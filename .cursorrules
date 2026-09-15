@@ -1,0 +1,78 @@
+<ProjectContext>
+# TP DECK (Techyparts Data Entry Control Keeper)
+**Goal:** Automate repetitive inventory data entry between eBay (orders) and internal ERP systems without creating new browser instances. 
+**Target Environment:** Native Windows multimonitor desktop utility.
+**Theme Identity:** Techyparts enterprise hardware dark theme.
+- Background: Deep Server Charcoal (`#0F172A` or `#1E293B`)
+- Primary Accent: Enterprise Electric Blue (`#0EA5E9`)
+- Text: Crisp White (`#F8FAFC`)
+- Cancel/Stop: Alert Red (`#7F1D1D` background, `#FCA5A5` text)
+</ProjectContext>
+
+<TechStack>
+- **Language:** Python 3.11+
+- **GUI Framework:** PySide6 (Native Windows integrations, Qt.WindowStaysOnTopHint)
+- **Browser Automation:** Playwright (async API) via Chrome DevTools Protocol (CDP)
+- **Global Hotkey:** `keyboard` library (Strictly limited to the `Pause` key)
+- **Concurrency:** `asyncio` for managing cancelable background automation tasks
+</TechStack>
+
+<ArchitectureRules>
+# 1. Anti-Virus Evasion (STRICT)
+- DO NOT use PyInstaller `--onefile` or broadly hook the Windows keyboard API.
+- Global hotkey usage is strictly limited to registering the `Pause` (Pause/Break) key for the emergency abort function.
+- The final app will be packaged using the Windows Embedded Python `.zip` and launched via a `.bat` script. Write code assuming a standard `python main.py` execution environment.
+
+# 2. Window & UI Constraints
+- **Floating Tool Window:** The main UI is a compact, floating dashboard. Use `Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool`.
+- **Position Persistence:** Override `closeEvent` and `moveEvent` to save the exact `(X, Y)` screen coordinates to `settings.json`. On initialization, load these coordinates so the app remembers its placement on auxiliary monitors.
+- **Debouncing:** When automation starts, disable the main execute button and change text to "⏳ Processing...". Re-enable inside a `finally` block.
+
+# 3. Automation Engine & CDP Connection
+- **NO NEW BROWSERS:** DO NOT use `playwright.chromium.launch()`. You MUST use `playwright.chromium.connect_over_cdp()`.
+- **Operating Modes:** Support "Single" (Port 9222) and "Dual" browser connections (eBay Port 9222, ERP Port 9223) determined by `settings.json`.
+- **Tab Disambiguation:** When scanning for the active eBay tab, iterate through all CDP contexts. Match the URL pattern (e.g., `ebay.com/sh/ord`) AND evaluate `document.hasFocus()` to ensure extraction only happens on the exact tab the user is actively viewing.
+
+# 4. Emergency Kill-Switch 
+- All Playwright operations must run inside an `asyncio.Task`.
+- Provide a red UI button `[🛑 Emergency Stop]` AND listen for the `Pause` key globally. Both triggers must call `task.cancel()` on the running asyncio task immediately.
+
+# 5. Configuration & State Management
+- Use `settings.json` for ALL variables. Do not hardcode ports, DOM CSS selectors, hotkeys, or window geometry.
+- Maintain a rolling log output to `tpdeck.log`.
+</ArchitectureRules>
+
+<ProjectStructure>
+/tp_deck/
+  ├── main.py                 # Entry point, event loop setup, global hotkey registration
+  ├── dashboard.py            # PySide6 Floating UI, styling, and position persistence
+  ├── settings_dialog.py      # PySide6 UI for toggling ports/modes and viewing setup instructions
+  ├── automation_engine.py    # Playwright async CDP connection and DOM extraction logic
+  ├── settings.json           # Configs (ports, selectors, window_x, window_y, mode)
+  └── tpdeck.log              # Local logging file
+</ProjectStructure>
+
+<DevelopmentMilestones>
+1. **Phase 1: Shell & State (UI)**
+   - Scaffold the floating PySide6 window, apply QSS theme, and implement `settings.json` position persistence.
+   - Scaffold the Settings Dialog with the Dual/Single browser toggle.
+2. **Phase 2: The Kill Switch & Engine Base**
+   - Implement the `asyncio` loop bridge with PySide6 (`qasync` or manual threading).
+   - Wire the main execution button to a dummy `asyncio.sleep(5)` task.
+   - Implement the `Pause` key and `[🛑 Stop]` button to successfully cancel the dummy task.
+3. **Phase 3: Playwright CDP Connect**
+   - Write the `connect_over_cdp` logic in `automation_engine.py`.
+   - Implement the tab disambiguation function (`document.hasFocus()`).
+4. **Phase 4: Scraping & Summarization**
+   - Implement the dynamic CSS selector extraction for eBay and the injection/wait logic for the ERP tab.
+   - Format the final output string and push to the system clipboard.
+</DevelopmentMilestones>
+
+<V1DefinitionOfDone>
+- App launches to a dark-themed floating panel that stays on top and remembers its multi-monitor position.
+- User clicks "Execute" (or presses a localized trigger).
+- Playwright connects to port 9222/9223 without opening a new window, finds the focused eBay tab, scrapes the SKU.
+- Playwright finds the ERP tab, enters the SKU, scrapes the Location, builds the string `[Order] - [SKU] - [Location]`, and copies to clipboard.
+- The UI properly disables buttons during the run and updates status labels (Idle -> Processing -> Success).
+- Pressing `Pause` instantly stops any mid-flight automation cleanly.
+</V1DefinitionOfDone>
