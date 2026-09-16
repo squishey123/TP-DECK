@@ -2,17 +2,30 @@
   "mode": "single",
   "ebay_port": 9222,
   "erp_port": 9223,
-  "window_x": 100,
-  "window_y": 100,
+  "window_x": 23,
+  "window_y": 146,
   "emergency_hotkey": "pause",
   "ebay_url_pattern": "ebay.com/sh/ord",
-  "erp_url_pattern": "",
+  "erp_url_pattern": "InventoryDetail.aspx",
   "wait_timeout_ms": 10000,
   "erp_submit_key": "Enter",
+  "location_blacklist": [
+    "tech",
+    "internal"
+  ],
+  "location_deprioritize": [
+    "Andrei & Alex Office"
+  ],
+  "location_deprioritize_prefixes": [
+    "PR"
+  ],
+  "location_lowest_priority": [
+    "HQ"
+  ],
   "selectors": {
-    "ebay_order_id": "",
-    "ebay_sku": "",
-    "erp_sku_input": "",
-    "erp_location": ""
+    "ebay_order_id": "[id$=\"__order-info\"] .order-details",
+    "ebay_sku": "span.item-custom-sku span.sh-bold",
+    "erp_sku_input": "#ag-grid-inventory-detail .ag-header-row-floating-filter > div:nth-child(2) input",
+    "erp_location": "#ag-grid-inventory-detail .ag-center-cols-container .ag-row > div:nth-child(3)"
   }
 }

@@ -22,6 +22,10 @@ DEFAULTS: dict[str, Any] = {
     "erp_url_pattern": "",
     "wait_timeout_ms": 10000,
     "erp_submit_key": "Enter",
+    "location_blacklist": ["tech", "internal"],
+    "location_deprioritize": ["Andrei & Alex Office"],
+    "location_deprioritize_prefixes": ["PR"],
+    "location_lowest_priority": ["HQ"],
     "selectors": {
         "ebay_order_id": "",
         "ebay_sku": "",

@@ -118,6 +118,102 @@ def _clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip()
 
 
+_LETTER_DASH_LOCATION = re.compile(r"^[A-Za-z]-")
+
+
+def pick_best_location(
+    locations: list[str],
+    *,
+    blacklist: Optional[list[str]] = None,
+    deprioritize: Optional[list[str]] = None,
+    deprioritize_prefixes: Optional[list[str]] = None,
+    lowest_priority: Optional[list[str]] = None,
+) -> str:
+    """
+    Choose one location from many serial rows:
+    - Drop blacklisted names entirely (e.g. Tech, Internal)
+    - Prefer highest frequency among remaining rows
+    - Then Andrei & Alex Office, then PR*, then HQ last
+    - On a frequency tie, favor codes like A-12 (letter + dash)
+    """
+    cleaned = [_clean_text(x) for x in locations]
+    cleaned = [x for x in cleaned if x]
+    if not cleaned:
+        raise RuntimeError("No ERP location values found in the grid")
+
+    blocked = {_clean_text(x).lower() for x in (blacklist or []) if _clean_text(x)}
+    soft_names = {
+        _clean_text(x).lower() for x in (deprioritize or []) if _clean_text(x)
+    }
+    lowest_names = {
+        _clean_text(x).lower() for x in (lowest_priority or []) if _clean_text(x)
+    }
+    prefixes = [
+        _clean_text(x).upper()
+        for x in (deprioritize_prefixes or ["PR"])
+        if _clean_text(x)
+    ]
+
+    def _is_blocked(loc: str) -> bool:
+        return loc.lower() in blocked
+
+    def _is_prefix_deprioritized(loc: str) -> bool:
+        upper = loc.upper()
+        return any(upper.startswith(prefix) for prefix in prefixes)
+
+    def _is_named_deprioritized(loc: str) -> bool:
+        return loc.lower() in soft_names
+
+    def _is_lowest(loc: str) -> bool:
+        return loc.lower() in lowest_names
+
+    kept = [loc for loc in cleaned if not _is_blocked(loc)]
+    if not kept:
+        raise RuntimeError(
+            "All ERP locations were blacklisted "
+            f"(values={sorted(set(cleaned))}, blacklist={sorted(blocked)})"
+        )
+
+    from collections import Counter
+
+    counts = Counter(kept)
+    names = list(counts.keys())
+    preferred = [
+        loc
+        for loc in names
+        if not _is_prefix_deprioritized(loc)
+        and not _is_named_deprioritized(loc)
+        and not _is_lowest(loc)
+    ]
+    named_soft = [
+        loc
+        for loc in names
+        if _is_named_deprioritized(loc) and not _is_lowest(loc)
+    ]
+    prefix_soft = [
+        loc
+        for loc in names
+        if _is_prefix_deprioritized(loc)
+        and not _is_named_deprioritized(loc)
+        and not _is_lowest(loc)
+    ]
+    lowest = [loc for loc in names if _is_lowest(loc)]
+    pool = preferred or named_soft or prefix_soft or lowest
+
+    max_freq = max(counts[loc] for loc in pool)
+    top = [loc for loc in pool if counts[loc] == max_freq]
+    letter_dash = [loc for loc in top if _LETTER_DASH_LOCATION.match(loc)]
+    chosen = sorted(letter_dash or top)[0]
+    logger.info(
+        "Location vote counts=%s blocked=%s pool=%s picked=%s",
+        dict(counts),
+        sorted(blocked),
+        pool,
+        chosen,
+    )
+    return chosen
+
+
 def _require_selector(selectors: dict[str, Any], key: str) -> str:
     raw = str(selectors.get(key, "") or "").strip()
     if not raw:
@@ -128,10 +224,22 @@ def _require_selector(selectors: dict[str, Any], key: str) -> str:
     return raw
 
 
-async def extract_text(page: Page, selector: str, *, timeout_ms: int) -> str:
+async def extract_text(
+    page: Page,
+    selector: str,
+    *,
+    timeout_ms: int,
+    label: str = "element",
+) -> str:
     """Read visible text (or input value) from the first matching element."""
     locator = page.locator(selector).first
-    await locator.wait_for(state="visible", timeout=timeout_ms)
+    try:
+        await locator.wait_for(state="visible", timeout=timeout_ms)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Timed out waiting for {label} ({selector}). "
+            "Open the correct page, then recopy the selector in Settings."
+        ) from exc
     text = await locator.inner_text()
     cleaned = _clean_text(text)
     if cleaned:
@@ -140,22 +248,252 @@ async def extract_text(page: Page, selector: str, *, timeout_ms: int) -> str:
     return _clean_text(value)
 
 
-async def scrape_ebay_order(
+async def collect_grid_column_texts(
+    page: Page,
+    cell_selector: str,
+    *,
+    timeout_ms: int,
+) -> list[str]:
+    """
+    Read a column from an ag-Grid, scrolling the body so virtualized rows
+    are included. Dedupes by row-id so the same row is not counted twice.
+    """
+    cells = page.locator(cell_selector)
+    try:
+        await cells.first.wait_for(state="visible", timeout=timeout_ms)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Timed out waiting for ERP location column ({cell_selector})."
+        ) from exc
+
+    viewport = page.locator(
+        "#ag-grid-inventory-detail .ag-body-viewport"
+    ).first
+    by_row: dict[str, str] = {}
+
+    async def _harvest() -> None:
+        batch = await cells.evaluate_all(
+            """(els) => els.map((el) => {
+                const row = el.closest('.ag-row');
+                const key = row
+                    ? (row.getAttribute('row-id')
+                        || row.getAttribute('row-index')
+                        || '')
+                    : '';
+                const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                return { key, text };
+            })"""
+        )
+        for i, item in enumerate(batch or []):
+            text = _clean_text(str(item.get("text") or ""))
+            if not text:
+                continue
+            key = str(item.get("key") or "") or f"anon-{i}-{text}"
+            by_row[key] = text
+
+    await _harvest()
+
+    if await viewport.count() > 0:
+        for _ in range(80):
+            at_end = await viewport.evaluate(
+                """(el) => {
+                    const before = el.scrollTop;
+                    el.scrollTop = Math.min(
+                        el.scrollTop + el.clientHeight,
+                        el.scrollHeight
+                    );
+                    return (
+                        el.scrollTop === before
+                        || el.scrollTop + el.clientHeight >= el.scrollHeight - 2
+                    );
+                }"""
+            )
+            await asyncio.sleep(0.05)
+            await _harvest()
+            if at_end:
+                break
+        # Reset scroll for the operator's view.
+        await viewport.evaluate("(el) => { el.scrollTop = 0; }")
+
+    return list(by_row.values())
+
+
+async def _scroll_ebay_order_list(page: Page) -> None:
+    """Load any lazy-rendered Seller Hub rows by scrolling the list container."""
+    previous = -1
+    for _ in range(25):
+        count = await page.locator("[id$='__order-info']").count()
+        if count > 0 and count == previous:
+            break
+        previous = count
+        await page.evaluate(
+            """() => {
+                const el = document.querySelector('[id$="__order-info"]');
+                let scroller = document.scrollingElement;
+                let node = el ? el.parentElement : null;
+                while (node) {
+                    const style = getComputedStyle(node);
+                    const scrollable =
+                        /(auto|scroll)/.test(style.overflowY)
+                        && node.scrollHeight > node.clientHeight + 20;
+                    if (scrollable) {
+                        scroller = node;
+                        break;
+                    }
+                    node = node.parentElement;
+                }
+                if (scroller) {
+                    scroller.scrollTop = scroller.scrollHeight;
+                }
+                window.scrollBy(0, window.innerHeight);
+            }"""
+        )
+        await asyncio.sleep(0.2)
+
+
+async def scrape_ebay_orders(
     page: Page,
     selectors: dict[str, Any],
     *,
     timeout_ms: int,
-) -> tuple[str, str]:
-    order_sel = _require_selector(selectors, "ebay_order_id")
+) -> list[tuple[str, str]]:
+    """
+    Collect every order + SKU on the focused /sh/ord list before any ERP work.
+    Returns (order_id, sku) pairs, including multiple SKUs per order.
+    """
     sku_sel = _require_selector(selectors, "ebay_sku")
-    order_id = await extract_text(page, order_sel, timeout_ms=timeout_ms)
-    sku = await extract_text(page, sku_sel, timeout_ms=timeout_ms)
-    if not order_id or not sku:
-        raise RuntimeError(
-            f"eBay scrape returned empty values (order={order_id!r}, sku={sku!r})"
+    order_sel = _require_selector(selectors, "ebay_order_id")
+
+    try:
+        await page.locator("[id$='__order-info']").first.wait_for(
+            state="visible", timeout=timeout_ms
         )
-    logger.info("eBay scraped order=%s sku=%s", order_id, sku)
-    return order_id, sku
+    except Exception as exc:
+        raise RuntimeError(
+            "No eBay order rows found on /sh/ord. Focus the order list tab."
+        ) from exc
+
+    await _scroll_ebay_order_list(page)
+
+    diagnostics = await page.evaluate(
+        """() => {
+            const infos = [...document.querySelectorAll('[id$="__order-info"]')]
+                .map((el) => el.id);
+            const items = [...document.querySelectorAll('[id*="__item-info"]')]
+                .map((el) => el.id);
+            return { infos, items };
+        }"""
+    )
+    logger.info(
+        "eBay DOM: %s order-info, %s item-info (no clicks on the list)",
+        len(diagnostics.get("infos") or []),
+        len(diagnostics.get("items") or []),
+    )
+    logger.debug("order-info ids=%s", diagnostics.get("infos"))
+
+    raw_rows = await page.evaluate(
+        """(skuSel) => {
+            const rows = [];
+            const seen = new Set();
+            const add = (orderId, sku) => {
+                const key = orderId + '|' + sku;
+                if (!orderId || !sku || seen.has(key)) return;
+                seen.add(key);
+                rows.push({ orderId, sku });
+            };
+            const parseHostId = (el) => {
+                const host = el && el.closest && el.closest('[id^="orderid_"]');
+                if (!host || !host.id) return null;
+                const m = host.id.match(/^orderid_(.+?)__/);
+                return m ? m[1] : null;
+            };
+
+            document.querySelectorAll('[id$="__order-info"]').forEach((info) => {
+                const idMatch = info.id.match(/^orderid_(.+?)__/);
+                if (!idMatch) return;
+                let orderId = idMatch[1];
+                const details = info.querySelector('.order-details');
+                const detailText = details ? details.innerText : '';
+                const orderMatch = detailText.match(/\\d{2}-\\d{5}-\\d{5}/);
+                if (orderMatch) orderId = orderMatch[0];
+
+                const items = document.querySelectorAll(
+                    '[id^="orderid_' + orderId + '__item-info"]'
+                );
+                items.forEach((item) => {
+                    item.querySelectorAll(skuSel).forEach((el) => {
+                        add(
+                            orderId,
+                            (el.innerText || '').replace(/\\s+/g, ' ').trim()
+                        );
+                    });
+                });
+                info.querySelectorAll(skuSel).forEach((el) => {
+                    add(
+                        orderId,
+                        (el.innerText || '').replace(/\\s+/g, ' ').trim()
+                    );
+                });
+            });
+
+            document.querySelectorAll(skuSel).forEach((el) => {
+                let orderId = parseHostId(el);
+                if (!orderId) return;
+                const om = String(orderId).match(/\\d{2}-\\d{5}-\\d{5}/);
+                if (om) orderId = om[0];
+                add(
+                    orderId,
+                    (el.innerText || '').replace(/\\s+/g, ' ').trim()
+                );
+            });
+            return rows;
+        }""",
+        sku_sel,
+    )
+
+    pairs: list[tuple[str, str]] = []
+    for row in raw_rows or []:
+        order_id = _clean_text(str(row.get("orderId") or ""))
+        sku = _clean_text(str(row.get("sku") or ""))
+        match = re.search(r"\d{2}-\d{5}-\d{5}", order_id)
+        if match:
+            order_id = match.group(0)
+        if order_id and sku:
+            pairs.append((order_id, sku))
+
+    if not pairs:
+        raise RuntimeError(
+            f"eBay list scrape found orders but no SKUs "
+            f"(sku selector {sku_sel!r}, order selector {order_sel!r})."
+        )
+
+    logger.info(
+        "eBay scrape complete: %s line(s) across %s order(s)",
+        len(pairs),
+        len({order_id for order_id, _ in pairs}),
+    )
+    for order_id, sku in pairs:
+        logger.info("  queued %s — %s", order_id, sku)
+    return pairs
+
+
+async def _erp_sku_field(page: Page, input_sel: str, timeout_ms: int):
+    """Resolve the SKU filter input even if the selector points at a wrapper div."""
+    root = page.locator(input_sel).first
+    try:
+        await root.wait_for(state="visible", timeout=timeout_ms)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Timed out waiting for ERP SKU input ({input_sel}). "
+            "Focus Inventory Detail, then recopy the filter box selector."
+        ) from exc
+
+    inner = root.locator("input:not([type='hidden'])")
+    if await inner.count() > 0:
+        field = inner.first
+        await field.wait_for(state="visible", timeout=timeout_ms)
+        return field
+    return root
 
 
 async def lookup_erp_location(
@@ -165,13 +503,16 @@ async def lookup_erp_location(
     *,
     timeout_ms: int,
     submit_key: str,
+    location_blacklist: Optional[list[str]] = None,
+    location_deprioritize: Optional[list[str]] = None,
+    location_deprioritize_prefixes: Optional[list[str]] = None,
+    location_lowest_priority: Optional[list[str]] = None,
 ) -> str:
-    """Type SKU into ERP, optional submit key, wait for and scrape Location."""
+    """Type SKU into ERP, wait for grid rows, vote on the best Location."""
     input_sel = _require_selector(selectors, "erp_sku_input")
     location_sel = _require_selector(selectors, "erp_location")
 
-    field = page.locator(input_sel).first
-    await field.wait_for(state="visible", timeout=timeout_ms)
+    field = await _erp_sku_field(page, input_sel, timeout_ms)
     await field.click()
     await field.fill("")
     await field.fill(sku)
@@ -180,10 +521,31 @@ async def lookup_erp_location(
     if key:
         await field.press(key)
 
-    location = await extract_text(page, location_sel, timeout_ms=timeout_ms)
-    if not location:
-        raise RuntimeError("ERP location scrape returned empty text")
-    logger.info("ERP location scraped: %s", location)
+    overlay = page.locator("#ag-grid-inventory-detail .ag-overlay-loading-wrapper")
+    try:
+        await overlay.wait_for(state="visible", timeout=1500)
+        await overlay.wait_for(state="hidden", timeout=timeout_ms)
+    except Exception:
+        await asyncio.sleep(0.4)
+
+    values = await collect_grid_column_texts(
+        page,
+        location_sel,
+        timeout_ms=timeout_ms,
+    )
+    location = pick_best_location(
+        values,
+        blacklist=location_blacklist,
+        deprioritize=location_deprioritize,
+        deprioritize_prefixes=location_deprioritize_prefixes,
+        lowest_priority=location_lowest_priority,
+    )
+    logger.info(
+        "ERP location selected for sku=%s: %s (from %s row(s))",
+        sku,
+        location,
+        len(values),
+    )
     return location
 
 
@@ -246,7 +608,7 @@ async def _resolve_erp_page(
 async def run_automation(settings: dict[str, Any]) -> str:
     """
     Full v1 pipeline:
-    focused eBay tab → Order/SKU → ERP SKU lookup → Location → clipboard.
+    focused eBay list → all Order/SKU lines → ERP lookups → clipboard.
     """
     mode = str(settings.get("mode", "single")).lower()
     ebay_port = int(settings.get("ebay_port", 9222))
@@ -278,7 +640,7 @@ async def run_automation(settings: dict[str, Any]) -> str:
                 "Click the Seller Hub order tab, then Execute again."
             )
 
-        order_id, sku = await scrape_ebay_order(
+        lines_in = await scrape_ebay_orders(
             ebay_page,
             selectors,
             timeout_ms=timeout_ms,
@@ -296,19 +658,37 @@ async def run_automation(settings: dict[str, Any]) -> str:
         )
         await asyncio.sleep(0)
 
-        location = await lookup_erp_location(
-            erp_page,
-            sku,
-            selectors,
-            timeout_ms=timeout_ms,
-            submit_key=submit_key,
-        )
-        await asyncio.sleep(0)
+        location_by_sku: dict[str, str] = {}
+        lines_out: list[str] = []
+        for order_id, sku in lines_in:
+            if sku not in location_by_sku:
+                location_by_sku[sku] = await lookup_erp_location(
+                    erp_page,
+                    sku,
+                    selectors,
+                    timeout_ms=timeout_ms,
+                    submit_key=submit_key,
+                    location_blacklist=settings.get("location_blacklist"),
+                    location_deprioritize=settings.get("location_deprioritize"),
+                    location_deprioritize_prefixes=settings.get(
+                        "location_deprioritize_prefixes"
+                    ),
+                    location_lowest_priority=settings.get(
+                        "location_lowest_priority"
+                    ),
+                )
+            lines_out.append(
+                format_output(order_id, sku, location_by_sku[sku])
+            )
+            await asyncio.sleep(0)
 
-        output = format_output(order_id, sku, location)
+        output = "\n".join(lines_out)
         copy_to_clipboard(output)
         logger.info("Automation success: %s", output)
-        return f"Success — {output}"
+        return (
+            f"Success — {len(lines_out)} line(s), "
+            f"{len(location_by_sku)} SKU lookup(s)"
+        )
 
     except asyncio.CancelledError:
         logger.info("Automation cancelled")
