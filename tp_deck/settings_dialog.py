@@ -8,6 +8,7 @@ from typing import Optional
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QFormLayout,
     QGroupBox,
@@ -43,9 +44,43 @@ QGroupBox::title {
     padding: 0 4px;
     color: #0EA5E9;
 }
-QLabel, QRadioButton {
+QLabel, QRadioButton, QCheckBox {
     color: #F8FAFC;
     background: transparent;
+}
+QRadioButton, QCheckBox {
+    spacing: 10px;
+    padding: 6px 8px;
+    border-radius: 4px;
+}
+QRadioButton:hover, QCheckBox:hover {
+    background-color: #1E293B;
+}
+QRadioButton:checked {
+    color: #38BDF8;
+    font-weight: bold;
+    background-color: #1E293B;
+    border: 1px solid #0EA5E9;
+}
+QRadioButton::indicator, QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 2px solid #64748B;
+    background-color: #0F172A;
+}
+QRadioButton::indicator {
+    border-radius: 9px;
+}
+QCheckBox::indicator {
+    border-radius: 3px;
+}
+QRadioButton::indicator:checked {
+    border: 2px solid #0EA5E9;
+    background-color: #0EA5E9;
+}
+QCheckBox::indicator:checked {
+    border: 2px solid #0EA5E9;
+    background-color: #0EA5E9;
 }
 QSpinBox, QLineEdit {
     background-color: #1E293B;
@@ -95,7 +130,7 @@ Dual mode:
 
 Fill CSS selectors below (DevTools → Copy → Copy selector).
 Execute scrapes Order + SKU from the focused eBay tab, types SKU into ERP,
-reads Location, then copies: [Order] - [SKU] - [Location]
+reads Location, then copies: [Order] - [Buyer] - [SKU] - [Location]
 """
 
 
@@ -150,16 +185,28 @@ class SettingsDialog(QDialog):
         self.timeout_spin.setSingleStep(500)
         self.timeout_spin.setSuffix(" ms")
         ports_form.addRow("Wait timeout:", self.timeout_spin)
+        self.cache_enabled_check = QCheckBox(
+            "Cache SKU → location results (12 hours)"
+        )
+        self.cache_enabled_check.setToolTip(
+            "Turn off when bin locations are changing often so every run "
+            "looks up live ERP data."
+        )
+        ports_form.addRow("", self.cache_enabled_check)
         layout.addWidget(ports_box)
 
         sel_box = QGroupBox("CSS Selectors")
         sel_form = QFormLayout(sel_box)
         self.sel_order = QLineEdit()
+        self.sel_buyer = QLineEdit()
         self.sel_sku = QLineEdit()
+        self.sel_qty = QLineEdit()
         self.sel_erp_input = QLineEdit()
         self.sel_erp_location = QLineEdit()
         sel_form.addRow("eBay order id:", self.sel_order)
+        sel_form.addRow("eBay buyer:", self.sel_buyer)
         sel_form.addRow("eBay SKU:", self.sel_sku)
+        sel_form.addRow("eBay qty:", self.sel_qty)
         sel_form.addRow("ERP SKU input:", self.sel_erp_input)
         sel_form.addRow("ERP location:", self.sel_erp_location)
         layout.addWidget(sel_box)
@@ -199,10 +246,15 @@ class SettingsDialog(QDialog):
         )
         self.erp_pattern_edit.setText(str(settings.get("erp_url_pattern", "")))
         self.timeout_spin.setValue(int(settings.get("wait_timeout_ms", 10000)))
+        self.cache_enabled_check.setChecked(
+            bool(settings.get("cache_enabled", True))
+        )
 
         selectors = settings.get("selectors") or {}
         self.sel_order.setText(str(selectors.get("ebay_order_id", "")))
+        self.sel_buyer.setText(str(selectors.get("ebay_buyer", "")))
         self.sel_sku.setText(str(selectors.get("ebay_sku", "")))
+        self.sel_qty.setText(str(selectors.get("ebay_qty", "")))
         self.sel_erp_input.setText(str(selectors.get("erp_sku_input", "")))
         self.sel_erp_location.setText(str(selectors.get("erp_location", "")))
         self._on_mode_toggled()
@@ -220,9 +272,12 @@ class SettingsDialog(QDialog):
             ebay_url_pattern=self.ebay_pattern_edit.text().strip(),
             erp_url_pattern=self.erp_pattern_edit.text().strip(),
             wait_timeout_ms=self.timeout_spin.value(),
+            cache_enabled=self.cache_enabled_check.isChecked(),
             selectors={
                 "ebay_order_id": self.sel_order.text().strip(),
+                "ebay_buyer": self.sel_buyer.text().strip(),
                 "ebay_sku": self.sel_sku.text().strip(),
+                "ebay_qty": self.sel_qty.text().strip(),
                 "erp_sku_input": self.sel_erp_input.text().strip(),
                 "erp_location": self.sel_erp_location.text().strip(),
             },

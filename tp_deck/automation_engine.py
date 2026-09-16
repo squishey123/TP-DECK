@@ -9,6 +9,9 @@ from typing import Any, Optional
 
 from playwright.async_api import Browser, Page, Playwright, async_playwright
 
+from tp_deck.pick_list import build_pick_list, parse_quantity
+from tp_deck.sku_cache import SkuLocationCache
+
 logger = logging.getLogger("tpdeck")
 
 
@@ -356,13 +359,17 @@ async def scrape_ebay_orders(
     selectors: dict[str, Any],
     *,
     timeout_ms: int,
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str, int]]:
     """
-    Collect every order + SKU on the focused /sh/ord list before any ERP work.
-    Returns (order_id, sku) pairs, including multiple SKUs per order.
+    Collect every order, buyer, SKU, and ordered qty on the focused /sh/ord list
+    before any ERP work.
     """
     sku_sel = _require_selector(selectors, "ebay_sku")
     order_sel = _require_selector(selectors, "ebay_order_id")
+    buyer_sel = str(selectors.get("ebay_buyer") or "").strip()
+    if not buyer_sel:
+        buyer_sel = "div.user-details.details span > button > span:nth-child(1)"
+    qty_sel = str(selectors.get("ebay_qty") or "").strip() or "td.item-quantity"
 
     try:
         await page.locator("[id$='__order-info']").first.wait_for(
@@ -392,20 +399,36 @@ async def scrape_ebay_orders(
     logger.debug("order-info ids=%s", diagnostics.get("infos"))
 
     raw_rows = await page.evaluate(
-        """(skuSel) => {
+        """({ skuSel, buyerSel, qtySel }) => {
             const rows = [];
             const seen = new Set();
-            const add = (orderId, sku) => {
-                const key = orderId + '|' + sku;
+            const buyers = {};
+            const add = (orderId, buyer, sku, qtyText, lineKey) => {
+                const key = lineKey || (orderId + '|' + sku);
                 if (!orderId || !sku || seen.has(key)) return;
                 seen.add(key);
-                rows.push({ orderId, sku });
+                rows.push({
+                    orderId,
+                    buyer: buyer || '',
+                    sku,
+                    qtyText: qtyText || '1',
+                });
             };
             const parseHostId = (el) => {
                 const host = el && el.closest && el.closest('[id^="orderid_"]');
                 if (!host || !host.id) return null;
                 const m = host.id.match(/^orderid_(.+?)__/);
                 return m ? m[1] : null;
+            };
+            const readBuyer = (info) => {
+                if (!info || !buyerSel) return '';
+                const el = info.querySelector(buyerSel);
+                return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
+            };
+            const readQty = (root) => {
+                if (!root || !qtySel) return '1';
+                const el = root.querySelector(qtySel);
+                return ((el && el.innerText) || '1').replace(/\\s+/g, ' ').trim();
             };
 
             document.querySelectorAll('[id$="__order-info"]').forEach((info) => {
@@ -416,50 +439,55 @@ async def scrape_ebay_orders(
                 const detailText = details ? details.innerText : '';
                 const orderMatch = detailText.match(/\\d{2}-\\d{5}-\\d{5}/);
                 if (orderMatch) orderId = orderMatch[0];
+                const buyer = readBuyer(info);
+                buyers[orderId] = buyer;
 
                 const items = document.querySelectorAll(
                     '[id^="orderid_' + orderId + '__item-info"]'
                 );
                 items.forEach((item) => {
+                    const qtyText = readQty(item);
                     item.querySelectorAll(skuSel).forEach((el) => {
+                        const skuText = (el.innerText || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
                         add(
                             orderId,
-                            (el.innerText || '').replace(/\\s+/g, ' ').trim()
+                            buyer,
+                            skuText,
+                            qtyText,
+                            (item.id || (orderId + '|item')) + '|' + skuText
                         );
                     });
                 });
-                info.querySelectorAll(skuSel).forEach((el) => {
-                    add(
-                        orderId,
-                        (el.innerText || '').replace(/\\s+/g, ' ').trim()
-                    );
-                });
-            });
-
-            document.querySelectorAll(skuSel).forEach((el) => {
-                let orderId = parseHostId(el);
-                if (!orderId) return;
-                const om = String(orderId).match(/\\d{2}-\\d{5}-\\d{5}/);
-                if (om) orderId = om[0];
-                add(
-                    orderId,
-                    (el.innerText || '').replace(/\\s+/g, ' ').trim()
-                );
+                if (!items.length) {
+                    info.querySelectorAll(skuSel).forEach((el) => {
+                        add(
+                            orderId,
+                            buyer,
+                            (el.innerText || '').replace(/\\s+/g, ' ').trim(),
+                            '1',
+                            orderId + '|info|' + ((el.innerText || '').trim())
+                        );
+                    });
+                }
             });
             return rows;
         }""",
-        sku_sel,
+        {"skuSel": sku_sel, "buyerSel": buyer_sel, "qtySel": qty_sel},
     )
 
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[str, str, str, int]] = []
     for row in raw_rows or []:
         order_id = _clean_text(str(row.get("orderId") or ""))
+        buyer = _clean_text(str(row.get("buyer") or ""))
         sku = _clean_text(str(row.get("sku") or ""))
+        qty = parse_quantity(str(row.get("qtyText") or "1"))
         match = re.search(r"\d{2}-\d{5}-\d{5}", order_id)
         if match:
             order_id = match.group(0)
         if order_id and sku:
-            pairs.append((order_id, sku))
+            pairs.append((order_id, buyer, sku, qty))
 
     if not pairs:
         raise RuntimeError(
@@ -470,10 +498,10 @@ async def scrape_ebay_orders(
     logger.info(
         "eBay scrape complete: %s line(s) across %s order(s)",
         len(pairs),
-        len({order_id for order_id, _ in pairs}),
+        len({order_id for order_id, _, _, _ in pairs}),
     )
-    for order_id, sku in pairs:
-        logger.info("  queued %s — %s", order_id, sku)
+    for order_id, buyer, sku, qty in pairs:
+        logger.info("  queued %s — %s — %sx %s", order_id, buyer or "?", qty, sku)
     return pairs
 
 
@@ -549,8 +577,9 @@ async def lookup_erp_location(
     return location
 
 
-def format_output(order_id: str, sku: str, location: str) -> str:
-    return f"{order_id} - {sku} - {location}"
+def format_output(order_id: str, buyer: str, sku: str, location: str) -> str:
+    name = buyer.strip() or "?"
+    return f"{order_id} - {name} - {sku} - {location}"
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -605,10 +634,14 @@ async def _resolve_erp_page(
     return page
 
 
-async def run_automation(settings: dict[str, Any]) -> str:
+async def run_automation(
+    settings: dict[str, Any],
+    *,
+    job: str = "orders",
+) -> str:
     """
-    Full v1 pipeline:
-    focused eBay list → all Order/SKU lines → ERP lookups → clipboard.
+    job=orders: clipboard Order - Buyer - SKU - Location
+    job=picklist: combined qty pick walk list
     """
     mode = str(settings.get("mode", "single")).lower()
     ebay_port = int(settings.get("ebay_port", 9222))
@@ -647,21 +680,37 @@ async def run_automation(settings: dict[str, Any]) -> str:
         )
         await asyncio.sleep(0)
 
-        if mode == "dual":
-            erp_browser = await connect_over_cdp(playwright, erp_port)
-
-        erp_page = await _resolve_erp_page(
-            mode=mode,
-            ebay_browser=ebay_browser,
-            erp_browser=erp_browser,
-            erp_pattern=erp_pattern,
+        cache_enabled = bool(settings.get("cache_enabled", True))
+        cache = SkuLocationCache(
+            ttl_hours=float(settings.get("cache_ttl_hours", 12))
         )
-        await asyncio.sleep(0)
-
         location_by_sku: dict[str, str] = {}
-        lines_out: list[str] = []
-        for order_id, sku in lines_in:
-            if sku not in location_by_sku:
+        unique_skus = list(dict.fromkeys(sku for _, _, sku, _ in lines_in))
+        misses: list[str] = []
+        for sku in unique_skus:
+            cached = cache.get(sku) if cache_enabled else None
+            if cached:
+                location_by_sku[sku] = cached
+                logger.info("SKU cache hit %s → %s", sku, cached)
+            else:
+                misses.append(sku)
+
+        if not cache_enabled:
+            logger.info("SKU location cache disabled; looking up all SKUs")
+
+        if misses:
+            if mode == "dual":
+                erp_browser = await connect_over_cdp(playwright, erp_port)
+
+            erp_page = await _resolve_erp_page(
+                mode=mode,
+                ebay_browser=ebay_browser,
+                erp_browser=erp_browser,
+                erp_pattern=erp_pattern,
+            )
+            await asyncio.sleep(0)
+
+            for sku in misses:
                 location_by_sku[sku] = await lookup_erp_location(
                     erp_page,
                     sku,
@@ -677,17 +726,50 @@ async def run_automation(settings: dict[str, Any]) -> str:
                         "location_lowest_priority"
                     ),
                 )
-            lines_out.append(
-                format_output(order_id, sku, location_by_sku[sku])
+                if cache_enabled:
+                    cache.put(sku, location_by_sku[sku])
+                await asyncio.sleep(0)
+            if cache_enabled:
+                cache.save()
+        else:
+            logger.info("All SKUs served from cache; skipping ERP lookup")
+            if cache_enabled:
+                cache.save()
+
+        hits = len(unique_skus) - len(misses)
+        job_name = str(job or "orders").lower()
+
+        if job_name == "picklist":
+            combined: dict[str, list] = {}
+            for _order_id, _buyer, sku, qty in lines_in:
+                loc = location_by_sku.get(sku, "")
+                if sku not in combined:
+                    combined[sku] = [0, loc]
+                combined[sku][0] += max(1, int(qty))
+                combined[sku][1] = loc
+            pick_items = [
+                (sku, loc, qty) for sku, (qty, loc) in combined.items()
+            ]
+            output = build_pick_list(pick_items)
+            copy_to_clipboard(output)
+            logger.info("Pick list success:\n%s", output)
+            return (
+                f"Success — pick list {len(pick_items)} SKU(s), "
+                f"{len(misses)} lookup(s), {hits} cache hit(s)"
             )
-            await asyncio.sleep(0)
+
+        lines_out: list[str] = []
+        for order_id, buyer, sku, _qty in lines_in:
+            lines_out.append(
+                format_output(order_id, buyer, sku, location_by_sku[sku])
+            )
 
         output = "\n".join(lines_out)
         copy_to_clipboard(output)
         logger.info("Automation success: %s", output)
         return (
             f"Success — {len(lines_out)} line(s), "
-            f"{len(location_by_sku)} SKU lookup(s)"
+            f"{len(misses)} lookup(s), {hits} cache hit(s)"
         )
 
     except asyncio.CancelledError:

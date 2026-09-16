@@ -6,11 +6,13 @@
 
 1. You already have Chrome running with remote debugging enabled (CDP).
 2. TP DECK opens as a compact, always-on-top floating panel and remembers its position across monitors.
-3. You click **Execute**. Playwright attaches to your existing Chrome session(s) over CDP — it never calls `launch()`.
-4. The engine finds the focused eBay order tab (`ebay.com/sh/ord` + `document.hasFocus()`), scrapes Order and SKU via CSS selectors from `settings.json`.
-5. It locates the ERP tab, enters the SKU, waits for Location, builds  
-   `[Order] - [SKU] - [Location]`, and copies that string to the clipboard.
-6. While a run is active, **Execute** shows `⏳ Processing...` and is disabled. Status moves Idle → Processing → Success.
+3. You click **Scrape eBay Orders** or **Generate Pick List**. Playwright attaches to your existing Chrome session(s) over CDP — it never calls `launch()`.
+4. The engine finds the focused eBay order tab (`ebay.com/sh/ord` + `document.hasFocus()`), scrapes Order, buyer, SKU, and quantity via CSS selectors from `settings.json`.
+5. It locates the ERP tab, enters each SKU, waits for Location, then copies either  
+   `[Order] - [Buyer] - [SKU] - [Location]` (scrape) or a walk-sorted pick list  
+   `Nx - SKU - LOCATION` grouped CPU Rack → Cubbies → Endcaps → Small parts → Cabinet → Misc.  
+   SKU → location results are cached for 12 hours when **Cache SKU → location** is enabled in Settings (`cache_enabled` / `cache_ttl_hours`). Turn that off when bins are moving often.
+6. While a run is active, both action buttons disable and the active one shows `⏳ Processing...`. Status moves Idle → Processing → Success.
 7. At any time, **🛑 Emergency Stop** or the global **Pause** key cancels the in-flight `asyncio` task immediately.
 
 ### Connection modes (`settings.json`)
@@ -77,7 +79,7 @@ TP-DECK/
 | **1** | Floating shell, QSS theme, position persistence, Settings dialog | Done |
 | **2** | asyncio ↔ PySide6 bridge, dummy task, Pause + Stop cancel | Done |
 | **3** | `connect_over_cdp`, focused-tab disambiguation | Done |
-| **4** | eBay/ERP scrape, clipboard output `[Order] - [SKU] - [Location]` | Done |
+| **4** | eBay/ERP scrape, clipboard output `[Order] - [Buyer] - [SKU] - [Location]` | Done |
 
 ## Local run
 

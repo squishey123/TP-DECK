@@ -64,18 +64,19 @@ class AutomationController:
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
-    def start(self) -> None:
+    def start(self, job: str = "orders") -> None:
         if self._task is not None and not self._task.done():
             return
 
-        self._dashboard.set_processing(True)
+        self._job = job
+        self._dashboard.set_processing(True, job=job)
         self._dashboard.set_status("Processing")
         self._task = asyncio.create_task(
-            self._run(),
+            self._run(job),
             name="tpdeck-automation",
         )
         self._task.add_done_callback(self._on_task_done)
-        logging.getLogger("tpdeck").info("Automation task started")
+        logging.getLogger("tpdeck").info("Automation task started (%s)", job)
 
     def stop(self) -> None:
         if self._task is None or self._task.done():
@@ -90,9 +91,9 @@ class AutomationController:
             return
         self._loop.call_soon_threadsafe(self.stop)
 
-    async def _run(self) -> str:
+    async def _run(self, job: str = "orders") -> str:
         settings = load_settings()
-        return await run_automation(settings)
+        return await run_automation(settings, job=job)
 
     def _on_task_done(self, task: asyncio.Task) -> None:
         self._dashboard.set_processing(False)
@@ -106,8 +107,7 @@ class AutomationController:
         exc = task.exception()
         if exc is not None:
             message = str(exc).strip() or exc.__class__.__name__
-            short = message if len(message) <= 48 else message[:45] + "..."
-            self._dashboard.set_status(f"Error — {short}")
+            self._dashboard.set_status(f"Error — {message}")
             logger.exception("Automation failed: %s", exc)
             return
 
@@ -158,7 +158,10 @@ def main() -> int:
     asyncio.set_event_loop(loop)
 
     def _execute() -> None:
-        controller.start()
+        controller.start("orders")
+
+    def _pick_list() -> None:
+        controller.start("picklist")
 
     def _stop() -> None:
         controller.stop()
@@ -168,6 +171,7 @@ def main() -> int:
 
     dashboard = Dashboard(
         on_execute=_execute,
+        on_pick_list=_pick_list,
         on_stop=_stop,
         on_open_settings=_settings,
     )

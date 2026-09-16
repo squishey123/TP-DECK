@@ -26,9 +26,13 @@ DEFAULTS: dict[str, Any] = {
     "location_deprioritize": ["Andrei & Alex Office"],
     "location_deprioritize_prefixes": ["PR"],
     "location_lowest_priority": ["HQ"],
+    "cache_ttl_hours": 12,
+    "cache_enabled": True,
     "selectors": {
         "ebay_order_id": "",
+        "ebay_buyer": "",
         "ebay_sku": "",
+        "ebay_qty": "",
         "erp_sku_input": "",
         "erp_location": "",
     },
