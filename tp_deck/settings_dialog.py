@@ -1,4 +1,4 @@
-"""Settings dialog — browser mode toggle and CDP setup instructions."""
+"""Settings dialog — mode, ports, URL patterns, CSS selectors, setup help."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
-    QLabel,
+    QLineEdit,
     QPushButton,
     QRadioButton,
     QSpinBox,
@@ -47,7 +47,7 @@ QLabel, QRadioButton {
     color: #F8FAFC;
     background: transparent;
 }
-QSpinBox {
+QSpinBox, QLineEdit {
     background-color: #1E293B;
     color: #F8FAFC;
     border: 1px solid #334155;
@@ -93,13 +93,14 @@ Dual mode:
   eBay  → chrome.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\\tpdeck-ebay"
   ERP   → chrome.exe --remote-debugging-port=9223 --user-data-dir="%TEMP%\\tpdeck-erp"
 
-Then open your eBay Seller Hub order tab and ERP tab.
-TP DECK connects over CDP — it never launches a new browser.
+Fill CSS selectors below (DevTools → Copy → Copy selector).
+Execute scrapes Order + SKU from the focused eBay tab, types SKU into ERP,
+reads Location, then copies: [Order] - [SKU] - [Location]
 """
 
 
 class SettingsDialog(QDialog):
-    """Toggle Single/Dual browser mode and edit CDP ports."""
+    """Toggle Single/Dual mode and edit ports, URL patterns, and selectors."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -107,7 +108,7 @@ class SettingsDialog(QDialog):
         self.setWindowFlags(
             self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setMinimumSize(420, 420)
+        self.setMinimumSize(480, 640)
         self.setStyleSheet(DIALOG_QSS)
 
         self._build_ui()
@@ -119,7 +120,6 @@ class SettingsDialog(QDialog):
 
         mode_box = QGroupBox("Browser Connection Mode")
         mode_layout = QVBoxLayout(mode_box)
-
         self.mode_group = QButtonGroup(self)
         self.single_radio = QRadioButton("Single — one Chrome on the eBay port")
         self.dual_radio = QRadioButton(
@@ -132,24 +132,44 @@ class SettingsDialog(QDialog):
         self.single_radio.toggled.connect(self._on_mode_toggled)
         layout.addWidget(mode_box)
 
-        ports_box = QGroupBox("CDP Ports")
+        ports_box = QGroupBox("CDP Ports & Patterns")
         ports_form = QFormLayout(ports_box)
-
         self.ebay_port_spin = QSpinBox()
         self.ebay_port_spin.setRange(1024, 65535)
         ports_form.addRow("eBay port:", self.ebay_port_spin)
-
         self.erp_port_spin = QSpinBox()
         self.erp_port_spin.setRange(1024, 65535)
         ports_form.addRow("ERP port:", self.erp_port_spin)
+        self.ebay_pattern_edit = QLineEdit()
+        ports_form.addRow("eBay URL contains:", self.ebay_pattern_edit)
+        self.erp_pattern_edit = QLineEdit()
+        self.erp_pattern_edit.setPlaceholderText("required in single mode")
+        ports_form.addRow("ERP URL contains:", self.erp_pattern_edit)
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(1000, 120000)
+        self.timeout_spin.setSingleStep(500)
+        self.timeout_spin.setSuffix(" ms")
+        ports_form.addRow("Wait timeout:", self.timeout_spin)
         layout.addWidget(ports_box)
+
+        sel_box = QGroupBox("CSS Selectors")
+        sel_form = QFormLayout(sel_box)
+        self.sel_order = QLineEdit()
+        self.sel_sku = QLineEdit()
+        self.sel_erp_input = QLineEdit()
+        self.sel_erp_location = QLineEdit()
+        sel_form.addRow("eBay order id:", self.sel_order)
+        sel_form.addRow("eBay SKU:", self.sel_sku)
+        sel_form.addRow("ERP SKU input:", self.sel_erp_input)
+        sel_form.addRow("ERP location:", self.sel_erp_location)
+        layout.addWidget(sel_box)
 
         help_box = QGroupBox("Setup Instructions")
         help_layout = QVBoxLayout(help_box)
         self.help_text = QTextEdit()
         self.help_text.setReadOnly(True)
         self.help_text.setPlainText(SETUP_INSTRUCTIONS)
-        self.help_text.setMinimumHeight(160)
+        self.help_text.setMinimumHeight(120)
         help_layout.addWidget(self.help_text)
         layout.addWidget(help_box)
 
@@ -158,7 +178,6 @@ class SettingsDialog(QDialog):
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         buttons.addWidget(cancel_btn)
-
         save_btn = QPushButton("Save")
         save_btn.setObjectName("saveBtn")
         save_btn.clicked.connect(self._save)
@@ -175,6 +194,17 @@ class SettingsDialog(QDialog):
 
         self.ebay_port_spin.setValue(int(settings.get("ebay_port", 9222)))
         self.erp_port_spin.setValue(int(settings.get("erp_port", 9223)))
+        self.ebay_pattern_edit.setText(
+            str(settings.get("ebay_url_pattern", "ebay.com/sh/ord"))
+        )
+        self.erp_pattern_edit.setText(str(settings.get("erp_url_pattern", "")))
+        self.timeout_spin.setValue(int(settings.get("wait_timeout_ms", 10000)))
+
+        selectors = settings.get("selectors") or {}
+        self.sel_order.setText(str(selectors.get("ebay_order_id", "")))
+        self.sel_sku.setText(str(selectors.get("ebay_sku", "")))
+        self.sel_erp_input.setText(str(selectors.get("erp_sku_input", "")))
+        self.sel_erp_location.setText(str(selectors.get("erp_location", "")))
         self._on_mode_toggled()
 
     def _on_mode_toggled(self) -> None:
@@ -187,6 +217,15 @@ class SettingsDialog(QDialog):
             mode=mode,
             ebay_port=self.ebay_port_spin.value(),
             erp_port=self.erp_port_spin.value(),
+            ebay_url_pattern=self.ebay_pattern_edit.text().strip(),
+            erp_url_pattern=self.erp_pattern_edit.text().strip(),
+            wait_timeout_ms=self.timeout_spin.value(),
+            selectors={
+                "ebay_order_id": self.sel_order.text().strip(),
+                "ebay_sku": self.sel_sku.text().strip(),
+                "erp_sku_input": self.sel_erp_input.text().strip(),
+                "erp_location": self.sel_erp_location.text().strip(),
+            },
         )
         logger.info(
             "Settings saved: mode=%s ebay_port=%s erp_port=%s",

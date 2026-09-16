@@ -19,6 +19,9 @@ DEFAULTS: dict[str, Any] = {
     "window_y": 100,
     "emergency_hotkey": "pause",
     "ebay_url_pattern": "ebay.com/sh/ord",
+    "erp_url_pattern": "",
+    "wait_timeout_ms": 10000,
+    "erp_submit_key": "Enter",
     "selectors": {
         "ebay_order_id": "",
         "ebay_sku": "",
