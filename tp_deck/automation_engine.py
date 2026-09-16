@@ -52,43 +52,21 @@ def _url_matches(url: str, pattern: str) -> bool:
     return pattern.lower() in (url or "").lower()
 
 
-async def find_focused_page(
-    browser: Browser,
-    url_pattern: str,
-    *,
-    label: str = "tab",
-) -> Optional[Page]:
-    """
-    Scan every CDP context/page. Match URL pattern AND document.hasFocus()
-    so extraction only targets the tab the user is actively viewing.
-    """
-    candidates = 0
+def _iter_pages(browser: Browser):
     for context in browser.contexts:
         for page in context.pages:
             url = page.url or ""
             if url.startswith("chrome://") or url.startswith("devtools://"):
                 continue
-            if not _url_matches(url, url_pattern):
-                continue
-            candidates += 1
-            focused = await _page_has_focus(page)
-            logger.debug(
-                "Candidate %s url=%s focused=%s",
-                label,
-                url,
-                focused,
-            )
-            if focused:
-                logger.info("Focused %s found: %s", label, url)
-                return page
+            yield page
 
-    logger.warning(
-        "No focused %s matching %r (%s URL candidate(s))",
-        label,
-        url_pattern or "*",
-        candidates,
-    )
-    return None
+
+def _matching_pages(browser: Browser, url_pattern: str) -> list[Page]:
+    return [
+        page
+        for page in _iter_pages(browser)
+        if _url_matches(page.url or "", url_pattern)
+    ]
 
 
 async def find_page_by_url(
@@ -96,25 +74,47 @@ async def find_page_by_url(
     url_pattern: str,
     *,
     label: str = "tab",
-    prefer_focused: bool = True,
 ) -> Optional[Page]:
-    """Find a page by URL substring; optionally prefer the focused match."""
-    if prefer_focused:
-        focused = await find_focused_page(browser, url_pattern, label=label)
-        if focused is not None:
-            return focused
+    """
+    Find a page by URL substring. document.hasFocus() is only used when
+    more than one tab matches, so a unique URL does not need to be focused.
+    """
+    matches = _matching_pages(browser, url_pattern)
+    if not matches:
+        logger.warning("No %s matching %r", label, url_pattern or "*")
+        return None
 
-    for context in browser.contexts:
-        for page in context.pages:
-            url = page.url or ""
-            if url.startswith("chrome://") or url.startswith("devtools://"):
-                continue
-            if _url_matches(url, url_pattern):
-                logger.info("%s matched by URL: %s", label, url)
-                return page
+    if len(matches) == 1:
+        page = matches[0]
+        logger.info("%s matched by unique URL: %s", label, page.url)
+        return page
 
-    logger.warning("No %s matching %r", label, url_pattern or "*")
-    return None
+    focused: list[Page] = []
+    for page in matches:
+        is_focused = await _page_has_focus(page)
+        logger.debug(
+            "Candidate %s url=%s focused=%s",
+            label,
+            page.url,
+            is_focused,
+        )
+        if is_focused:
+            focused.append(page)
+
+    if focused:
+        page = focused[0]
+        logger.info(
+            "Focused %s selected among %s URL matches: %s",
+            label,
+            len(matches),
+            page.url,
+        )
+        return page
+
+    raise RuntimeError(
+        f"Multiple {label}s match {url_pattern!r} ({len(matches)} tabs). "
+        "Click the tab you want, then Execute again."
+    )
 
 
 def _clean_text(value: str) -> str:
@@ -361,7 +361,7 @@ async def scrape_ebay_orders(
     timeout_ms: int,
 ) -> list[tuple[str, str, str, int]]:
     """
-    Collect every order, buyer, SKU, and ordered qty on the focused /sh/ord list
+    Collect every order, buyer, SKU, and ordered qty on the matched /sh/ord list
     before any ERP work.
     """
     sku_sel = _require_selector(selectors, "ebay_sku")
@@ -377,7 +377,7 @@ async def scrape_ebay_orders(
         )
     except Exception as exc:
         raise RuntimeError(
-            "No eBay order rows found on /sh/ord. Focus the order list tab."
+            "No eBay order rows found on /sh/ord. Open the Seller Hub order list."
         ) from exc
 
     await _scroll_ebay_order_list(page)
@@ -606,7 +606,6 @@ async def _resolve_erp_page(
             erp_browser,
             erp_pattern,
             label="ERP tab",
-            prefer_focused=True,
         )
         if page is None:
             raise RuntimeError(
@@ -625,7 +624,6 @@ async def _resolve_erp_page(
         ebay_browser,
         erp_pattern,
         label="ERP tab (same browser)",
-        prefer_focused=False,
     )
     if page is None:
         raise RuntimeError(
@@ -662,15 +660,14 @@ async def run_automation(
         playwright = await async_playwright().start()
         ebay_browser = await connect_over_cdp(playwright, ebay_port)
 
-        ebay_page = await find_focused_page(
+        ebay_page = await find_page_by_url(
             ebay_browser,
             ebay_pattern,
             label="eBay order tab",
         )
         if ebay_page is None:
             raise RuntimeError(
-                f"No focused eBay tab matching {ebay_pattern!r}. "
-                "Click the Seller Hub order tab, then Execute again."
+                f"No eBay tab matching {ebay_pattern!r}."
             )
 
         lines_in = await scrape_ebay_orders(

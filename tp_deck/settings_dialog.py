@@ -129,7 +129,7 @@ Dual mode:
   ERP   → chrome.exe --remote-debugging-port=9223 --user-data-dir="%TEMP%\\tpdeck-erp"
 
 Fill CSS selectors below (DevTools → Copy → Copy selector).
-Execute scrapes Order + SKU from the focused eBay tab, types SKU into ERP,
+Execute scrapes Order + SKU from the eBay order tab (focus only if several match), types SKU into ERP,
 reads Location, then copies: [Order] - [Buyer] - [SKU] - [Location]
 """
 
