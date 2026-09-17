@@ -14,6 +14,9 @@ from tp_deck.sku_cache import SkuLocationCache
 
 logger = logging.getLogger("tpdeck")
 
+UNKNOWN_LOCATION = "Unknown"
+_DEFAULT_EBAY_QTY_SEL = "div.quantity strong"
+
 
 def _cdp_endpoint(port: int) -> str:
     return f"http://127.0.0.1:{int(port)}"
@@ -264,10 +267,13 @@ async def collect_grid_column_texts(
     cells = page.locator(cell_selector)
     try:
         await cells.first.wait_for(state="visible", timeout=timeout_ms)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Timed out waiting for ERP location column ({cell_selector})."
-        ) from exc
+    except Exception:
+        logger.info(
+            "ERP location column not visible within %sms (%s)",
+            timeout_ms,
+            cell_selector,
+        )
+        return []
 
     viewport = page.locator(
         "#ag-grid-inventory-detail .ag-body-viewport"
@@ -369,7 +375,9 @@ async def scrape_ebay_orders(
     buyer_sel = str(selectors.get("ebay_buyer") or "").strip()
     if not buyer_sel:
         buyer_sel = "div.user-details.details span > button > span:nth-child(1)"
-    qty_sel = str(selectors.get("ebay_qty") or "").strip() or "td.item-quantity"
+    qty_sel = (
+        str(selectors.get("ebay_qty") or "").strip() or _DEFAULT_EBAY_QTY_SEL
+    )
 
     try:
         await page.locator("[id$='__order-info']").first.wait_for(
@@ -426,9 +434,24 @@ async def scrape_ebay_orders(
                 return ((el && el.innerText) || '').replace(/\\s+/g, ' ').trim();
             };
             const readQty = (root) => {
-                if (!root || !qtySel) return '1';
-                const el = root.querySelector(qtySel);
-                return ((el && el.innerText) || '1').replace(/\\s+/g, ' ').trim();
+                if (!root) return '1';
+                const textOf = (el) => {
+                    if (!el) return '';
+                    const strong = (el.tagName === 'STRONG')
+                        ? el
+                        : el.querySelector('strong');
+                    return ((strong && strong.innerText) || el.innerText || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                };
+                if (qtySel) {
+                    const fromSel = textOf(root.querySelector(qtySel));
+                    if (fromSel) return fromSel;
+                }
+                const fallback = root.querySelector(
+                    'div.quantity strong, td.item-quantity, div.quantity'
+                );
+                return textOf(fallback) || '1';
             };
 
             document.querySelectorAll('[id$="__order-info"]').forEach((info) => {
@@ -466,7 +489,7 @@ async def scrape_ebay_orders(
                             orderId,
                             buyer,
                             (el.innerText || '').replace(/\\s+/g, ' ').trim(),
-                            '1',
+                            readQty(info),
                             orderId + '|info|' + ((el.innerText || '').trim())
                         );
                     });
@@ -536,45 +559,84 @@ async def lookup_erp_location(
     location_deprioritize_prefixes: Optional[list[str]] = None,
     location_lowest_priority: Optional[list[str]] = None,
 ) -> str:
-    """Type SKU into ERP, wait for grid rows, vote on the best Location."""
+    """Type SKU into ERP, wait for grid rows, vote on the best Location.
+
+    Kit SKUs, unknown SKUs, and empty inventory grids return Unknown
+    instead of aborting the rest of the run.
+    """
     input_sel = _require_selector(selectors, "erp_sku_input")
     location_sel = _require_selector(selectors, "erp_location")
 
     field = await _erp_sku_field(page, input_sel, timeout_ms)
-    await field.click()
-    await field.fill("")
-    await field.fill(sku)
-
-    key = (submit_key or "").strip()
-    if key:
-        await field.press(key)
-
-    overlay = page.locator("#ag-grid-inventory-detail .ag-overlay-loading-wrapper")
     try:
-        await overlay.wait_for(state="visible", timeout=1500)
-        await overlay.wait_for(state="hidden", timeout=timeout_ms)
-    except Exception:
-        await asyncio.sleep(0.4)
+        await field.click()
+        await field.fill("")
+        await field.fill(sku)
 
-    values = await collect_grid_column_texts(
-        page,
-        location_sel,
-        timeout_ms=timeout_ms,
-    )
-    location = pick_best_location(
-        values,
-        blacklist=location_blacklist,
-        deprioritize=location_deprioritize,
-        deprioritize_prefixes=location_deprioritize_prefixes,
-        lowest_priority=location_lowest_priority,
-    )
-    logger.info(
-        "ERP location selected for sku=%s: %s (from %s row(s))",
-        sku,
-        location,
-        len(values),
-    )
-    return location
+        key = (submit_key or "").strip()
+        if key:
+            await field.press(key)
+
+        overlay = page.locator(
+            "#ag-grid-inventory-detail .ag-overlay-loading-wrapper"
+        )
+        no_rows = page.locator(
+            "#ag-grid-inventory-detail .ag-overlay-no-rows-wrapper"
+        )
+        try:
+            await overlay.wait_for(state="visible", timeout=1500)
+            await overlay.wait_for(state="hidden", timeout=timeout_ms)
+        except Exception:
+            await asyncio.sleep(0.4)
+
+        try:
+            if await no_rows.is_visible():
+                logger.warning(
+                    "ERP grid has no rows for sku=%s; using %s",
+                    sku,
+                    UNKNOWN_LOCATION,
+                )
+                return UNKNOWN_LOCATION
+        except Exception:
+            pass
+
+        values = await collect_grid_column_texts(
+            page,
+            location_sel,
+            timeout_ms=timeout_ms,
+        )
+        if not values:
+            logger.warning(
+                "ERP location timeout/empty for sku=%s; using %s",
+                sku,
+                UNKNOWN_LOCATION,
+            )
+            return UNKNOWN_LOCATION
+
+        location = pick_best_location(
+            values,
+            blacklist=location_blacklist,
+            deprioritize=location_deprioritize,
+            deprioritize_prefixes=location_deprioritize_prefixes,
+            lowest_priority=location_lowest_priority,
+        )
+        logger.info(
+            "ERP location selected for sku=%s: %s (from %s row(s))",
+            sku,
+            location,
+            len(values),
+        )
+        return location
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "ERP location lookup failed for sku=%s: %s — using %s",
+            sku,
+            exc,
+            UNKNOWN_LOCATION,
+        )
+        return UNKNOWN_LOCATION
 
 
 def format_output(order_id: str, buyer: str, sku: str, location: str) -> str:
@@ -632,6 +694,39 @@ async def _resolve_erp_page(
     return page
 
 
+async def _refresh_ebay_order_page(page: Page, timeout_ms: int) -> None:
+    """Reload Seller Hub so the scrape includes newly arrived orders."""
+    reload_timeout = max(int(timeout_ms), 30000)
+    logger.info("Refreshing eBay order tab: %s", page.url)
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=reload_timeout)
+    except Exception as exc:
+        raise RuntimeError(
+            f"eBay refresh failed ({exc}). Keep Seller Hub open and try again."
+        ) from exc
+    try:
+        await page.wait_for_load_state("load", timeout=reload_timeout)
+    except Exception:
+        logger.info("eBay load event not observed; waiting for order rows")
+    try:
+        await page.locator("[id$='__order-info']").first.wait_for(
+            state="visible", timeout=reload_timeout
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "eBay order list did not appear after refresh."
+        ) from exc
+    logger.info("eBay order tab refreshed")
+
+
+def _unknown_count(location_by_sku: dict[str, str]) -> int:
+    return sum(
+        1
+        for loc in location_by_sku.values()
+        if str(loc).strip().casefold() == UNKNOWN_LOCATION.casefold()
+    )
+
+
 async def run_automation(
     settings: dict[str, Any],
     *,
@@ -670,6 +765,7 @@ async def run_automation(
                 f"No eBay tab matching {ebay_pattern!r}."
             )
 
+        await _refresh_ebay_order_page(ebay_page, timeout_ms)
         lines_in = await scrape_ebay_orders(
             ebay_page,
             selectors,
@@ -734,12 +830,14 @@ async def run_automation(
                 cache.save()
 
         hits = len(unique_skus) - len(misses)
+        unknowns = _unknown_count(location_by_sku)
+        unknown_bit = f", {unknowns} unknown" if unknowns else ""
         job_name = str(job or "orders").lower()
 
         if job_name == "picklist":
             combined: dict[str, list] = {}
             for _order_id, _buyer, sku, qty in lines_in:
-                loc = location_by_sku.get(sku, "")
+                loc = location_by_sku.get(sku, UNKNOWN_LOCATION)
                 if sku not in combined:
                     combined[sku] = [0, loc]
                 combined[sku][0] += max(1, int(qty))
@@ -752,13 +850,18 @@ async def run_automation(
             logger.info("Pick list success:\n%s", output)
             return (
                 f"Success — pick list {len(pick_items)} SKU(s), "
-                f"{len(misses)} lookup(s), {hits} cache hit(s)"
+                f"{len(misses)} lookup(s), {hits} cache hit(s){unknown_bit}"
             )
 
         lines_out: list[str] = []
         for order_id, buyer, sku, _qty in lines_in:
             lines_out.append(
-                format_output(order_id, buyer, sku, location_by_sku[sku])
+                format_output(
+                    order_id,
+                    buyer,
+                    sku,
+                    location_by_sku.get(sku, UNKNOWN_LOCATION),
+                )
             )
 
         output = "\n".join(lines_out)
@@ -766,7 +869,7 @@ async def run_automation(
         logger.info("Automation success: %s", output)
         return (
             f"Success — {len(lines_out)} line(s), "
-            f"{len(misses)} lookup(s), {hits} cache hit(s)"
+            f"{len(misses)} lookup(s), {hits} cache hit(s){unknown_bit}"
         )
 
     except asyncio.CancelledError:

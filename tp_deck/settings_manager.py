@@ -32,7 +32,7 @@ DEFAULTS: dict[str, Any] = {
         "ebay_order_id": "",
         "ebay_buyer": "",
         "ebay_sku": "",
-        "ebay_qty": "",
+        "ebay_qty": "div.quantity strong",
         "erp_sku_input": "",
         "erp_location": "",
     },

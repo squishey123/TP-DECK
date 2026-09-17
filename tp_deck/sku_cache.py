@@ -69,12 +69,15 @@ class SkuLocationCache:
         entry = self._data.get(sku)
         if not entry:
             return None
-        return str(entry.get("location") or "") or None
+        location = str(entry.get("location") or "") or None
+        if location and location.casefold() == "unknown":
+            return None
+        return location
 
     def put(self, sku: str, location: str) -> None:
         sku = (sku or "").strip()
         location = (location or "").strip()
-        if not sku or not location:
+        if not sku or not location or location.casefold() == "unknown":
             return
         self._data[sku] = {"location": location, "ts": time.time()}
         self._dirty = True
