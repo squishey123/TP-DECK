@@ -27,3 +27,6 @@ python-embed/
 dist/
 build/
 *.egg-info/
+
+# Local scratch dumps / notes (not part of the app)
+Mailbox/

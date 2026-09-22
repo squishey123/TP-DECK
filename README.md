@@ -48,13 +48,46 @@ Open your eBay Seller Hub order tab and ERP tab in those profiles, fill selector
 - **qasync** — shared Qt + asyncio event loop
 - **asyncio** — cancelable background automation tasks
 
-## Packaging note
+## Packaging / coworker zip
 
-The shipped app will use Windows Embedded Python (`.zip`) launched via a `.bat` script — not PyInstaller `--onefile`. Local development:
+Do **not** use PyInstaller `--onefile`. Defender often flags those. Releases are official **python.org embeddable Python** plus the `.py` files, started with `TP-DECK.bat`.
 
-```bat
-TP-DECK.bat
+### Build the zip (on this machine)
+
+From the repo root in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
+
+Output: `dist\TP-DECK-0.2.0-windows-x64.zip`
+
+Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
+
+### Publish a GitHub Release
+
+1. Commit the version you want to ship (`tp_deck/__init__.py` is the zip version).
+2. Push `main`.
+3. Create an annotated tag and push it:
+
+```powershell
+git tag -a v0.2.0 -m "TP DECK 0.2.0"
+git push origin v0.2.0
+```
+
+4. Upload the zip (GitHub website **or** `gh`):
+
+**Website:** repo → **Releases** → **Draft a new release** → choose tag `v0.2.0` → title `TP DECK 0.2.0` → attach `dist\TP-DECK-0.2.0-windows-x64.zip` → **Publish release**.
+
+**CLI:**
+
+```powershell
+gh release create v0.2.0 "dist/TP-DECK-0.2.0-windows-x64.zip" --title "TP DECK 0.2.0" --notes "Embeddable Python zip. Unzip and run TP-DECK.bat. Chrome must be started with --remote-debugging-port=9222."
+```
+
+5. Send coworkers the **Release** page or an internal copy of the zip (internal share is less likely to trip SmartScreen than a random email attachment).
+
+If Windows shows “unrecognized app”, that is SmartScreen reputation on a new file, not a packed exe. Prefer **More info → Run anyway** after IT is aware, or host the zip on SharePoint/a file share.
 
 ## Project layout
 
