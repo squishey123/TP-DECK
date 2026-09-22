@@ -28,6 +28,11 @@ DEFAULTS: dict[str, Any] = {
     "location_lowest_priority": ["HQ"],
     "cache_ttl_hours": 12,
     "cache_enabled": True,
+    "ebay_refresh_hold_enabled": True,
+    "ebay_refresh_hold_minutes": 5,
+    "pick_list_exclude_locations": ["HQ", "unavailable"],
+    "pick_list_exclude_prefixes": ["PR"],
+    "pick_list_exclude_misc": True,
     "selectors": {
         "ebay_order_id": "",
         "ebay_buyer": "",

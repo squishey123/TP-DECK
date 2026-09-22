@@ -193,6 +193,21 @@ class SettingsDialog(QDialog):
             "looks up live ERP data."
         )
         ports_form.addRow("", self.cache_enabled_check)
+        self.refresh_hold_check = QCheckBox("Skip eBay refresh when recent")
+        self.refresh_hold_check.setToolTip(
+            "If Seller Hub was reloaded inside this window, Execute and "
+            "Pick List continue without waiting for another refresh."
+        )
+        self.refresh_hold_check.toggled.connect(self._on_refresh_hold_toggled)
+        ports_form.addRow("", self.refresh_hold_check)
+        self.refresh_hold_spin = QSpinBox()
+        self.refresh_hold_spin.setRange(1, 180)
+        self.refresh_hold_spin.setSuffix(" min")
+        self.refresh_hold_spin.setToolTip(
+            "How long a completed eBay refresh stays valid. "
+            "Uncheck the option above to refresh on every run."
+        )
+        ports_form.addRow("eBay refresh hold:", self.refresh_hold_spin)
         layout.addWidget(ports_box)
 
         sel_box = QGroupBox("CSS Selectors")
@@ -249,6 +264,14 @@ class SettingsDialog(QDialog):
         self.cache_enabled_check.setChecked(
             bool(settings.get("cache_enabled", True))
         )
+        self.refresh_hold_check.setChecked(
+            bool(settings.get("ebay_refresh_hold_enabled", True))
+        )
+        try:
+            hold_minutes = int(settings.get("ebay_refresh_hold_minutes", 5))
+        except (TypeError, ValueError):
+            hold_minutes = 5
+        self.refresh_hold_spin.setValue(max(1, min(180, hold_minutes)))
 
         selectors = settings.get("selectors") or {}
         self.sel_order.setText(str(selectors.get("ebay_order_id", "")))
@@ -258,10 +281,14 @@ class SettingsDialog(QDialog):
         self.sel_erp_input.setText(str(selectors.get("erp_sku_input", "")))
         self.sel_erp_location.setText(str(selectors.get("erp_location", "")))
         self._on_mode_toggled()
+        self._on_refresh_hold_toggled()
 
     def _on_mode_toggled(self) -> None:
         dual = self.dual_radio.isChecked()
         self.erp_port_spin.setEnabled(dual)
+
+    def _on_refresh_hold_toggled(self) -> None:
+        self.refresh_hold_spin.setEnabled(self.refresh_hold_check.isChecked())
 
     def _save(self) -> None:
         mode = "dual" if self.dual_radio.isChecked() else "single"
@@ -273,6 +300,8 @@ class SettingsDialog(QDialog):
             erp_url_pattern=self.erp_pattern_edit.text().strip(),
             wait_timeout_ms=self.timeout_spin.value(),
             cache_enabled=self.cache_enabled_check.isChecked(),
+            ebay_refresh_hold_enabled=self.refresh_hold_check.isChecked(),
+            ebay_refresh_hold_minutes=self.refresh_hold_spin.value(),
             selectors={
                 "ebay_order_id": self.sel_order.text().strip(),
                 "ebay_buyer": self.sel_buyer.text().strip(),

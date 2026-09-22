@@ -5,11 +5,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Any, Optional
 
 from playwright.async_api import Browser, Page, Playwright, async_playwright
 
-from tp_deck.pick_list import build_pick_list, parse_quantity
+from tp_deck.pick_list import (
+    build_pick_list,
+    is_excluded_pick_location,
+    parse_quantity,
+)
+from tp_deck.settings_manager import update_settings
 from tp_deck.sku_cache import SkuLocationCache
 
 logger = logging.getLogger("tpdeck")
@@ -694,6 +700,42 @@ async def _resolve_erp_page(
     return page
 
 
+def _ebay_refresh_hold_seconds(settings: dict[str, Any]) -> float:
+    if not bool(settings.get("ebay_refresh_hold_enabled", True)):
+        return 0.0
+    try:
+        minutes = float(settings.get("ebay_refresh_hold_minutes", 5))
+    except (TypeError, ValueError):
+        minutes = 5.0
+    return max(0.0, minutes) * 60.0
+
+
+def _skip_ebay_refresh(settings: dict[str, Any]) -> bool:
+    """True when Seller Hub was reloaded inside the configured hold window."""
+    hold = _ebay_refresh_hold_seconds(settings)
+    if hold <= 0:
+        return False
+    try:
+        last = float(settings.get("ebay_last_refresh_epoch") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if last <= 0:
+        return False
+    elapsed = time.time() - last
+    if elapsed < hold:
+        logger.info(
+            "Skipping eBay refresh; last refresh %.0fs ago (hold %.0fs)",
+            elapsed,
+            hold,
+        )
+        return True
+    return False
+
+
+def _mark_ebay_refreshed() -> None:
+    update_settings(ebay_last_refresh_epoch=time.time())
+
+
 async def _refresh_ebay_order_page(page: Page, timeout_ms: int) -> None:
     """Reload Seller Hub so the scrape includes newly arrived orders."""
     reload_timeout = max(int(timeout_ms), 30000)
@@ -717,6 +759,7 @@ async def _refresh_ebay_order_page(page: Page, timeout_ms: int) -> None:
             "eBay order list did not appear after refresh."
         ) from exc
     logger.info("eBay order tab refreshed")
+    _mark_ebay_refreshed()
 
 
 def _unknown_count(location_by_sku: dict[str, str]) -> int:
@@ -765,7 +808,8 @@ async def run_automation(
                 f"No eBay tab matching {ebay_pattern!r}."
             )
 
-        await _refresh_ebay_order_page(ebay_page, timeout_ms)
+        if not _skip_ebay_refresh(settings):
+            await _refresh_ebay_order_page(ebay_page, timeout_ms)
         lines_in = await scrape_ebay_orders(
             ebay_page,
             selectors,
@@ -842,15 +886,39 @@ async def run_automation(
                     combined[sku] = [0, loc]
                 combined[sku][0] += max(1, int(qty))
                 combined[sku][1] = loc
-            pick_items = [
-                (sku, loc, qty) for sku, (qty, loc) in combined.items()
-            ]
-            output = build_pick_list(pick_items)
+            exclude_names = settings.get("pick_list_exclude_locations")
+            exclude_prefixes = settings.get("pick_list_exclude_prefixes")
+            exclude_misc = bool(settings.get("pick_list_exclude_misc", True))
+            pick_items = []
+            skipped = 0
+            for sku, (qty, loc) in combined.items():
+                if is_excluded_pick_location(
+                    loc,
+                    exclude_names=exclude_names,
+                    exclude_prefixes=exclude_prefixes,
+                    exclude_misc=exclude_misc,
+                ):
+                    skipped += 1
+                    logger.info(
+                        "Pick list skipped %s at %s (not a pick location)",
+                        sku,
+                        loc,
+                    )
+                    continue
+                pick_items.append((sku, loc, qty))
+            output = build_pick_list(
+                pick_items,
+                exclude_names=exclude_names,
+                exclude_prefixes=exclude_prefixes,
+                exclude_misc=exclude_misc,
+            )
             copy_to_clipboard(output)
             logger.info("Pick list success:\n%s", output)
+            skipped_bit = f", {skipped} skipped" if skipped else ""
             return (
                 f"Success — pick list {len(pick_items)} SKU(s), "
-                f"{len(misses)} lookup(s), {hits} cache hit(s){unknown_bit}"
+                f"{len(misses)} lookup(s), {hits} cache hit(s)"
+                f"{unknown_bit}{skipped_bit}"
             )
 
         lines_out: list[str] = []

@@ -75,16 +75,65 @@ def location_group_and_key(location: str) -> tuple:
     return (GROUP_MISC, (upper,))
 
 
+def is_excluded_pick_location(
+    location: str,
+    *,
+    exclude_names: Iterable[str] | None = None,
+    exclude_prefixes: Iterable[str] | None = None,
+    exclude_misc: bool = True,
+) -> bool:
+    """
+    Drop bins that warehouse picking does not walk.
+    Named tech bins (HQ, unavailable), prefixes such as PR, and any
+    location that does not match a warehouse walk group.
+    """
+    loc = re.sub(r"\s+", " ", (location or "")).strip()
+    if not loc:
+        return True
+    upper = loc.upper()
+    names = {
+        str(name).strip().upper()
+        for name in (exclude_names or [])
+        if str(name).strip()
+    }
+    if upper in names:
+        return True
+    prefixes = [
+        str(prefix).strip().upper()
+        for prefix in (exclude_prefixes or [])
+        if str(prefix).strip()
+    ]
+    if any(upper.startswith(prefix) for prefix in prefixes):
+        return True
+    if exclude_misc:
+        group, _key = location_group_and_key(loc)
+        if group == GROUP_MISC:
+            return True
+    return False
+
+
 def build_pick_list(
     items: Iterable[tuple[str, str, int]],
+    *,
+    exclude_names: Iterable[str] | None = None,
+    exclude_prefixes: Iterable[str] | None = None,
+    exclude_misc: bool = True,
 ) -> str:
     """
     items: (sku, location, quantity) already combined per SKU.
     Output grouped sections, SKUs sorted by walk order then SKU.
+    Tech and other non-walk locations are omitted.
     """
     rows = []
     for sku, location, qty in items:
         if not sku or qty < 1:
+            continue
+        if is_excluded_pick_location(
+            location,
+            exclude_names=exclude_names,
+            exclude_prefixes=exclude_prefixes,
+            exclude_misc=exclude_misc,
+        ):
             continue
         group, key = location_group_and_key(location)
         rows.append((group, key, str(sku), str(location), int(qty)))

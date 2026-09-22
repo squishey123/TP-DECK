@@ -24,6 +24,16 @@
   ],
   "cache_ttl_hours": 12,
   "cache_enabled": true,
+  "ebay_refresh_hold_enabled": true,
+  "ebay_refresh_hold_minutes": 5,
+  "pick_list_exclude_locations": [
+    "HQ",
+    "unavailable"
+  ],
+  "pick_list_exclude_prefixes": [
+    "PR"
+  ],
+  "pick_list_exclude_misc": true,
   "selectors": {
     "ebay_order_id": "[id$=\"__order-info\"] .order-details",
     "ebay_buyer": "div.user-details.details span > button > span:nth-child(1)",
