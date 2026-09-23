@@ -1,12 +1,12 @@
 # TP DECK
 
-**Techyparts Data Entry Control Keeper** — a native Windows multimonitor utility that automates repetitive inventory data entry between eBay Seller Hub orders and an internal ERP, without launching new browser windows.
+**Techyparts Data Entry Control Keeper** — a native Windows multimonitor utility that automates repetitive inventory data entry between eBay Seller Hub orders and an internal ERP. Opening the app starts a separate Chromium window; each scrape attaches to that window.
 
 ## How it works (v1)
 
-1. You already have Chrome running with remote debugging enabled (CDP).
+1. Open TP DECK. It starts Playwright's Chromium minimized, with remote debugging, and restores the last session. The first open downloads Chromium into a `browser` folder next to the app (network required once). If the debug port is already open, that window is left where you put it.
 2. TP DECK opens as a compact, always-on-top floating panel and remembers its position across monitors.
-3. You click **Scrape eBay Orders** or **Generate Pick List**. Playwright attaches to your existing Chrome session(s) over CDP — it never calls `launch()`.
+3. You click **Scrape eBay Orders** or **Generate Pick List**. Playwright attaches to that Chromium session over CDP — it never calls `launch()`.
 4. The engine finds the focused eBay order tab (`ebay.com/sh/ord` + `document.hasFocus()`), scrapes Order, buyer, SKU, and quantity via CSS selectors from `settings.json`.
 5. It locates the ERP tab, enters each SKU, waits for Location, then copies either  
    `[Order] - [Buyer] - [SKU] - [Location]` (scrape) or a walk-sorted pick list  
@@ -19,12 +19,16 @@
 
 | Mode | Behavior |
 |------|----------|
-| **Single** | One Chrome instance on the eBay CDP port (default `9222`); set `erp_url_pattern` so the ERP tab can be found in the same browser |
-| **Dual** | eBay on `9222`, ERP on `9223` |
+| **Single** | One Chromium window on the eBay CDP port (default `9222`); set `erp_url_pattern` so the ERP tab can be found in the same browser |
+| **Dual** | eBay on `9222`, ERP on `9223` (two Chromium windows) |
 
-All ports, CSS selectors, URL patterns, timeouts, hotkeys, and window geometry live in `tp_deck/settings.json` (also editable in **⚙ Settings**).
+All ports, CSS selectors, URL patterns, timeouts, hotkeys, and window geometry live in `tp_deck/settings.json` (also editable in **⚙ Settings**). `chrome_version` records the Playwright Chromium revision after the first install.
 
-### Chrome CDP setup
+### Chromium
+
+Opening TP DECK is the daily start. Chromium stays minimized and restores yesterday's eBay and ERP tabs. Log into those sites in that window once. Profiles live in `browser/profile` (and `browser/profile-erp` in dual mode), separate from installed Chrome.
+
+If automatic start fails, launch a browser yourself:
 
 **Single mode:**
 ```bat
@@ -37,7 +41,7 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\tpdeck-ebay"
 chrome.exe --remote-debugging-port=9223 --user-data-dir="%TEMP%\tpdeck-erp"
 ```
 
-Open your eBay Seller Hub order tab and ERP tab in those profiles, fill selectors in Settings, then run TP DECK.
+Then focus the eBay order tab and run TP DECK again.
 
 ## Tech stack
 
@@ -60,7 +64,7 @@ From the repo root in PowerShell:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-Output: `dist\TP-DECK-0.2.0-windows-x64.zip`
+Output: `dist\TP-DECK-0.2.2-windows-x64.zip`
 
 Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 
@@ -71,18 +75,18 @@ Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 3. Create an annotated tag and push it:
 
 ```powershell
-git tag -a v0.2.0 -m "TP DECK 0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.2 -m "TP DECK 0.2.2"
+git push origin v0.2.2
 ```
 
 4. Upload the zip (GitHub website **or** `gh`):
 
-**Website:** repo → **Releases** → **Draft a new release** → choose tag `v0.2.0` → title `TP DECK 0.2.0` → attach `dist\TP-DECK-0.2.0-windows-x64.zip` → **Publish release**.
+**Website:** repo → **Releases** → **Draft a new release** → choose tag `v0.2.2` → title `TP DECK 0.2.2` → attach `dist\TP-DECK-0.2.2-windows-x64.zip` → **Publish release**.
 
 **CLI:**
 
 ```powershell
-gh release create v0.2.0 "dist/TP-DECK-0.2.0-windows-x64.zip" --title "TP DECK 0.2.0" --notes "Embeddable Python zip. Unzip and run TP-DECK.bat. Chrome must be started with --remote-debugging-port=9222."
+gh release create v0.2.2 "dist/TP-DECK-0.2.2-windows-x64.zip" --title "TP DECK 0.2.2" --notes "Embeddable Python zip. Unzip and run TP-DECK.bat. Chrome must be started with --remote-debugging-port=9222."
 ```
 
 5. Send coworkers the **Release** page or an internal copy of the zip (internal share is less likely to trip SmartScreen than a random email attachment).
@@ -98,6 +102,7 @@ TP-DECK/
 ├── requirements.txt
 └── tp_deck/
     ├── main.py             # Entry point, event loop, hotkey registration
+    ├── chrome_launcher.py  # Install and start minimized Chromium on open
     ├── dashboard.py        # Floating UI, theme, position persistence
     ├── settings_dialog.py  # Mode, ports, patterns, selectors, setup help
     ├── automation_engine.py# CDP connect, tab focus, scrape, clipboard
@@ -123,7 +128,7 @@ TP-DECK.bat
 
 Or `pythonw main.py`. Set `TPDECK_DEBUG=1` to keep a console for live logs.
 
-**v1 check:** Chrome with CDP → focused eBay order tab → selectors configured → Execute → clipboard gets `Order - SKU - Location`. Pause / Emergency Stop cancels mid-run.
+**v1 check:** Open TP DECK (Chromium starts minimized) → focused eBay order tab → selectors configured → Execute → clipboard gets `Order - SKU - Location`. Pause / Emergency Stop cancels mid-run.
 
 ## Theme
 

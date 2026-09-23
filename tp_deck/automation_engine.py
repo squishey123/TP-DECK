@@ -37,7 +37,7 @@ async def connect_over_cdp(playwright: Playwright, port: int) -> Browser:
     except Exception as exc:
         raise RuntimeError(
             f"CDP connect failed on port {port}. "
-            f"Is Chrome running with --remote-debugging-port={port}? ({exc})"
+            f"Open TP DECK again so Chromium can start on that port. ({exc})"
         ) from exc
     logger.info(
         "CDP connected (port=%s, contexts=%s)",

@@ -203,6 +203,11 @@ class Dashboard(QMainWindow):
         self.status_label.setText(_format_status(text))
         self.status_label.setToolTip(str(text or "").strip())
 
+    def set_actions_enabled(self, enabled: bool) -> None:
+        """Enable or disable scrape and pick list without changing their labels."""
+        self.execute_btn.setEnabled(enabled)
+        self.pick_btn.setEnabled(enabled)
+
     def set_processing(self, active: bool, job: str = "orders") -> None:
         """Disable action buttons while a run is in flight; restore in finally."""
         if active:

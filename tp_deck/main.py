@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
 from tp_deck.automation_engine import run_automation
+from tp_deck.chrome_launcher import ensure_debug_chromium
 from tp_deck.dashboard import Dashboard
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
@@ -137,6 +138,22 @@ def _register_emergency_hotkey(controller: AutomationController) -> None:
     )
 
 
+async def _prepare_chromium(dashboard: Dashboard) -> None:
+    """Start minimized Chromium before scrape and pick list can run."""
+    logger = logging.getLogger("tpdeck")
+    try:
+        await ensure_debug_chromium(load_settings(), dashboard.set_status)
+    except Exception as exc:
+        message = str(exc).strip() or exc.__class__.__name__
+        dashboard.set_status(f"Error — {message}")
+        logger.exception("Chromium startup failed")
+    else:
+        dashboard.set_status("Idle")
+        logger.info("Chromium ready")
+    finally:
+        dashboard.set_actions_enabled(True)
+
+
 def main() -> int:
     keep_console = os.environ.get("TPDECK_DEBUG", "").strip() in {
         "1",
@@ -186,9 +203,12 @@ def main() -> int:
             exc,
         )
 
+    dashboard.set_actions_enabled(False)
+    dashboard.set_status("Starting Chromium")
     dashboard.show()
 
     with loop:
+        loop.create_task(_prepare_chromium(dashboard), name="tpdeck-chromium")
         loop.run_forever()
     return 0
 

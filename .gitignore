@@ -30,3 +30,6 @@ build/
 
 # Local scratch dumps / notes (not part of the app)
 Mailbox/
+
+# Portable Chromium download and its profiles (created on first launch)
+browser/

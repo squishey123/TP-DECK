@@ -1,13 +1,9 @@
 TP DECK — how to run (no Python install needed)
 
 1. Unzip this folder anywhere (example: C:\Apps\TP-DECK).
-2. Start Chrome with remote debugging (PowerShell):
-
-   & "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:TEMP\tpdeck-chrome"
-
-3. In that Chrome, open Seller Hub orders (ebay.com/sh/ord) and RazorERP Inventory Detail.
-4. Double-click TP-DECK.bat
-5. Click "Scrape eBay Orders" or "Generate Pick List"
+2. Double-click TP-DECK.bat. The first open downloads Chromium (needs network once) and starts it minimized. Later opens restore the last tabs.
+3. In that Chromium window, open Seller Hub orders (ebay.com/sh/ord) and RazorERP Inventory Detail. You only need to log in once.
+4. Click "Scrape eBay Orders" or "Generate Pick List" when the status says Idle.
 
 Emergency stop: red button, or the Pause/Break key.
 

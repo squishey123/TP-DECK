@@ -15,6 +15,7 @@ DEFAULTS: dict[str, Any] = {
     "mode": "single",
     "ebay_port": 9222,
     "erp_port": 9223,
+    "chrome_version": "",
     "window_x": 100,
     "window_y": 100,
     "emergency_hotkey": "pause",

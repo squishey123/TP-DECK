@@ -119,7 +119,12 @@ QPushButton#saveBtn:hover {
 """
 
 SETUP_INSTRUCTIONS = """\
-Chrome CDP launch (run once per browser profile):
+Opening TP DECK starts Chromium minimized and restores the last session.
+Log into eBay Seller Hub and the ERP in that window once. The profile stays
+in the browser folder next to the app, separate from installed Chrome.
+The first open downloads Chromium (network required once).
+
+If that automatic start fails, launch a browser yourself:
 
 Single mode (port 9222):
   chrome.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\\tpdeck-chrome"
