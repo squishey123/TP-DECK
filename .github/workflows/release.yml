@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release zip
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/build_release.ps1
+
+      - name: Read version and verify tag
+        id: ver
+        shell: pwsh
+        run: |
+          $init = Get-Content tp_deck/__init__.py -Raw
+          if ($init -notmatch '__version__\s*=\s*"([^"]+)"') {
+            throw "Could not read version from tp_deck/__init__.py"
+          }
+          $version = $Matches[1]
+          $expectedTag = "v$version"
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -ne $expectedTag) {
+            throw "Tag '$tag' does not match package version '$expectedTag'. Bump tp_deck/__init__.py or retag."
+          }
+          $zip = "dist/TP-DECK-$version-windows-x64.zip"
+          if (-not (Test-Path $zip)) {
+            throw "Expected zip not found: $zip"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release $expectedTag → $zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.ver.outputs.zip }}
+          name: TP DECK ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          body: |
+            Embeddable Python zip. Unzip and run `TP-DECK.bat`.
+
+            Opening TP DECK starts Chromium minimized (first run needs network once to download it). Log into eBay Seller Hub and the ERP in that window once.

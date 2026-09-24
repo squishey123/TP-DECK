@@ -68,28 +68,34 @@ Output: `dist\TP-DECK-0.2.2-windows-x64.zip`
 
 Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 
-### Publish a GitHub Release
+### Publish a GitHub Release (recommended)
 
-1. Commit the version you want to ship (`tp_deck/__init__.py` is the zip version).
-2. Push `main`.
-3. Create an annotated tag and push it:
+Pushing a version tag runs `.github/workflows/release.yml` on Windows: it builds the zip and creates the GitHub Release with the asset attached.
+
+1. Bump `tp_deck/__init__.py` (e.g. `0.2.3`), commit, and push `main`.
+2. Tag that commit and push the tag (tag must match `v` + `__version__`):
+
+```powershell
+git tag -a v0.2.3 -m "TP DECK 0.2.3"
+git push origin v0.2.3
+```
+
+3. Watch **Actions → Release**. When it finishes, the zip is on the **Releases** page.
+
+### Publish locally (optional)
+
+If you need a zip without GitHub Actions:
+
+1. Build with `scripts\build_release.ps1` (above).
+2. Tag and upload with `gh`:
 
 ```powershell
 git tag -a v0.2.2 -m "TP DECK 0.2.2"
 git push origin v0.2.2
+gh release create v0.2.2 "dist/TP-DECK-0.2.2-windows-x64.zip" --title "TP DECK 0.2.2" --notes "Embeddable Python zip. Unzip and run TP-DECK.bat."
 ```
 
-4. Upload the zip (GitHub website **or** `gh`):
-
-**Website:** repo → **Releases** → **Draft a new release** → choose tag `v0.2.2` → title `TP DECK 0.2.2` → attach `dist\TP-DECK-0.2.2-windows-x64.zip` → **Publish release**.
-
-**CLI:**
-
-```powershell
-gh release create v0.2.2 "dist/TP-DECK-0.2.2-windows-x64.zip" --title "TP DECK 0.2.2" --notes "Embeddable Python zip. Unzip and run TP-DECK.bat. Chrome must be started with --remote-debugging-port=9222."
-```
-
-5. Send coworkers the **Release** page or an internal copy of the zip (internal share is less likely to trip SmartScreen than a random email attachment).
+Send coworkers the **Release** page or an internal copy of the zip (internal share is less likely to trip SmartScreen than a random email attachment).
 
 If Windows shows “unrecognized app”, that is SmartScreen reputation on a new file, not a packed exe. Prefer **More info → Run anyway** after IT is aware, or host the zip on SharePoint/a file share.
 
