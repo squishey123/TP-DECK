@@ -6,7 +6,8 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 from playwright.async_api import Browser, Page, Playwright, async_playwright
 
@@ -21,6 +22,14 @@ from tp_deck.sku_cache import SkuLocationCache
 logger = logging.getLogger("tpdeck")
 
 UNKNOWN_LOCATION = "Unknown"
+
+
+@dataclass(frozen=True)
+class AutomationResult:
+    """Status line for the dashboard, plus clipboard text when a job copied it."""
+
+    status: str
+    clipboard_text: Optional[str] = None
 _DEFAULT_EBAY_QTY_SEL = "div.quantity strong"
 
 
@@ -770,14 +779,25 @@ def _unknown_count(location_by_sku: dict[str, str]) -> int:
     )
 
 
+def _setting_int(settings: dict[str, Any], key: str, default: int) -> int:
+    try:
+        return int(settings.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 async def run_automation(
     settings: dict[str, Any],
     *,
     job: str = "orders",
-) -> str:
+    copy_clipboard: bool = True,
+) -> AutomationResult:
     """
     job=orders: clipboard Order - Buyer - SKU - Location
     job=picklist: combined qty pick walk list
+
+    copy_clipboard=False is the auto-cycle cache pass: same scrape and ERP
+    lookup, no clipboard text and no results popup payload.
     """
     mode = str(settings.get("mode", "single")).lower()
     ebay_port = int(settings.get("ebay_port", 9222))
@@ -912,14 +932,32 @@ async def run_automation(
                 exclude_prefixes=exclude_prefixes,
                 exclude_misc=exclude_misc,
             )
-            copy_to_clipboard(output)
+            if copy_clipboard:
+                copy_to_clipboard(output)
             logger.info("Pick list success:\n%s", output)
             skipped_bit = f", {skipped} skipped" if skipped else ""
-            return (
-                f"Success — pick list {len(pick_items)} SKU(s), "
-                f"{len(misses)} lookup(s), {hits} cache hit(s)"
-                f"{unknown_bit}{skipped_bit}"
+            return AutomationResult(
+                status=(
+                    f"Success — pick list {len(pick_items)} SKU(s), "
+                    f"{len(misses)} lookup(s), {hits} cache hit(s)"
+                    f"{unknown_bit}{skipped_bit}"
+                ),
+                clipboard_text=output if copy_clipboard else None,
             )
+
+        if not copy_clipboard:
+            if not cache_enabled:
+                status = (
+                    f"Cycling — {len(unique_skus)} SKU(s), "
+                    "cache is off — locations will not be stored"
+                )
+            else:
+                status = (
+                    f"Cycling — {len(unique_skus)} SKU(s) cached, "
+                    f"{len(misses)} lookup(s), {hits} cache hit(s){unknown_bit}"
+                )
+            logger.info("Auto-cycle cache pass: %s", status)
+            return AutomationResult(status=status)
 
         lines_out: list[str] = []
         for order_id, buyer, sku, _qty in lines_in:
@@ -935,9 +973,12 @@ async def run_automation(
         output = "\n".join(lines_out)
         copy_to_clipboard(output)
         logger.info("Automation success: %s", output)
-        return (
-            f"Success — {len(lines_out)} line(s), "
-            f"{len(misses)} lookup(s), {hits} cache hit(s){unknown_bit}"
+        return AutomationResult(
+            status=(
+                f"Success — {len(lines_out)} line(s), "
+                f"{len(misses)} lookup(s), {hits} cache hit(s){unknown_bit}"
+            ),
+            clipboard_text=output,
         )
 
     except asyncio.CancelledError:
@@ -957,3 +998,200 @@ async def run_automation(
                 await playwright.stop()
             except Exception as exc:
                 logger.debug("Playwright stop: %s", exc)
+
+
+async def _disconnect_browsers(
+    playwright: Optional[Playwright],
+    *browsers: Optional[Browser],
+) -> None:
+    for browser in browsers:
+        if browser is None:
+            continue
+        try:
+            await browser.close()
+        except Exception as exc:
+            logger.debug("Browser disconnect: %s", exc)
+    if playwright is not None:
+        try:
+            await playwright.stop()
+        except Exception as exc:
+            logger.debug("Playwright stop: %s", exc)
+
+
+async def _serial_field(page: Page, selector: str, timeout_ms: int):
+    """Resolve the sales-order serial box, including when the selector is a wrapper."""
+    root = page.locator(selector).first
+    try:
+        await root.wait_for(state="visible", timeout=timeout_ms)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Timed out waiting for the serial box ({selector}). "
+            "Open the sales order, then check the ERP serial input selector."
+        ) from exc
+
+    inner = root.locator("input:not([type='hidden']), textarea")
+    if await inner.count() > 0:
+        field = inner.first
+        await field.wait_for(state="visible", timeout=timeout_ms)
+        return field
+    return root
+
+
+async def _field_value(field) -> str:
+    try:
+        return str(await field.input_value() or "").strip()
+    except Exception:
+        text = await field.evaluate(
+            "el => (el.value || el.innerText || '').replace(/\\s+/g, ' ').trim()"
+        )
+        return str(text or "").strip()
+
+
+async def _submit_one_serial(
+    field,
+    serial: str,
+    submit_key: str,
+    timeout_ms: int,
+    confirm_ms: int,
+) -> bool:
+    """
+    Fill one serial and press Enter. Success is the box staying empty after
+    a short confirm wait. A timeout means this serial was not accepted.
+    """
+    await field.click()
+    await field.fill("")
+    await field.fill(serial)
+    current = await _field_value(field)
+    if serial.casefold() not in current.casefold():
+        logger.warning(
+            "Serial field did not accept %r (value=%r)", serial, current
+        )
+        return False
+
+    key = (submit_key or "").strip() or "Enter"
+    await field.press(key)
+
+    deadline = time.monotonic() + (max(1, timeout_ms) / 1000.0)
+    confirm_s = max(0, confirm_ms) / 1000.0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.15, remaining))
+        if await _field_value(field) == "":
+            await asyncio.sleep(confirm_s)
+            if await _field_value(field) == "":
+                return True
+
+
+async def run_batch_serials(
+    settings: dict[str, Any],
+    serials: list[str],
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> AutomationResult:
+    """Enter serials one at a time on the already-open ERP sales order."""
+    cleaned = [str(item).strip() for item in serials if str(item).strip()]
+    if not cleaned:
+        raise RuntimeError("No serial numbers to submit")
+
+    mode = str(settings.get("mode", "single")).lower()
+    ebay_port = int(settings.get("ebay_port", 9222))
+    erp_port = int(settings.get("erp_port", 9223))
+    pattern = str(settings.get("sales_order_url_pattern") or "SalesOrder.aspx")
+    timeout_ms = _setting_int(settings, "wait_timeout_ms", 10000)
+    serial_timeout_ms = _setting_int(settings, "serial_timeout_ms", 10000)
+    confirm_ms = _setting_int(settings, "serial_clear_confirm_ms", 500)
+    submit_key = str(settings.get("erp_submit_key", "Enter"))
+    selectors = settings.get("selectors") or {}
+    if not isinstance(selectors, dict):
+        raise RuntimeError("settings.selectors must be an object")
+    selector = _require_selector(selectors, "erp_serial_input")
+
+    total = len(cleaned)
+    if on_progress is not None:
+        on_progress(0, total)
+
+    playwright: Optional[Playwright] = None
+    ebay_browser: Optional[Browser] = None
+    erp_browser: Optional[Browser] = None
+    success = 0
+    skipped = 0
+    streak = 0
+
+    try:
+        playwright = await async_playwright().start()
+        ebay_browser = await connect_over_cdp(playwright, ebay_port)
+        if mode == "dual":
+            erp_browser = await connect_over_cdp(playwright, erp_port)
+            browser = erp_browser
+        else:
+            browser = ebay_browser
+
+        page = await find_page_by_url(
+            browser,
+            pattern,
+            label="sales order tab",
+        )
+        if page is None:
+            raise RuntimeError(
+                f"No ERP sales order tab matching {pattern!r}. "
+                "Open any SalesOrder.aspx order (orderId in the URL is ignored)."
+            )
+
+        field = await _serial_field(page, selector, timeout_ms)
+        logger.info("Batch serial starting: %s serial(s) on %s", total, page.url)
+
+        for serial in cleaned:
+            await asyncio.sleep(0)
+            try:
+                accepted = await _submit_one_serial(
+                    field,
+                    serial,
+                    submit_key,
+                    serial_timeout_ms,
+                    confirm_ms,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not enter a serial into the sales order box ({exc}). "
+                    "Check the ERP serial input selector."
+                ) from exc
+
+            if accepted:
+                success += 1
+                streak = 0
+                logger.info("Serial submitted (%s/%s): %s", success, total, serial)
+            else:
+                skipped += 1
+                streak += 1
+                logger.warning(
+                    "Serial timed out (%s/%s, streak %s): %s",
+                    success,
+                    total,
+                    streak,
+                    serial,
+                )
+            if on_progress is not None:
+                on_progress(success, total)
+            if streak >= 2:
+                logger.info(
+                    "Batch serial cancelled after two timeouts (%s/%s)",
+                    success,
+                    total,
+                )
+                return AutomationResult(
+                    status=f"Stopped — {success}/{total} serials, 2 timed out"
+                )
+
+        if skipped:
+            return AutomationResult(
+                status=f"Success — {success}/{total} serials, {skipped} skipped"
+            )
+        return AutomationResult(status=f"Success — {success}/{total} serials")
+    except asyncio.CancelledError:
+        logger.info("Batch serial cancelled")
+        raise
+    finally:
+        await _disconnect_browsers(playwright, erp_browser, ebay_browser)

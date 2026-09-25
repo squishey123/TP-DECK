@@ -27,6 +27,11 @@
   "cache_enabled": true,
   "ebay_refresh_hold_enabled": true,
   "ebay_refresh_hold_minutes": 5,
+  "show_results_popup": false,
+  "ebay_autocycle_minutes": 10,
+  "sales_order_url_pattern": "SalesOrder.aspx",
+  "serial_timeout_ms": 10000,
+  "serial_clear_confirm_ms": 500,
   "pick_list_exclude_locations": [
     "HQ",
     "unavailable"
@@ -41,6 +46,7 @@
     "ebay_sku": "span.item-custom-sku span.sh-bold",
     "ebay_qty": "div.quantity strong",
     "erp_sku_input": "#ag-grid-inventory-detail .ag-header-row-floating-filter > div:nth-child(2) input",
-    "erp_location": "#ag-grid-inventory-detail .ag-center-cols-container .ag-row > div:nth-child(3)"
+    "erp_location": "#ag-grid-inventory-detail .ag-center-cols-container .ag-row > div:nth-child(3)",
+    "erp_serial_input": "#div_TabSalesOrderItems > div:nth-child(5) > div.clearfix.allocated-controls > div:nth-child(1)"
   }
 }

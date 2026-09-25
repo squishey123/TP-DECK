@@ -31,6 +31,11 @@ DEFAULTS: dict[str, Any] = {
     "cache_enabled": True,
     "ebay_refresh_hold_enabled": True,
     "ebay_refresh_hold_minutes": 5,
+    "show_results_popup": False,
+    "ebay_autocycle_minutes": 10,
+    "sales_order_url_pattern": "SalesOrder.aspx",
+    "serial_timeout_ms": 10000,
+    "serial_clear_confirm_ms": 500,
     "pick_list_exclude_locations": ["HQ", "unavailable"],
     "pick_list_exclude_prefixes": ["PR"],
     "pick_list_exclude_misc": True,
@@ -41,6 +46,10 @@ DEFAULTS: dict[str, Any] = {
         "ebay_qty": "div.quantity strong",
         "erp_sku_input": "",
         "erp_location": "",
+        "erp_serial_input": (
+            "#div_TabSalesOrderItems > div:nth-child(5) > "
+            "div.clearfix.allocated-controls > div:nth-child(1)"
+        ),
     },
 }
 

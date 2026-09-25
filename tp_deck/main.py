@@ -13,9 +13,10 @@ from typing import Optional
 from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
-from tp_deck.automation_engine import run_automation
+from tp_deck.automation_engine import run_automation, run_batch_serials
 from tp_deck.chrome_launcher import ensure_debug_chromium
 from tp_deck.dashboard import Dashboard
+from tp_deck.serial_dialog import SerialDialog
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
 
@@ -54,37 +55,103 @@ def _configure_logging(*, console: bool) -> None:
     )
 
 
+def _autocycle_minutes(settings: dict) -> int:
+    try:
+        minutes = int(settings.get("ebay_autocycle_minutes", 10))
+    except (TypeError, ValueError):
+        minutes = 10
+    return max(1, min(180, minutes))
+
+
 class AutomationController:
-    """Owns the cancelable asyncio automation task and UI debounce state."""
+    """Owns cancelable automation tasks, the cache cycle, and UI debounce state."""
 
     def __init__(self, dashboard: Dashboard) -> None:
         self._dashboard = dashboard
-        self._task: Optional[asyncio.Task] = None
+        self._manual_task: Optional[asyncio.Task] = None
+        self._cycle_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._lock = asyncio.Lock()
+        self._autocycle = False
+        self._cycle_gen = 0
+        self._cycle_busy = False
+        self._hold = False
+        self._manual_pending = False
+        self._wake: Optional[asyncio.Event] = None
+        self._job = "orders"
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
-    def start(self, job: str = "orders") -> None:
-        if self._task is not None and not self._task.done():
-            return
+    def hold_autocycle(self, hold: bool) -> None:
+        """Keep the cache cycle from starting a scrape while a dialog is open."""
+        self._hold = hold
 
+    def start(self, job: str = "orders", serials: Optional[list[str]] = None) -> bool:
+        if self._lock.locked() or self._manual_pending:
+            return False
+        if self._manual_task is not None and not self._manual_task.done():
+            return False
+
+        self._manual_pending = True
         self._job = job
         self._dashboard.set_processing(True, job=job)
         self._dashboard.set_status("Processing")
-        self._task = asyncio.create_task(
-            self._run(job),
+        self._manual_task = asyncio.create_task(
+            self._run_manual(job, serials),
             name="tpdeck-automation",
         )
-        self._task.add_done_callback(self._on_task_done)
+        self._manual_task.add_done_callback(self._on_manual_done)
         logging.getLogger("tpdeck").info("Automation task started (%s)", job)
+        return True
+
+    def toggle_autocycle(self) -> None:
+        if self._autocycle:
+            self._autocycle = False
+            self._cycle_gen += 1
+            self._dashboard.set_autocycle(False)
+            if (
+                self._cycle_busy
+                and self._cycle_task is not None
+                and not self._cycle_task.done()
+            ):
+                self._cycle_task.cancel()
+            else:
+                self._wake_wait()
+                if not self._cycle_busy:
+                    self._dashboard.set_status("Idle")
+            return
+
+        self._cycle_gen += 1
+        generation = self._cycle_gen
+        self._autocycle = True
+        self._dashboard.set_autocycle(True)
+        self._cycle_task = asyncio.create_task(
+            self._autocycle_loop(generation),
+            name="tpdeck-autocycle",
+        )
+        logging.getLogger("tpdeck").info("Auto-cycle enabled")
 
     def stop(self) -> None:
-        if self._task is None or self._task.done():
-            logging.getLogger("tpdeck").info("Emergency stop — no active task")
+        logger = logging.getLogger("tpdeck")
+        manual_running = (
+            self._manual_task is not None and not self._manual_task.done()
+        )
+        cycle_running = self._cycle_task is not None and not self._cycle_task.done()
+        if not manual_running and not cycle_running:
+            logger.info("Emergency stop — no active task")
             return
-        logging.getLogger("tpdeck").info("Emergency stop — cancelling task")
-        self._task.cancel()
+        logger.info("Emergency stop — cancelling task")
+        self._autocycle = False
+        self._cycle_gen += 1
+        self._dashboard.set_autocycle(False)
+        self._wake_wait()
+        if manual_running:
+            assert self._manual_task is not None
+            self._manual_task.cancel()
+        if cycle_running:
+            assert self._cycle_task is not None
+            self._cycle_task.cancel()
 
     def stop_from_other_thread(self) -> None:
         """Marshal Pause-key cancels onto the asyncio/Qt loop."""
@@ -92,11 +159,37 @@ class AutomationController:
             return
         self._loop.call_soon_threadsafe(self.stop)
 
-    async def _run(self, job: str = "orders") -> str:
-        settings = load_settings()
-        return await run_automation(settings, job=job)
+    def _wake_wait(self) -> None:
+        if self._wake is not None:
+            self._wake.set()
 
-    def _on_task_done(self, task: asyncio.Task) -> None:
+    def _on_serial_progress(self, done: int, total: int) -> None:
+        self._dashboard.set_status(f"Serials {done}/{total}")
+
+    async def _run_manual(
+        self,
+        job: str,
+        serials: Optional[list[str]],
+    ):
+        try:
+            async with self._lock:
+                settings = load_settings()
+                if job == "serials":
+                    return await run_batch_serials(
+                        settings,
+                        serials or [],
+                        on_progress=self._on_serial_progress,
+                    )
+                return await run_automation(
+                    settings,
+                    job=job,
+                    copy_clipboard=True,
+                )
+        finally:
+            self._manual_pending = False
+
+    def _on_manual_done(self, task: asyncio.Task) -> None:
+        self._manual_pending = False
         self._dashboard.set_processing(False)
         logger = logging.getLogger("tpdeck")
 
@@ -113,11 +206,82 @@ class AutomationController:
             return
 
         result = task.result()
-        if result:
-            self._dashboard.set_status(str(result))
-        else:
-            self._dashboard.set_status("Success")
-        logger.info("Automation completed: %s", result)
+        status = result.status if result else "Success"
+        self._dashboard.set_status(status)
+        logger.info("Automation completed: %s", status)
+        clipboard = result.clipboard_text if result else None
+        if clipboard and bool(load_settings().get("show_results_popup", False)):
+            self._dashboard.show_results(clipboard)
+
+    async def _interruptible_sleep(self, seconds: float) -> None:
+        self._wake = asyncio.Event()
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=max(0.0, seconds))
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._wake = None
+
+    async def _autocycle_loop(self, generation: int) -> None:
+        logger = logging.getLogger("tpdeck")
+        logger.info("Auto-cycle started")
+        try:
+            while self._autocycle and self._cycle_gen == generation:
+                if self._hold or self._manual_pending or self._lock.locked():
+                    await asyncio.sleep(0.2)
+                    continue
+                minutes = 10
+                status_text = ""
+                async with self._lock:
+                    if (
+                        not self._autocycle
+                        or self._cycle_gen != generation
+                        or self._hold
+                        or self._manual_pending
+                    ):
+                        continue
+                    self._job = "cycle"
+                    self._cycle_busy = True
+                    self._dashboard.set_processing(True, job="cycle")
+                    self._dashboard.set_status("Processing")
+                    try:
+                        settings = load_settings()
+                        minutes = _autocycle_minutes(settings)
+                        result = await run_automation(
+                            settings,
+                            job="orders",
+                            copy_clipboard=False,
+                        )
+                        status_text = result.status
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        message = str(exc).strip() or exc.__class__.__name__
+                        logger.exception("Auto-cycle failed: %s", exc)
+                        minutes = _autocycle_minutes(load_settings())
+                        status_text = f"Error — {message}"
+                    finally:
+                        self._cycle_busy = False
+                        self._dashboard.set_processing(False)
+                if not self._autocycle or self._cycle_gen != generation:
+                    break
+                self._dashboard.set_status(
+                    f"{status_text} — next in {minutes} min"
+                )
+                await self._interruptible_sleep(minutes * 60)
+        except asyncio.CancelledError:
+            logger.info("Auto-cycle cancelled")
+            self._cycle_busy = False
+            self._dashboard.set_processing(False)
+            if self._cycle_gen == generation:
+                self._autocycle = False
+                self._dashboard.set_autocycle(False)
+            if self._cycle_gen == generation or not self._autocycle:
+                self._dashboard.set_status("Stopped")
+        finally:
+            if self._cycle_gen == generation:
+                self._autocycle = False
+                self._dashboard.set_autocycle(False)
 
 
 def _register_emergency_hotkey(controller: AutomationController) -> None:
@@ -180,6 +344,21 @@ def main() -> int:
     def _pick_list() -> None:
         controller.start("picklist")
 
+    def _batch_serial() -> None:
+        controller.hold_autocycle(True)
+        serials: list[str] = []
+        try:
+            dialog = SerialDialog(parent=dashboard)
+            if dialog.exec() == SerialDialog.DialogCode.Accepted:
+                serials = dialog.serials()
+            if serials and not controller.start("serials", serials):
+                dashboard.set_status("Error — busy, try again")
+        finally:
+            controller.hold_autocycle(False)
+
+    def _cycle() -> None:
+        controller.toggle_autocycle()
+
     def _stop() -> None:
         controller.stop()
 
@@ -189,6 +368,8 @@ def main() -> int:
     dashboard = Dashboard(
         on_execute=_execute,
         on_pick_list=_pick_list,
+        on_batch_serial=_batch_serial,
+        on_cycle=_cycle,
         on_stop=_stop,
         on_open_settings=_settings,
     )

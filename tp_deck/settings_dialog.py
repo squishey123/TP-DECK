@@ -26,6 +26,16 @@ from tp_deck.settings_manager import load_settings, update_settings
 
 logger = logging.getLogger("tpdeck")
 
+
+def _clamp_int(value: object, low: int, high: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return low
+    try:
+        number = int(value)
+    except ValueError:
+        return low
+    return max(low, min(high, number))
+
 DIALOG_QSS = """
 QDialog, QGroupBox {
     background-color: #0F172A;
@@ -213,6 +223,46 @@ class SettingsDialog(QDialog):
             "Uncheck the option above to refresh on every run."
         )
         ports_form.addRow("eBay refresh hold:", self.refresh_hold_spin)
+        self.results_popup_check = QCheckBox("Show results popup after copy")
+        self.results_popup_check.setToolTip(
+            "After Scrape eBay Orders or Generate Pick List, open a small "
+            "window with the text that was copied to the clipboard."
+        )
+        ports_form.addRow("", self.results_popup_check)
+        self.autocycle_spin = QSpinBox()
+        self.autocycle_spin.setRange(1, 180)
+        self.autocycle_spin.setSuffix(" min")
+        self.autocycle_spin.setToolTip(
+            "Wait between auto-cycle scrapes. The cycle button on the main "
+            "window turns this on. Those passes fill the SKU cache only."
+        )
+        ports_form.addRow("Auto-cycle wait:", self.autocycle_spin)
+        self.sales_order_pattern_edit = QLineEdit()
+        self.sales_order_pattern_edit.setPlaceholderText("SalesOrder.aspx")
+        self.sales_order_pattern_edit.setToolTip(
+            "Substring match for any open sales order. "
+            "SalesOrder.aspx matches .../SalesOrder.aspx?orderId=12345 "
+            "and any other orderId — the number is not compared."
+        )
+        ports_form.addRow("Sales order URL contains:", self.sales_order_pattern_edit)
+        self.serial_timeout_spin = QSpinBox()
+        self.serial_timeout_spin.setRange(1000, 60000)
+        self.serial_timeout_spin.setSingleStep(500)
+        self.serial_timeout_spin.setSuffix(" ms")
+        self.serial_timeout_spin.setToolTip(
+            "How long to wait for the serial box to clear before skipping "
+            "that serial. Two skips in a row cancel the batch."
+        )
+        ports_form.addRow("Serial timeout:", self.serial_timeout_spin)
+        self.serial_confirm_spin = QSpinBox()
+        self.serial_confirm_spin.setRange(100, 5000)
+        self.serial_confirm_spin.setSingleStep(100)
+        self.serial_confirm_spin.setSuffix(" ms")
+        self.serial_confirm_spin.setToolTip(
+            "After the serial box looks empty, wait this long and check "
+            "again before entering the next serial."
+        )
+        ports_form.addRow("Serial clear confirm:", self.serial_confirm_spin)
         layout.addWidget(ports_box)
 
         sel_box = QGroupBox("CSS Selectors")
@@ -223,12 +273,14 @@ class SettingsDialog(QDialog):
         self.sel_qty = QLineEdit()
         self.sel_erp_input = QLineEdit()
         self.sel_erp_location = QLineEdit()
+        self.sel_erp_serial = QLineEdit()
         sel_form.addRow("eBay order id:", self.sel_order)
         sel_form.addRow("eBay buyer:", self.sel_buyer)
         sel_form.addRow("eBay SKU:", self.sel_sku)
         sel_form.addRow("eBay qty:", self.sel_qty)
         sel_form.addRow("ERP SKU input:", self.sel_erp_input)
         sel_form.addRow("ERP location:", self.sel_erp_location)
+        sel_form.addRow("ERP serial input:", self.sel_erp_serial)
         layout.addWidget(sel_box)
 
         help_box = QGroupBox("Setup Instructions")
@@ -277,6 +329,23 @@ class SettingsDialog(QDialog):
         except (TypeError, ValueError):
             hold_minutes = 5
         self.refresh_hold_spin.setValue(max(1, min(180, hold_minutes)))
+        self.results_popup_check.setChecked(
+            bool(settings.get("show_results_popup", False))
+        )
+        try:
+            cycle_minutes = int(settings.get("ebay_autocycle_minutes", 10))
+        except (TypeError, ValueError):
+            cycle_minutes = 10
+        self.autocycle_spin.setValue(max(1, min(180, cycle_minutes)))
+        self.sales_order_pattern_edit.setText(
+            str(settings.get("sales_order_url_pattern", "SalesOrder.aspx"))
+        )
+        self.serial_timeout_spin.setValue(
+            _clamp_int(settings.get("serial_timeout_ms", 10000), 1000, 60000)
+        )
+        self.serial_confirm_spin.setValue(
+            _clamp_int(settings.get("serial_clear_confirm_ms", 500), 100, 5000)
+        )
 
         selectors = settings.get("selectors") or {}
         self.sel_order.setText(str(selectors.get("ebay_order_id", "")))
@@ -285,6 +354,7 @@ class SettingsDialog(QDialog):
         self.sel_qty.setText(str(selectors.get("ebay_qty", "")))
         self.sel_erp_input.setText(str(selectors.get("erp_sku_input", "")))
         self.sel_erp_location.setText(str(selectors.get("erp_location", "")))
+        self.sel_erp_serial.setText(str(selectors.get("erp_serial_input", "")))
         self._on_mode_toggled()
         self._on_refresh_hold_toggled()
 
@@ -307,6 +377,11 @@ class SettingsDialog(QDialog):
             cache_enabled=self.cache_enabled_check.isChecked(),
             ebay_refresh_hold_enabled=self.refresh_hold_check.isChecked(),
             ebay_refresh_hold_minutes=self.refresh_hold_spin.value(),
+            show_results_popup=self.results_popup_check.isChecked(),
+            ebay_autocycle_minutes=self.autocycle_spin.value(),
+            sales_order_url_pattern=self.sales_order_pattern_edit.text().strip(),
+            serial_timeout_ms=self.serial_timeout_spin.value(),
+            serial_clear_confirm_ms=self.serial_confirm_spin.value(),
             selectors={
                 "ebay_order_id": self.sel_order.text().strip(),
                 "ebay_buyer": self.sel_buyer.text().strip(),
@@ -314,6 +389,7 @@ class SettingsDialog(QDialog):
                 "ebay_qty": self.sel_qty.text().strip(),
                 "erp_sku_input": self.sel_erp_input.text().strip(),
                 "erp_location": self.sel_erp_location.text().strip(),
+                "erp_serial_input": self.sel_erp_serial.text().strip(),
             },
         )
         logger.info(

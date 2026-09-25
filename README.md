@@ -64,7 +64,7 @@ From the repo root in PowerShell:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-Output: `dist\TP-DECK-0.2.2-windows-x64.zip`
+Output: `dist\TP-DECK-0.2.3-windows-x64.zip`
 
 Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 

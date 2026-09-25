@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Callable, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -18,6 +21,47 @@ from PySide6.QtWidgets import (
 from tp_deck.settings_manager import load_settings, update_settings
 
 logger = logging.getLogger("tpdeck")
+
+
+def _cycle_icon() -> QIcon:
+    """Two arrows chasing each other around a circle."""
+    size = 20
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#F8FAFC"))
+    pen.setWidthF(1.7)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    center = size / 2
+    radius = 6.2
+
+    def arc_and_head(start_deg: float, sweep: float) -> None:
+        rect = QRectF(center - radius, center - radius, radius * 2, radius * 2)
+        painter.drawArc(rect, int(start_deg * 16), int(sweep * 16))
+        end = math.radians(start_deg + sweep)
+        tip_x = center + radius * math.cos(end)
+        tip_y = center - radius * math.sin(end)
+        tangent = end + (math.pi / 2)
+        travel_x = math.cos(tangent)
+        travel_y = -math.sin(tangent)
+        head = 3.6
+        for delta in (-0.62, 0.62):
+            turn = math.cos(delta)
+            side = math.sin(delta)
+            back_x = travel_x * turn - travel_y * side
+            back_y = travel_x * side + travel_y * turn
+            painter.drawLine(
+                QPointF(tip_x, tip_y),
+                QPointF(tip_x - head * back_x, tip_y - head * back_y),
+            )
+
+    arc_and_head(25, 135)
+    arc_and_head(205, 135)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def _format_status(text: str) -> str:
@@ -67,19 +111,52 @@ QPushButton:disabled {
     color: #64748B;
     border-color: #334155;
 }
-QPushButton#executeBtn, QPushButton#pickBtn {
+QPushButton#executeBtn, QPushButton#pickBtn, QPushButton#batchBtn {
     background-color: #0EA5E9;
     color: #0F172A;
     font-weight: bold;
     min-height: 28px;
 }
-QPushButton#executeBtn:hover, QPushButton#pickBtn:hover {
+QPushButton#executeBtn:hover, QPushButton#pickBtn:hover, QPushButton#batchBtn:hover {
     background-color: #38BDF8;
 }
-QPushButton#executeBtn:disabled, QPushButton#pickBtn:disabled {
+QPushButton#executeBtn:disabled, QPushButton#pickBtn:disabled, QPushButton#batchBtn:disabled {
     background-color: #334155;
     color: #94A3B8;
     border-color: #475569;
+}
+QPushButton#cycleBtn {
+    background-color: #B45309;
+    color: #F8FAFC;
+    border: 1px solid #F59E0B;
+    padding: 4px;
+    min-width: 36px;
+    max-width: 36px;
+}
+QPushButton#cycleBtn:hover {
+    background-color: #D97706;
+    color: #F8FAFC;
+}
+QPushButton#cycleBtn[cycleOn="true"] {
+    background-color: #15803D;
+    border: 1px solid #4ADE80;
+}
+QPushButton#cycleBtn[cycleOn="true"]:hover {
+    background-color: #16A34A;
+    color: #F8FAFC;
+}
+QPushButton#cycleBtn:disabled {
+    background-color: #334155;
+    color: #94A3B8;
+    border-color: #475569;
+}
+QTextEdit#resultsText {
+    background-color: #1E293B;
+    color: #F8FAFC;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 11px;
 }
 QPushButton#stopBtn {
     background-color: #7F1D1D;
@@ -97,6 +174,45 @@ QPushButton#settingsBtn {
 """
 
 
+class ResultsWindow(QWidget):
+    """Small always-on-top view of the text just copied to the clipboard."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("TP DECK — Results")
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setMinimumSize(320, 220)
+        self.resize(360, 280)
+        self.setStyleSheet(THEME_QSS)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        note = QLabel("Copied to clipboard")
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(note)
+
+        self._text = QTextEdit()
+        self._text.setObjectName("resultsText")
+        self._text.setReadOnly(True)
+        layout.addWidget(self._text)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+
+    def present(self, text: str) -> None:
+        self._text.setPlainText(text)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+
 class Dashboard(QMainWindow):
     """Compact floating panel that stays on top and remembers screen position."""
 
@@ -104,6 +220,8 @@ class Dashboard(QMainWindow):
         self,
         on_execute: Optional[Callable[[], None]] = None,
         on_pick_list: Optional[Callable[[], None]] = None,
+        on_batch_serial: Optional[Callable[[], None]] = None,
+        on_cycle: Optional[Callable[[], None]] = None,
         on_stop: Optional[Callable[[], None]] = None,
         on_open_settings: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
@@ -111,15 +229,18 @@ class Dashboard(QMainWindow):
         super().__init__(parent)
         self._on_execute = on_execute
         self._on_pick_list = on_pick_list
+        self._on_batch_serial = on_batch_serial
+        self._on_cycle = on_cycle
         self._on_stop = on_stop
         self._on_open_settings = on_open_settings
         self._persist_enabled = False
+        self._results: Optional[ResultsWindow] = None
 
         self.setWindowTitle("TP DECK")
         self.setWindowFlags(
             Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
         )
-        self.setFixedSize(300, 250)
+        self.setFixedSize(300, 340)
         self.setStyleSheet(THEME_QSS)
 
         self._build_ui()
@@ -150,15 +271,34 @@ class Dashboard(QMainWindow):
         self.status_label.setMinimumHeight(52)
         layout.addWidget(self.status_label)
 
+        scrape_row = QHBoxLayout()
+        scrape_row.setSpacing(8)
+
         self.execute_btn = QPushButton("Scrape eBay Orders")
         self.execute_btn.setObjectName("executeBtn")
         self.execute_btn.clicked.connect(self._handle_execute)
-        layout.addWidget(self.execute_btn)
+        scrape_row.addWidget(self.execute_btn)
+
+        self.cycle_btn = QPushButton()
+        self.cycle_btn.setObjectName("cycleBtn")
+        self.cycle_btn.setFixedWidth(36)
+        self.cycle_btn.setIcon(_cycle_icon())
+        self.cycle_btn.setIconSize(QSize(18, 18))
+        self.cycle_btn.setToolTip("Auto-cycle eBay scrape (off)")
+        self.cycle_btn.clicked.connect(self._handle_cycle)
+        scrape_row.addWidget(self.cycle_btn)
+        layout.addLayout(scrape_row)
+        self.set_autocycle(False)
 
         self.pick_btn = QPushButton("Generate Pick List")
         self.pick_btn.setObjectName("pickBtn")
         self.pick_btn.clicked.connect(self._handle_pick_list)
         layout.addWidget(self.pick_btn)
+
+        self.batch_btn = QPushButton("Batch Serial")
+        self.batch_btn.setObjectName("batchBtn")
+        self.batch_btn.clicked.connect(self._handle_batch_serial)
+        layout.addWidget(self.batch_btn)
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -203,26 +343,48 @@ class Dashboard(QMainWindow):
         self.status_label.setText(_format_status(text))
         self.status_label.setToolTip(str(text or "").strip())
 
+    def set_autocycle(self, enabled: bool) -> None:
+        """Amber when off, green when the cache cycle is running."""
+        self.cycle_btn.setProperty("cycleOn", "true" if enabled else "false")
+        self.cycle_btn.style().unpolish(self.cycle_btn)
+        self.cycle_btn.style().polish(self.cycle_btn)
+        self.cycle_btn.update()
+        self.cycle_btn.setToolTip(
+            "Auto-cycle eBay scrape (on)" if enabled else "Auto-cycle eBay scrape (off)"
+        )
+
+    def show_results(self, text: str) -> None:
+        if self._results is None:
+            self._results = ResultsWindow(self)
+        self._results.present(text)
+
     def set_actions_enabled(self, enabled: bool) -> None:
-        """Enable or disable scrape and pick list without changing their labels."""
+        """Enable or disable scrape, pick list, batch, and cycle without changing labels."""
         self.execute_btn.setEnabled(enabled)
         self.pick_btn.setEnabled(enabled)
+        self.batch_btn.setEnabled(enabled)
+        self.cycle_btn.setEnabled(enabled)
 
     def set_processing(self, active: bool, job: str = "orders") -> None:
-        """Disable action buttons while a run is in flight; restore in finally."""
+        """Disable action buttons while a run is in flight; leave the cycle toggle clickable."""
         if active:
             self.execute_btn.setEnabled(False)
             self.pick_btn.setEnabled(False)
+            self.batch_btn.setEnabled(False)
             if job == "picklist":
                 self.pick_btn.setText("⏳ Processing...")
+            elif job == "serials":
+                self.batch_btn.setText("⏳ Processing...")
             else:
                 self.execute_btn.setText("⏳ Processing...")
             self.set_status("Processing")
         else:
             self.execute_btn.setEnabled(True)
             self.pick_btn.setEnabled(True)
+            self.batch_btn.setEnabled(True)
             self.execute_btn.setText("Scrape eBay Orders")
             self.pick_btn.setText("Generate Pick List")
+            self.batch_btn.setText("Batch Serial")
 
     def _handle_execute(self) -> None:
         if self._on_execute:
@@ -231,6 +393,14 @@ class Dashboard(QMainWindow):
     def _handle_pick_list(self) -> None:
         if self._on_pick_list:
             self._on_pick_list()
+
+    def _handle_batch_serial(self) -> None:
+        if self._on_batch_serial:
+            self._on_batch_serial()
+
+    def _handle_cycle(self) -> None:
+        if self._on_cycle:
+            self._on_cycle()
 
     def _handle_stop(self) -> None:
         if self._on_stop:
