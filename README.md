@@ -10,7 +10,7 @@
 4. The engine finds the focused eBay order tab (`ebay.com/sh/ord` + `document.hasFocus()`), scrapes Order, buyer, SKU, and quantity via CSS selectors from `settings.json`.
 5. It locates the ERP tab, enters each SKU, waits for Location, then copies either  
    `[Order] - [Buyer] - [SKU] - [Location]` (scrape) or a walk-sorted pick list  
-   `Nx - SKU - LOCATION` grouped CPU Rack → Cubbies → Endcaps → Small parts → Cabinet → Misc.  
+   `Nx - SKU - LOCATION` grouped CPU Rack → Cubbies → Endcaps → Small parts → Cabinet → Rail Shelf → Misc.  
    SKU → location results are cached for 12 hours when **Cache SKU → location** is enabled in Settings (`cache_enabled` / `cache_ttl_hours`). Turn that off when bins are moving often.
 6. While a run is active, both action buttons disable and the active one shows `⏳ Processing...`. Status moves Idle → Processing → Success.
 7. At any time, **🛑 Emergency Stop** or the global **Pause** key cancels the in-flight `asyncio` task immediately.
@@ -64,7 +64,7 @@ From the repo root in PowerShell:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-Output: `dist\TP-DECK-0.2.3-windows-x64.zip`
+Output: `dist\TP-DECK-0.2.4-windows-x64.zip`
 
 Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 
@@ -72,12 +72,12 @@ Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 
 Pushing a version tag runs `.github/workflows/release.yml` on Windows: it builds the zip and creates the GitHub Release with the asset attached.
 
-1. Bump `tp_deck/__init__.py` (e.g. `0.2.3`), commit, and push `main`.
+1. Bump `tp_deck/__init__.py` (e.g. `0.2.4`), commit, and push `main`.
 2. Tag that commit and push the tag (tag must match `v` + `__version__`):
 
 ```powershell
-git tag -a v0.2.3 -m "TP DECK 0.2.3"
-git push origin v0.2.3
+git tag -a v0.2.4 -m "TP DECK 0.2.4"
+git push origin v0.2.4
 ```
 
 3. Watch **Actions → Release**. When it finishes, the zip is on the **Releases** page.

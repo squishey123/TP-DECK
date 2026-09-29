@@ -212,6 +212,9 @@ class AutomationController:
         clipboard = result.clipboard_text if result else None
         if clipboard and bool(load_settings().get("show_results_popup", False)):
             self._dashboard.show_results(clipboard)
+        failures = result.failed_serials if result else ()
+        if failures:
+            self._dashboard.show_serial_failures(failures)
 
     async def _interruptible_sleep(self, seconds: float) -> None:
         self._wake = asyncio.Event()

@@ -12,6 +12,7 @@ _SMALL_PARTS = re.compile(
 _CUBBY = re.compile(r"^([A-Za-z])-([1-9]\d*)$")
 _ENDCAP = re.compile(r"^([A-Za-z])-(0\d+)$")
 _CPU_RACK = re.compile(r"^CR-([A-Za-z0-9]+)", re.IGNORECASE)
+_RAIL_SHELF = re.compile(r"^RS-(.*)$", re.IGNORECASE)
 _CABINET = re.compile(r"^CAB", re.IGNORECASE)
 
 GROUP_CPU = 0
@@ -19,7 +20,8 @@ GROUP_CUBBY = 1
 GROUP_ENDCAP = 2
 GROUP_SMALL = 3
 GROUP_CAB = 4
-GROUP_MISC = 5
+GROUP_RAIL = 5
+GROUP_MISC = 6
 
 GROUP_TITLES = {
     GROUP_CPU: "CPU Rack",
@@ -27,6 +29,7 @@ GROUP_TITLES = {
     GROUP_ENDCAP: "Endcaps",
     GROUP_SMALL: "Small parts",
     GROUP_CAB: "Cabinet",
+    GROUP_RAIL: "Rail Shelf",
     GROUP_MISC: "Misc",
 }
 
@@ -39,6 +42,19 @@ def parse_quantity(text: str) -> int:
     if not match:
         return 1
     return max(1, int(match.group(0)))
+
+
+def _natural_key(text: str) -> tuple:
+    """Sort RS-2 before RS-10 while keeping letter suffixes in order."""
+    parts: list[tuple] = []
+    for piece in re.split(r"(\d+)", text.upper()):
+        if not piece:
+            continue
+        if piece.isdigit():
+            parts.append((0, int(piece)))
+        else:
+            parts.append((1, piece))
+    return tuple(parts)
 
 
 def location_group_and_key(location: str) -> tuple:
@@ -72,6 +88,10 @@ def location_group_and_key(location: str) -> tuple:
     if _CABINET.match(loc):
         return (GROUP_CAB, (upper,))
 
+    rail = _RAIL_SHELF.match(loc)
+    if rail:
+        return (GROUP_RAIL, (_natural_key(rail.group(1)), upper))
+
     return (GROUP_MISC, (upper,))
 
 
@@ -85,7 +105,8 @@ def is_excluded_pick_location(
     """
     Drop bins that warehouse picking does not walk.
     Named tech bins (HQ, unavailable), prefixes such as PR, and any
-    location that does not match a warehouse walk group.
+    location that does not match a warehouse walk group
+    (CPU Rack, Cubbies, Endcaps, Small parts, Cabinet, Rail Shelf).
     """
     loc = re.sub(r"\s+", " ", (location or "")).strip()
     if not loc:

@@ -30,6 +30,9 @@ class AutomationResult:
 
     status: str
     clipboard_text: Optional[str] = None
+    failed_serials: tuple[tuple[int, str], ...] = ()
+
+
 _DEFAULT_EBAY_QTY_SEL = "div.quantity strong"
 
 
@@ -1117,6 +1120,7 @@ async def run_batch_serials(
     success = 0
     skipped = 0
     streak = 0
+    failed: list[tuple[int, str]] = []
 
     try:
         playwright = await async_playwright().start()
@@ -1141,7 +1145,7 @@ async def run_batch_serials(
         field = await _serial_field(page, selector, timeout_ms)
         logger.info("Batch serial starting: %s serial(s) on %s", total, page.url)
 
-        for serial in cleaned:
+        for index, serial in enumerate(cleaned, start=1):
             await asyncio.sleep(0)
             try:
                 accepted = await _submit_one_serial(
@@ -1166,11 +1170,13 @@ async def run_batch_serials(
             else:
                 skipped += 1
                 streak += 1
+                failed.append((index, serial))
                 logger.warning(
-                    "Serial timed out (%s/%s, streak %s): %s",
+                    "Serial timed out (%s/%s, streak %s, position %s): %s",
                     success,
                     total,
                     streak,
+                    index,
                     serial,
                 )
             if on_progress is not None:
@@ -1182,12 +1188,14 @@ async def run_batch_serials(
                     total,
                 )
                 return AutomationResult(
-                    status=f"Stopped — {success}/{total} serials, 2 timed out"
+                    status=f"Stopped — {success}/{total} serials, 2 timed out",
+                    failed_serials=tuple(failed),
                 )
 
         if skipped:
             return AutomationResult(
-                status=f"Success — {success}/{total} serials, {skipped} skipped"
+                status=f"Success — {success}/{total} serials, {skipped} skipped",
+                failed_serials=tuple(failed),
             )
         return AutomationResult(status=f"Success — {success}/{total} serials")
     except asyncio.CancelledError:

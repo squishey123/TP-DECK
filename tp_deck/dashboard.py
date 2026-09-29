@@ -7,12 +7,22 @@ import math
 from typing import Callable, Optional
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QIcon,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -150,14 +160,6 @@ QPushButton#cycleBtn:disabled {
     color: #94A3B8;
     border-color: #475569;
 }
-QTextEdit#resultsText {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #334155;
-    border-radius: 4px;
-    font-family: Consolas, "Courier New", monospace;
-    font-size: 11px;
-}
 QPushButton#stopBtn {
     background-color: #7F1D1D;
     color: #FCA5A5;
@@ -173,44 +175,142 @@ QPushButton#settingsBtn {
 }
 """
 
+RESULTS_QSS = """
+QWidget#resultsRoot {
+    background-color: #FFFFFF;
+    color: #000000;
+}
+QLabel#resultsNote {
+    background-color: #FFFFFF;
+    color: #000000;
+    font-size: 16px;
+}
+QTextEdit#resultsText {
+    background-color: #FFFFFF;
+    color: #000000;
+    border: 1px solid #CBD5E1;
+    border-radius: 4px;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 22px;
+    padding: 6px;
+}
+QPushButton#closeBtn {
+    background-color: #0EA5E9;
+    color: #0F172A;
+    border: 1px solid #0EA5E9;
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: bold;
+    min-height: 28px;
+}
+QPushButton#closeBtn:hover {
+    background-color: #38BDF8;
+    color: #0F172A;
+}
+"""
+
+
+def _ordinal(index: int) -> str:
+    """1st, 2nd, 3rd, 4th — teens stay 'th'."""
+    value = int(index)
+    if 10 <= (value % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+    return f"{value}{suffix}"
+
 
 class ResultsWindow(QWidget):
-    """Small always-on-top view of the text just copied to the clipboard."""
+    """Always-on-top report shown when an operation finishes."""
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        title: str = "TP DECK — Results",
+        note: str = "Copied to clipboard",
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("TP DECK — Results")
+        self.setObjectName("resultsRoot")
+        self.setWindowTitle(title)
         self.setWindowFlags(
             Qt.WindowType.Window
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
-        self.setMinimumSize(320, 220)
-        self.resize(360, 280)
-        self.setStyleSheet(THEME_QSS)
+        self.setStyleSheet(RESULTS_QSS)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
-        note = QLabel("Copied to clipboard")
-        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(note)
+        self._note = QLabel(note)
+        self._note.setObjectName("resultsNote")
+        self._note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._note)
 
         self._text = QTextEdit()
         self._text.setObjectName("resultsText")
         self._text.setReadOnly(True)
+        self._text.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self._text.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self._text.setMinimumSize(0, 0)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setPixelSize(22)
+        self._text.setFont(font)
         layout.addWidget(self._text)
 
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
+        self._close = QPushButton("Close")
+        self._close.setObjectName("closeBtn")
+        self._close.clicked.connect(self.close)
+        layout.addWidget(self._close)
 
-    def present(self, text: str) -> None:
+    def present(self, text: str, *, note: Optional[str] = None) -> None:
+        if note is not None:
+            self._note.setText(note)
         self._text.setPlainText(text)
+        self._fit_to_text(text)
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def _fit_to_text(self, text: str) -> None:
+        metrics = QFontMetrics(self._text.font())
+        lines = text.splitlines() or [""]
+        longest = max((metrics.horizontalAdvance(line) for line in lines), default=0)
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            max_w = max(360, int(avail.width() * 0.9))
+            max_h = max(220, int(avail.height() * 0.85))
+        else:
+            max_w, max_h = 1400, 900
+
+        margins = self.layout().contentsMargins()
+        margin_x = margins.left() + margins.right()
+        text_w = max(280, min(longest + 36, max_w - margin_x))
+        self._text.document().setTextWidth(text_w)
+        doc_h = math.ceil(self._text.document().size().height()) + 20
+
+        note_h = self._note.sizeHint().height()
+        btn_h = max(self._close.sizeHint().height(), 36)
+        spacing = self.layout().spacing()
+        chrome_h = (
+            margins.top()
+            + margins.bottom()
+            + note_h
+            + btn_h
+            + spacing * 2
+            + 8
+        )
+        width = min(max_w, text_w + margin_x)
+        height = min(max_h, max(180, doc_h + chrome_h))
+        self.setFixedSize(width, height)
 
 
 class Dashboard(QMainWindow):
@@ -235,6 +335,7 @@ class Dashboard(QMainWindow):
         self._on_open_settings = on_open_settings
         self._persist_enabled = False
         self._results: Optional[ResultsWindow] = None
+        self._failures: Optional[ResultsWindow] = None
 
         self.setWindowTitle("TP DECK")
         self.setWindowFlags(
@@ -357,6 +458,24 @@ class Dashboard(QMainWindow):
         if self._results is None:
             self._results = ResultsWindow(self)
         self._results.present(text)
+
+    def show_serial_failures(self, failures: list[tuple[int, str]]) -> None:
+        """Report serials the batch did not accept, by scan order."""
+        if not failures:
+            return
+        if self._failures is None:
+            self._failures = ResultsWindow(
+                self,
+                title="TP DECK — Failed Serials",
+                note="Serial numbers that failed",
+            )
+        count = len(failures)
+        noun = "serial number" if count == 1 else "serial numbers"
+        lines = [
+            f"{_ordinal(index)} scanned: {serial}"
+            for index, serial in failures
+        ]
+        self._failures.present("\n".join(lines), note=f"{count} {noun} failed")
 
     def set_actions_enabled(self, enabled: bool) -> None:
         """Enable or disable scrape, pick list, batch, and cycle without changing labels."""
