@@ -2,7 +2,7 @@
 
 **Techyparts Data Entry Control Keeper** — a native Windows multimonitor utility that automates repetitive inventory data entry between eBay Seller Hub orders and an internal ERP. Opening the app starts a separate Chromium window; each scrape attaches to that window.
 
-## How it works (v1)
+## How it works
 
 1. Open TP DECK. It starts Playwright's Chromium minimized, with remote debugging, and restores the last session. The first open downloads Chromium into a `browser` folder next to the app (network required once). If the debug port is already open, that window is left where you put it.
 2. TP DECK opens as a compact, always-on-top floating panel and remembers its position across monitors.
