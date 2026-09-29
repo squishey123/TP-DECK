@@ -13,7 +13,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build release zip
         shell: pwsh
@@ -43,7 +43,7 @@ jobs:
           Write-Host "Release $expectedTag → $zip"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.ver.outputs.zip }}
           name: TP DECK ${{ steps.ver.outputs.version }}
