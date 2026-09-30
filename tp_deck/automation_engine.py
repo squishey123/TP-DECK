@@ -6,31 +6,20 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from playwright.async_api import Browser, Page, Playwright, async_playwright
 
-from tp_deck.pick_list import (
-    build_pick_list,
-    is_excluded_pick_location,
-    parse_quantity,
-)
+from tp_deck.duration import cache_ttl_seconds
+from tp_deck.job_results import UNKNOWN_LOCATION, AutomationResult, render_job
+from tp_deck.locators import load_locators
+from tp_deck.pick_list import parse_quantity
+from tp_deck.runtime_state import razor_multiplier, scale_ms
 from tp_deck.settings_manager import update_settings
 from tp_deck.sku_cache import SkuLocationCache
+from tp_deck.sku_overrides import load_overrides, resolve_sku
 
 logger = logging.getLogger("tpdeck")
-
-UNKNOWN_LOCATION = "Unknown"
-
-
-@dataclass(frozen=True)
-class AutomationResult:
-    """Status line for the dashboard, plus clipboard text when a job copied it."""
-
-    status: str
-    clipboard_text: Optional[str] = None
-    failed_serials: tuple[tuple[int, str], ...] = ()
 
 
 _DEFAULT_EBAY_QTY_SEL = "div.quantity strong"
@@ -242,8 +231,7 @@ def _require_selector(selectors: dict[str, Any], key: str) -> str:
     raw = str(selectors.get(key, "") or "").strip()
     if not raw:
         raise RuntimeError(
-            f"Missing CSS selector '{key}' in settings.json. "
-            "Open Settings and fill the selector fields."
+            f"Missing CSS selector '{key}' in locators.json."
         )
     return raw
 
@@ -572,6 +560,7 @@ async def lookup_erp_location(
     *,
     timeout_ms: int,
     submit_key: str,
+    overlay_visible_ms: int = 1500,
     location_blacklist: Optional[list[str]] = None,
     location_deprioritize: Optional[list[str]] = None,
     location_deprioritize_prefixes: Optional[list[str]] = None,
@@ -602,7 +591,7 @@ async def lookup_erp_location(
             "#ag-grid-inventory-detail .ag-overlay-no-rows-wrapper"
         )
         try:
-            await overlay.wait_for(state="visible", timeout=1500)
+            await overlay.wait_for(state="visible", timeout=overlay_visible_ms)
             await overlay.wait_for(state="hidden", timeout=timeout_ms)
         except Exception:
             await asyncio.sleep(0.4)
@@ -655,11 +644,6 @@ async def lookup_erp_location(
             UNKNOWN_LOCATION,
         )
         return UNKNOWN_LOCATION
-
-
-def format_output(order_id: str, buyer: str, sku: str, location: str) -> str:
-    name = buyer.strip() or "?"
-    return f"{order_id} - {name} - {sku} - {location}"
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -774,19 +758,106 @@ async def _refresh_ebay_order_page(page: Page, timeout_ms: int) -> None:
     _mark_ebay_refreshed()
 
 
-def _unknown_count(location_by_sku: dict[str, str]) -> int:
-    return sum(
-        1
-        for loc in location_by_sku.values()
-        if str(loc).strip().casefold() == UNKNOWN_LOCATION.casefold()
-    )
-
-
 def _setting_int(settings: dict[str, Any], key: str, default: int) -> int:
     try:
         return int(settings.get(key, default))
     except (TypeError, ValueError):
         return default
+
+
+def erp_wait_pair(settings: dict[str, Any]) -> tuple[int, int, int]:
+    """Locator timeout, ERP wait, and overlay-appear probe. Scaled while Slow Razor is on."""
+    mult = razor_multiplier(settings)
+    wait = _setting_int(settings, "wait_timeout_ms", 10000)
+    action = scale_ms(30_000, mult)
+    scaled_wait = scale_ms(wait, mult)
+    overlay_ms = scale_ms(1500, mult)
+    if mult > 1:
+        logger.info(
+            "Slow Razor x%s: locator %sms, ERP wait %sms, overlay %sms",
+            mult,
+            action,
+            scaled_wait,
+            overlay_ms,
+        )
+    return action, scaled_wait, overlay_ms
+
+
+async def lookup_missing_locations(
+    settings: dict[str, Any],
+    skus: list[str],
+) -> dict[str, str]:
+    """Look up SKUs that were not already resolved in this run. Reconnects over CDP."""
+    cleaned = list(dict.fromkeys(str(sku).strip() for sku in skus if str(sku).strip()))
+    if not cleaned:
+        return {}
+
+    mode = str(settings.get("mode", "single")).lower()
+    ebay_port = int(settings.get("ebay_port", 9222))
+    erp_port = int(settings.get("erp_port", 9223))
+    erp_pattern = str(settings.get("erp_url_pattern", ""))
+    action_ms, erp_timeout_ms, overlay_ms = erp_wait_pair(settings)
+    submit_key = str(settings.get("erp_submit_key", "Enter"))
+    selectors = load_locators()
+
+    cache_enabled = bool(settings.get("cache_enabled", True))
+    cache = (
+        SkuLocationCache(ttl_seconds=cache_ttl_seconds(settings))
+        if cache_enabled
+        else None
+    )
+    found: dict[str, str] = {}
+    misses: list[str] = []
+    for sku in cleaned:
+        cached = cache.get(sku) if cache is not None else None
+        if cached:
+            found[sku] = cached
+            logger.info("SKU cache hit %s → %s", sku, cached)
+        else:
+            misses.append(sku)
+    if not misses:
+        if cache is not None:
+            cache.save()
+        return found
+
+    playwright: Optional[Playwright] = None
+    ebay_browser: Optional[Browser] = None
+    erp_browser: Optional[Browser] = None
+    try:
+        playwright = await async_playwright().start()
+        ebay_browser = await connect_over_cdp(playwright, ebay_port)
+        if mode == "dual":
+            erp_browser = await connect_over_cdp(playwright, erp_port)
+        erp_page = await _resolve_erp_page(
+            mode=mode,
+            ebay_browser=ebay_browser,
+            erp_browser=erp_browser,
+            erp_pattern=erp_pattern,
+        )
+        erp_page.set_default_timeout(action_ms)
+        for sku in misses:
+            found[sku] = await lookup_erp_location(
+                erp_page,
+                sku,
+                selectors,
+                timeout_ms=erp_timeout_ms,
+                submit_key=submit_key,
+                overlay_visible_ms=overlay_ms,
+                location_blacklist=settings.get("location_blacklist"),
+                location_deprioritize=settings.get("location_deprioritize"),
+                location_deprioritize_prefixes=settings.get(
+                    "location_deprioritize_prefixes"
+                ),
+                location_lowest_priority=settings.get("location_lowest_priority"),
+            )
+            if cache is not None:
+                cache.put(sku, found[sku])
+            await asyncio.sleep(0)
+        if cache is not None:
+            cache.save()
+        return found
+    finally:
+        await _disconnect_browsers(playwright, erp_browser, ebay_browser)
 
 
 async def run_automation(
@@ -808,10 +879,9 @@ async def run_automation(
     ebay_pattern = str(settings.get("ebay_url_pattern", "ebay.com/sh/ord"))
     erp_pattern = str(settings.get("erp_url_pattern", ""))
     timeout_ms = int(settings.get("wait_timeout_ms", 10000))
+    action_ms, erp_timeout_ms, overlay_ms = erp_wait_pair(settings)
     submit_key = str(settings.get("erp_submit_key", "Enter"))
-    selectors = settings.get("selectors") or {}
-    if not isinstance(selectors, dict):
-        raise RuntimeError("settings.selectors must be an object")
+    selectors = load_locators()
 
     playwright: Optional[Playwright] = None
     ebay_browser: Optional[Browser] = None
@@ -841,16 +911,25 @@ async def run_automation(
         await asyncio.sleep(0)
 
         cache_enabled = bool(settings.get("cache_enabled", True))
-        cache = SkuLocationCache(
-            ttl_hours=float(settings.get("cache_ttl_hours", 12))
-        )
-        location_by_sku: dict[str, str] = {}
-        unique_skus = list(dict.fromkeys(sku for _, _, sku, _ in lines_in))
+        cache = SkuLocationCache(ttl_seconds=cache_ttl_seconds(settings))
+        overrides = load_overrides()
+        unique_ebay = list(dict.fromkeys(sku for _, _, sku, _ in lines_in))
+        lookup_skus: list[str] = []
+        seen_lookup: set[str] = set()
+        for sku in unique_ebay:
+            lookup, _factor, display = resolve_sku(sku, overrides)
+            if lookup != sku:
+                logger.info("SKU override %s → %s (%s)", sku, lookup, display)
+            if lookup not in seen_lookup:
+                seen_lookup.add(lookup)
+                lookup_skus.append(lookup)
+
+        queried: dict[str, str] = {}
         misses: list[str] = []
-        for sku in unique_skus:
+        for sku in lookup_skus:
             cached = cache.get(sku) if cache_enabled else None
             if cached:
-                location_by_sku[sku] = cached
+                queried[sku] = cached
                 logger.info("SKU cache hit %s → %s", sku, cached)
             else:
                 misses.append(sku)
@@ -868,15 +947,17 @@ async def run_automation(
                 erp_browser=erp_browser,
                 erp_pattern=erp_pattern,
             )
+            erp_page.set_default_timeout(action_ms)
             await asyncio.sleep(0)
 
             for sku in misses:
-                location_by_sku[sku] = await lookup_erp_location(
+                queried[sku] = await lookup_erp_location(
                     erp_page,
                     sku,
                     selectors,
-                    timeout_ms=timeout_ms,
+                    timeout_ms=erp_timeout_ms,
                     submit_key=submit_key,
+                    overlay_visible_ms=overlay_ms,
                     location_blacklist=settings.get("location_blacklist"),
                     location_deprioritize=settings.get("location_deprioritize"),
                     location_deprioritize_prefixes=settings.get(
@@ -887,7 +968,7 @@ async def run_automation(
                     ),
                 )
                 if cache_enabled:
-                    cache.put(sku, location_by_sku[sku])
+                    cache.put(sku, queried[sku])
                 await asyncio.sleep(0)
             if cache_enabled:
                 cache.save()
@@ -896,93 +977,31 @@ async def run_automation(
             if cache_enabled:
                 cache.save()
 
-        hits = len(unique_skus) - len(misses)
-        unknowns = _unknown_count(location_by_sku)
-        unknown_bit = f", {unknowns} unknown" if unknowns else ""
-        job_name = str(job or "orders").lower()
-
-        if job_name == "picklist":
-            combined: dict[str, list] = {}
-            for _order_id, _buyer, sku, qty in lines_in:
-                loc = location_by_sku.get(sku, UNKNOWN_LOCATION)
-                if sku not in combined:
-                    combined[sku] = [0, loc]
-                combined[sku][0] += max(1, int(qty))
-                combined[sku][1] = loc
-            exclude_names = settings.get("pick_list_exclude_locations")
-            exclude_prefixes = settings.get("pick_list_exclude_prefixes")
-            exclude_misc = bool(settings.get("pick_list_exclude_misc", True))
-            pick_items = []
-            skipped = 0
-            for sku, (qty, loc) in combined.items():
-                if is_excluded_pick_location(
-                    loc,
-                    exclude_names=exclude_names,
-                    exclude_prefixes=exclude_prefixes,
-                    exclude_misc=exclude_misc,
-                ):
-                    skipped += 1
-                    logger.info(
-                        "Pick list skipped %s at %s (not a pick location)",
-                        sku,
-                        loc,
-                    )
-                    continue
-                pick_items.append((sku, loc, qty))
-            output = build_pick_list(
-                pick_items,
-                exclude_names=exclude_names,
-                exclude_prefixes=exclude_prefixes,
-                exclude_misc=exclude_misc,
-            )
-            if copy_clipboard:
-                copy_to_clipboard(output)
-            logger.info("Pick list success:\n%s", output)
-            skipped_bit = f", {skipped} skipped" if skipped else ""
-            return AutomationResult(
-                status=(
-                    f"Success — pick list {len(pick_items)} SKU(s), "
-                    f"{len(misses)} lookup(s), {hits} cache hit(s)"
-                    f"{unknown_bit}{skipped_bit}"
-                ),
-                clipboard_text=output if copy_clipboard else None,
-            )
-
-        if not copy_clipboard:
-            if not cache_enabled:
-                status = (
-                    f"Cycling — {len(unique_skus)} SKU(s), "
-                    "cache is off — locations will not be stored"
-                )
-            else:
-                status = (
-                    f"Cycling — {len(unique_skus)} SKU(s) cached, "
-                    f"{len(misses)} lookup(s), {hits} cache hit(s){unknown_bit}"
-                )
-            logger.info("Auto-cycle cache pass: %s", status)
-            return AutomationResult(status=status)
-
-        lines_out: list[str] = []
-        for order_id, buyer, sku, _qty in lines_in:
-            lines_out.append(
-                format_output(
-                    order_id,
-                    buyer,
-                    sku,
-                    location_by_sku.get(sku, UNKNOWN_LOCATION),
-                )
-            )
-
-        output = "\n".join(lines_out)
-        copy_to_clipboard(output)
-        logger.info("Automation success: %s", output)
-        return AutomationResult(
-            status=(
-                f"Success — {len(lines_out)} line(s), "
-                f"{len(misses)} lookup(s), {hits} cache hit(s){unknown_bit}"
-            ),
-            clipboard_text=output,
+        hits = len(lookup_skus) - len(misses)
+        result = render_job(
+            settings,
+            job=job,
+            lines=lines_in,
+            queried=queried,
+            overrides=overrides,
+            hits=hits,
+            misses=len(misses),
+            copy_clipboard=copy_clipboard,
+            allow_prompt=copy_clipboard,
+            cache_enabled=cache_enabled,
         )
+        if (
+            copy_clipboard
+            and not result.defer_copy
+            and result.clipboard_text
+            and result.clipboard_text.strip()
+        ):
+            copy_to_clipboard(result.clipboard_text)
+        if result.clipboard_text:
+            logger.info("Automation success:\n%s", result.clipboard_text)
+        else:
+            logger.info("Automation success: %s", result.status)
+        return result
 
     except asyncio.CancelledError:
         logger.info("Automation cancelled")
@@ -1091,8 +1110,11 @@ async def run_batch_serials(
     settings: dict[str, Any],
     serials: list[str],
     on_progress: Optional[Callable[[int, int], None]] = None,
+    order_number: str = "",
 ) -> AutomationResult:
-    """Enter serials one at a time on the already-open ERP sales order."""
+    """Open the sales order when a number is given, then enter serials."""
+    from tp_deck.sales_order import prepare_sales_order
+
     cleaned = [str(item).strip() for item in serials if str(item).strip()]
     if not cleaned:
         raise RuntimeError("No serial numbers to submit")
@@ -1100,14 +1122,24 @@ async def run_batch_serials(
     mode = str(settings.get("mode", "single")).lower()
     ebay_port = int(settings.get("ebay_port", 9222))
     erp_port = int(settings.get("erp_port", 9223))
-    pattern = str(settings.get("sales_order_url_pattern") or "SalesOrder.aspx")
-    timeout_ms = _setting_int(settings, "wait_timeout_ms", 10000)
-    serial_timeout_ms = _setting_int(settings, "serial_timeout_ms", 10000)
-    confirm_ms = _setting_int(settings, "serial_clear_confirm_ms", 500)
+    action_ms, timeout_ms, overlay_ms = erp_wait_pair(settings)
+    mult = razor_multiplier(settings)
+    serial_timeout_ms = scale_ms(
+        _setting_int(settings, "serial_timeout_ms", 10000),
+        mult,
+    )
+    confirm_ms = scale_ms(
+        _setting_int(settings, "serial_clear_confirm_ms", 500),
+        mult,
+    )
+    if mult > 1:
+        logger.info(
+            "Slow Razor serial clear %sms, confirm %sms",
+            serial_timeout_ms,
+            confirm_ms,
+        )
     submit_key = str(settings.get("erp_submit_key", "Enter"))
-    selectors = settings.get("selectors") or {}
-    if not isinstance(selectors, dict):
-        raise RuntimeError("settings.selectors must be an object")
+    selectors = load_locators()
     selector = _require_selector(selectors, "erp_serial_input")
 
     total = len(cleaned)
@@ -1131,17 +1163,16 @@ async def run_batch_serials(
         else:
             browser = ebay_browser
 
-        page = await find_page_by_url(
+        page = await prepare_sales_order(
             browser,
-            pattern,
-            label="sales order tab",
+            order_number,
+            timeout_ms=timeout_ms,
+            action_ms=action_ms,
+            overlay_ms=overlay_ms,
+            submit_key=submit_key,
         )
-        if page is None:
-            raise RuntimeError(
-                f"No ERP sales order tab matching {pattern!r}. "
-                "Open any SalesOrder.aspx order (orderId in the URL is ignored)."
-            )
 
+        page.set_default_timeout(action_ms)
         field = await _serial_field(page, selector, timeout_ms)
         logger.info("Batch serial starting: %s serial(s) on %s", total, page.url)
 
@@ -1160,7 +1191,7 @@ async def run_batch_serials(
             except Exception as exc:
                 raise RuntimeError(
                     f"Could not enter a serial into the sales order box ({exc}). "
-                    "Check the ERP serial input selector."
+                    "Check locators.json for the ERP serial input."
                 ) from exc
 
             if accepted:
@@ -1194,10 +1225,15 @@ async def run_batch_serials(
 
         if skipped:
             return AutomationResult(
-                status=f"Success — {success}/{total} serials, {skipped} skipped",
+                status=(
+                    f"Incomplete — {success}/{total} serials, {skipped} skipped"
+                ),
                 failed_serials=tuple(failed),
             )
-        return AutomationResult(status=f"Success — {success}/{total} serials")
+        return AutomationResult(
+            status=f"Success — {success}/{total} serials",
+            close_detail_url=page.url,
+        )
     except asyncio.CancelledError:
         logger.info("Batch serial cancelled")
         raise

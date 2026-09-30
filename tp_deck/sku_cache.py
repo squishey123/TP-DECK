@@ -35,10 +35,10 @@ def _write_raw(data: dict[str, Any]) -> None:
 
 
 class SkuLocationCache:
-    """File-backed SKU location cache. Entries older than ttl_hours are dropped."""
+    """File-backed SKU location cache. Entries older than ttl_seconds are dropped."""
 
-    def __init__(self, ttl_hours: float = 12.0) -> None:
-        self.ttl_seconds = max(0.0, float(ttl_hours)) * 3600.0
+    def __init__(self, ttl_seconds: float = 12 * 3600) -> None:
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
         self._data = self._prune(_read_raw())
         self._dirty = False
 

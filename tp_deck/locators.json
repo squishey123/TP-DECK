@@ -1,0 +1,15 @@
+{
+  "ebay_order_id": "[id$=\"__order-info\"] .order-details",
+  "ebay_buyer": "div.user-details.details span > button > span:nth-child(1)",
+  "ebay_sku": "span.item-custom-sku span.sh-bold",
+  "ebay_qty": "div.quantity strong",
+  "erp_sku_input": "#ag-grid-inventory-detail .ag-header-row-floating-filter > div:nth-child(2) input",
+  "erp_location": "#ag-grid-inventory-detail .ag-center-cols-container .ag-row > div:nth-child(3)",
+  "erp_serial_input": "#div_TabSalesOrderItems > div:nth-child(5) > div.clearfix.allocated-controls > div:nth-child(1)",
+  "sales_orders_url": "https://techyparts.razorerp.com/Admin/SalesOrders.aspx",
+  "sales_orders_url_pattern": "SalesOrders.aspx",
+  "sales_order_detail_pattern": "SalesOrder.aspx?orderId=",
+  "sales_order_filter": "#ag-grid .ag-header-row-floating-filter > div:nth-child(1) input",
+  "sales_order_rows": "#ag-grid .ag-center-cols-container .ag-row",
+  "service_order_label": "#div_PageSalesOrder .wrap-sales-list > ul:nth-child(2) > li:nth-child(2)"
+}

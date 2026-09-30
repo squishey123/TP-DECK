@@ -7,11 +7,11 @@
 1. Open TP DECK. It starts Playwright's Chromium minimized, with remote debugging, and restores the last session. The first open downloads Chromium into a `browser` folder next to the app (network required once). If the debug port is already open, that window is left where you put it.
 2. TP DECK opens as a compact, always-on-top floating panel and remembers its position across monitors.
 3. You click **Scrape eBay Orders** or **Generate Pick List**. Playwright attaches to that Chromium session over CDP — it never calls `launch()`.
-4. The engine finds the focused eBay order tab (`ebay.com/sh/ord` + `document.hasFocus()`), scrapes Order, buyer, SKU, and quantity via CSS selectors from `settings.json`.
+4. The engine finds the focused eBay order tab (`ebay.com/sh/ord` + `document.hasFocus()`), scrapes Order, buyer, SKU, and quantity via CSS selectors from `locators.json`.
 5. It locates the ERP tab, enters each SKU, waits for Location, then copies either  
    `[Order] - [Buyer] - [SKU] - [Location]` (scrape) or a walk-sorted pick list  
    `Nx - SKU - LOCATION` grouped CPU Rack → Cubbies → Endcaps → Small parts → Cabinet → Rail Shelf → Misc.  
-   SKU → location results are cached for 12 hours when **Cache SKU → location** is enabled in Settings (`cache_enabled` / `cache_ttl_hours`). Turn that off when bins are moving often.
+   SKU → location results are cached for the lifetime set under **Cache SKU → location** in Settings (default `12h`; `cache_enabled` / `cache_ttl`). Turn that off when bins are moving often.
 6. While a run is active, both action buttons disable and the active one shows `⏳ Processing...`. Status moves Idle → Processing → Success.
 7. At any time, **🛑 Emergency Stop** or the global **Pause** key cancels the in-flight `asyncio` task immediately.
 
@@ -22,7 +22,7 @@
 | **Single** | One Chromium window on the eBay CDP port (default `9222`); set `erp_url_pattern` so the ERP tab can be found in the same browser |
 | **Dual** | eBay on `9222`, ERP on `9223` (two Chromium windows) |
 
-All ports, CSS selectors, URL patterns, timeouts, hotkeys, and window geometry live in `tp_deck/settings.json` (also editable in **⚙ Settings**). `chrome_version` records the Playwright Chromium revision after the first install.
+All ports, URL patterns, timeouts, hotkeys, and window geometry live in `tp_deck/settings.json` (also editable in **⚙ Settings**). CSS selectors and Razor sales-order addresses live in `tp_deck/locators.json`. `chrome_version` records the Playwright Chromium revision after the first install.
 
 ### Chromium
 
@@ -64,7 +64,7 @@ From the repo root in PowerShell:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-Output: `dist\TP-DECK-0.2.4-windows-x64.zip`
+Output: `dist\TP-DECK-0.2.5-windows-x64.zip`
 
 Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 
@@ -72,12 +72,12 @@ Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 
 Pushing a version tag runs `.github/workflows/release.yml` on Windows: it builds the zip and creates the GitHub Release with the asset attached.
 
-1. Bump `tp_deck/__init__.py` (e.g. `0.2.4`), commit, and push `main`.
+1. Bump `tp_deck/__init__.py` (e.g. `0.2.5`), commit, and push `main`.
 2. Tag that commit and push the tag (tag must match `v` + `__version__`):
 
 ```powershell
-git tag -a v0.2.4 -m "TP DECK 0.2.4"
-git push origin v0.2.4
+git tag -a v0.2.5 -m "TP DECK 0.2.5"
+git push origin v0.2.5
 ```
 
 3. Watch **Actions → Release**. When it finishes, the zip is on the **Releases** page.
@@ -110,9 +110,10 @@ TP-DECK/
     ├── main.py             # Entry point, event loop, hotkey registration
     ├── chrome_launcher.py  # Install and start minimized Chromium on open
     ├── dashboard.py        # Floating UI, theme, position persistence
-    ├── settings_dialog.py  # Mode, ports, patterns, selectors, setup help
+    ├── settings_dialog.py  # Mode, ports, patterns, and what each button does
     ├── automation_engine.py# CDP connect, tab focus, scrape, clipboard
-    ├── settings.json       # Ports, selectors, window_x/y, mode
+    ├── locators.json       # CSS selectors and Razor sales-order addresses
+    ├── settings.json       # Ports, window_x/y, mode
     └── tpdeck.log          # Rolling local log
 ```
 

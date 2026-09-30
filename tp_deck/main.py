@@ -13,14 +13,24 @@ from typing import Optional
 from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
-from tp_deck.automation_engine import run_automation, run_batch_serials
+from tp_deck.automation_engine import (
+    copy_to_clipboard,
+    lookup_missing_locations,
+    run_automation,
+    run_batch_serials,
+)
 from tp_deck.chrome_launcher import ensure_debug_chromium
 from tp_deck.dashboard import Dashboard
+from tp_deck.job_results import AutomationResult, render_job
+from tp_deck.sales_order import close_detail_tab
 from tp_deck.serial_dialog import SerialDialog
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
+from tp_deck.sku_override_dialog import UnknownSkuDialog
+from tp_deck.sku_overrides import load_overrides, merge_overrides
 
 LOG_PATH = Path(__file__).resolve().parent / "tpdeck.log"
+DETAIL_CLOSE_SECONDS = 30
 
 
 def _detach_windows_console() -> None:
@@ -70,6 +80,7 @@ class AutomationController:
         self._dashboard = dashboard
         self._manual_task: Optional[asyncio.Task] = None
         self._cycle_task: Optional[asyncio.Task] = None
+        self._close_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._lock = asyncio.Lock()
         self._autocycle = False
@@ -87,7 +98,14 @@ class AutomationController:
         """Keep the cache cycle from starting a scrape while a dialog is open."""
         self._hold = hold
 
-    def start(self, job: str = "orders", serials: Optional[list[str]] = None) -> bool:
+    def start(
+        self,
+        job: str = "orders",
+        serials: Optional[list[str]] = None,
+        order_number: str = "",
+    ) -> bool:
+        if job == "serials":
+            self._cancel_detail_close()
         if self._lock.locked() or self._manual_pending:
             return False
         if self._manual_task is not None and not self._manual_task.done():
@@ -98,11 +116,37 @@ class AutomationController:
         self._dashboard.set_processing(True, job=job)
         self._dashboard.set_status("Processing")
         self._manual_task = asyncio.create_task(
-            self._run_manual(job, serials),
+            self._run_manual(job, serials, order_number),
             name="tpdeck-automation",
         )
         self._manual_task.add_done_callback(self._on_manual_done)
         logging.getLogger("tpdeck").info("Automation task started (%s)", job)
+        return True
+
+    def start_sister_lookup(
+        self,
+        result: AutomationResult,
+        sisters: list[str],
+    ) -> bool:
+        """Look up alternatives chosen after Unknown, then rebuild the result."""
+        if self._lock.locked() or self._manual_pending:
+            return False
+        if self._manual_task is not None and not self._manual_task.done():
+            return False
+
+        self._manual_pending = True
+        self._job = result.job or "orders"
+        self._dashboard.set_processing(True, job=self._job)
+        self._dashboard.set_status("Processing")
+        self._manual_task = asyncio.create_task(
+            self._run_sister_lookup(result, sisters),
+            name="tpdeck-sister-lookup",
+        )
+        self._manual_task.add_done_callback(self._on_manual_done)
+        logging.getLogger("tpdeck").info(
+            "Sister SKU lookup started (%s)",
+            ", ".join(sisters),
+        )
         return True
 
     def toggle_autocycle(self) -> None:
@@ -134,12 +178,18 @@ class AutomationController:
 
     def stop(self) -> None:
         logger = logging.getLogger("tpdeck")
+        close_running = (
+            self._close_task is not None and not self._close_task.done()
+        )
+        if close_running:
+            self._cancel_detail_close()
         manual_running = (
             self._manual_task is not None and not self._manual_task.done()
         )
         cycle_running = self._cycle_task is not None and not self._cycle_task.done()
         if not manual_running and not cycle_running:
-            logger.info("Emergency stop — no active task")
+            if not close_running:
+                logger.info("Emergency stop — no active task")
             return
         logger.info("Emergency stop — cancelling task")
         self._autocycle = False
@@ -159,6 +209,13 @@ class AutomationController:
             return
         self._loop.call_soon_threadsafe(self.stop)
 
+    def _cancel_detail_close(self) -> None:
+        task = self._close_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        logging.getLogger("tpdeck").info("Cancelled pending sales order tab close")
+
     def _wake_wait(self) -> None:
         if self._wake is not None:
             self._wake.set()
@@ -170,6 +227,7 @@ class AutomationController:
         self,
         job: str,
         serials: Optional[list[str]],
+        order_number: str = "",
     ):
         try:
             async with self._lock:
@@ -179,6 +237,7 @@ class AutomationController:
                         settings,
                         serials or [],
                         on_progress=self._on_serial_progress,
+                        order_number=order_number,
                     )
                 return await run_automation(
                     settings,
@@ -188,33 +247,143 @@ class AutomationController:
         finally:
             self._manual_pending = False
 
+    async def _run_sister_lookup(
+        self,
+        result: AutomationResult,
+        sisters: list[str],
+    ) -> AutomationResult:
+        try:
+            async with self._lock:
+                settings = load_settings()
+                known = dict(result.queried)
+                unique_sisters = list(dict.fromkeys(sisters))
+                missing = [sku for sku in unique_sisters if sku not in known]
+                if missing:
+                    found = await lookup_missing_locations(settings, missing)
+                    known.update(found)
+                hits = len(unique_sisters) - len(missing)
+                rendered = render_job(
+                    settings,
+                    job=result.job,
+                    lines=result.lines,
+                    queried=known,
+                    overrides=load_overrides(),
+                    hits=max(0, hits),
+                    misses=len(missing),
+                    copy_clipboard=True,
+                    allow_prompt=False,
+                    cache_enabled=bool(settings.get("cache_enabled", True)),
+                )
+                if rendered.clipboard_text and rendered.clipboard_text.strip():
+                    copy_to_clipboard(rendered.clipboard_text)
+                return rendered
+        finally:
+            self._manual_pending = False
+
     def _on_manual_done(self, task: asyncio.Task) -> None:
         self._manual_pending = False
-        self._dashboard.set_processing(False)
         logger = logging.getLogger("tpdeck")
 
         if task.cancelled():
+            self._dashboard.set_processing(False)
             self._dashboard.set_status("Stopped")
             logger.info("Automation cancelled")
             return
 
         exc = task.exception()
         if exc is not None:
+            self._dashboard.set_processing(False)
             message = str(exc).strip() or exc.__class__.__name__
             self._dashboard.set_status(f"Error — {message}")
             logger.exception("Automation failed: %s", exc)
             return
 
         result = task.result()
+        if result is not None and result.pending_unknowns:
+            self._offer_overrides(result)
+            return
+
+        self._dashboard.set_processing(False)
+        self._publish(result)
+
+    def _offer_overrides(self, result: AutomationResult) -> None:
+        """Ask once for every unknown SKU, then look up any alternatives."""
+        logger = logging.getLogger("tpdeck")
+        count = len(result.pending_unknowns)
+        noun = "SKU" if count == 1 else "SKUs"
+        self._dashboard.set_status(f"{count} unknown {noun} — enter alternatives")
+        self.hold_autocycle(True)
+        mappings: list[tuple[str, str, int]] = []
+        try:
+            dialog = UnknownSkuDialog(
+                list(result.pending_unknowns),
+                parent=self._dashboard,
+            )
+            if dialog.exec():
+                mappings = dialog.mappings()
+            if not mappings:
+                self._present_deferred(result)
+                return
+            try:
+                merge_overrides(mappings)
+            except (ValueError, OSError) as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                logger.exception("Could not save SKU overrides")
+                self._present_deferred(result)
+                self._dashboard.set_status(f"Error — {message}")
+                return
+            sisters = [sister for _original, sister, _qty in mappings]
+            if not self.start_sister_lookup(result, sisters):
+                self._present_deferred(result)
+                self._dashboard.set_status("Error — busy, try again")
+        finally:
+            self.hold_autocycle(False)
+
+    def _present_deferred(self, result: AutomationResult) -> None:
+        """Copy and show a finished run whose clipboard waited on the prompt."""
+        text = result.clipboard_text or ""
+        if text.strip():
+            copy_to_clipboard(text)
+        self._dashboard.set_processing(False)
+        self._publish(result)
+
+    def _publish(self, result: Optional[AutomationResult]) -> None:
+        logger = logging.getLogger("tpdeck")
         status = result.status if result else "Success"
         self._dashboard.set_status(status)
         logger.info("Automation completed: %s", status)
-        clipboard = result.clipboard_text if result else None
-        if clipboard and bool(load_settings().get("show_results_popup", False)):
-            self._dashboard.show_results(clipboard)
+        if (
+            result is not None
+            and result.job in {"orders", "picklist"}
+            and bool(load_settings().get("show_results_popup", False))
+        ):
+            self._dashboard.show_results(
+                list(result.headers),
+                [list(row) for row in result.rows],
+                unknown=list(result.unknown_flags),
+                note=result.note,
+            )
         failures = result.failed_serials if result else ()
         if failures:
-            self._dashboard.show_serial_failures(failures)
+            self._dashboard.show_serial_failures(list(failures))
+        if result is not None and result.close_detail_url:
+            self._close_task = asyncio.create_task(
+                self._close_detail_later(result.close_detail_url),
+                name="tpdeck-close-order",
+            )
+
+    async def _close_detail_later(self, url: str) -> None:
+        """Wait, then reconnect only long enough to close that detail tab."""
+        logger = logging.getLogger("tpdeck")
+        try:
+            await asyncio.sleep(DETAIL_CLOSE_SECONDS)
+            async with self._lock:
+                await close_detail_tab(load_settings(), url)
+        except asyncio.CancelledError:
+            logger.info("Detail tab close cancelled")
+            raise
+        except Exception:
+            logger.exception("Could not close the sales order tab")
 
     async def _interruptible_sleep(self, seconds: float) -> None:
         self._wake = asyncio.Event()
@@ -352,9 +521,11 @@ def main() -> int:
         serials: list[str] = []
         try:
             dialog = SerialDialog(parent=dashboard)
+            order_number = ""
             if dialog.exec() == SerialDialog.DialogCode.Accepted:
                 serials = dialog.serials()
-            if serials and not controller.start("serials", serials):
+                order_number = dialog.order_number()
+            if serials and not controller.start("serials", serials, order_number):
                 dashboard.set_status("Error — busy, try again")
         finally:
             controller.hold_autocycle(False)

@@ -29,33 +29,24 @@ DEFAULTS: dict[str, Any] = {
     "location_lowest_priority": ["HQ"],
     "cache_ttl_hours": 12,
     "cache_enabled": True,
+    "slow_razor_multiplier": 10,
     "ebay_refresh_hold_enabled": True,
     "ebay_refresh_hold_minutes": 5,
     "show_results_popup": False,
     "ebay_autocycle_minutes": 10,
-    "sales_order_url_pattern": "SalesOrder.aspx",
     "serial_timeout_ms": 10000,
     "serial_clear_confirm_ms": 500,
     "pick_list_exclude_locations": ["HQ", "unavailable"],
     "pick_list_exclude_prefixes": ["PR"],
     "pick_list_exclude_misc": True,
-    "selectors": {
-        "ebay_order_id": "",
-        "ebay_buyer": "",
-        "ebay_sku": "",
-        "ebay_qty": "div.quantity strong",
-        "erp_sku_input": "",
-        "erp_location": "",
-        "erp_serial_input": (
-            "#div_TabSalesOrderItems > div:nth-child(5) > "
-            "div.clearfix.allocated-controls > div:nth-child(1)"
-        ),
-    },
 }
 
 
 def load_settings() -> dict[str, Any]:
     """Return settings merged over defaults. Creates the file if missing."""
+    from tp_deck.locators import load_locators
+
+    load_locators()
     if not SETTINGS_PATH.exists():
         save_settings(DEFAULTS.copy())
         return DEFAULTS.copy()
@@ -69,10 +60,6 @@ def load_settings() -> dict[str, Any]:
 
     merged = DEFAULTS.copy()
     merged.update(data)
-    if "selectors" in data and isinstance(data["selectors"], dict):
-        selectors = DEFAULTS["selectors"].copy()
-        selectors.update(data["selectors"])
-        merged["selectors"] = selectors
     return merged
 
 

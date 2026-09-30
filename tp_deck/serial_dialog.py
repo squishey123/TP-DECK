@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -27,13 +28,14 @@ QLabel {
 QLabel#errorLabel {
     color: #FCA5A5;
 }
-QTextEdit {
+QLineEdit, QTextEdit {
     background-color: #1E293B;
     color: #F8FAFC;
     border: 1px solid #334155;
     border-radius: 4px;
     font-family: Consolas, "Courier New", monospace;
     font-size: 12px;
+    padding: 4px 6px;
 }
 QPushButton {
     background-color: #1E293B;
@@ -75,9 +77,17 @@ class SerialDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
-        hint = QLabel("Paste one serial number per line. The sales order must already be open.")
+        hint = QLabel(
+            "Paste one serial number per line. A service order number opens "
+            "that order first. Leave it blank to use the one sales order "
+            "already open."
+        )
         hint.setWordWrap(True)
         layout.addWidget(hint)
+
+        self._order = QLineEdit()
+        self._order.setPlaceholderText("Service order number")
+        layout.addWidget(self._order)
 
         self._editor = QTextEdit()
         self._editor.setPlaceholderText("Serial numbers from Google Sheets")
@@ -99,6 +109,9 @@ class SerialDialog(QDialog):
         submit_btn.clicked.connect(self._submit)
         buttons.addWidget(submit_btn)
         layout.addLayout(buttons)
+
+    def order_number(self) -> str:
+        return self._order.text().strip()
 
     def serials(self) -> list[str]:
         return parse_serials(self._editor.toPlainText())

@@ -18,11 +18,15 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QPushButton,
     QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -173,6 +177,11 @@ QPushButton#stopBtn:hover {
 QPushButton#settingsBtn {
     border-color: #64748B;
 }
+QLabel#slowRazorLabel {
+    color: #FBBF24;
+    font-size: 12px;
+    font-weight: bold;
+}
 """
 
 RESULTS_QSS = """
@@ -207,6 +216,23 @@ QPushButton#closeBtn {
 QPushButton#closeBtn:hover {
     background-color: #38BDF8;
     color: #0F172A;
+}
+QTableWidget#resultsTable {
+    background-color: #FFFFFF;
+    color: #000000;
+    border: 1px solid #CBD5E1;
+    gridline-color: #E2E8F0;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 18px;
+    selection-background-color: #E0F2FE;
+    selection-color: #000000;
+}
+QTableWidget#resultsTable QHeaderView::section {
+    background-color: #F1F5F9;
+    color: #0F172A;
+    font-weight: bold;
+    padding: 4px 6px;
+    border: 1px solid #CBD5E1;
 }
 """
 
@@ -248,7 +274,28 @@ class ResultsWindow(QWidget):
         self._note = QLabel(note)
         self._note.setObjectName("resultsNote")
         self._note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._note.setWordWrap(True)
         layout.addWidget(self._note)
+
+        self._table = QTableWidget()
+        self._table.setObjectName("resultsTable")
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self._table.setAlternatingRowColors(False)
+        self._table.setWordWrap(True)
+        self._table.setShowGrid(True)
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        self._table.setVisible(False)
+        layout.addWidget(self._table)
 
         self._text = QTextEdit()
         self._text.setObjectName("resultsText")
@@ -273,11 +320,58 @@ class ResultsWindow(QWidget):
     def present(self, text: str, *, note: Optional[str] = None) -> None:
         if note is not None:
             self._note.setText(note)
+        self._table.setVisible(False)
+        self._text.setVisible(True)
         self._text.setPlainText(text)
         self._fit_to_text(text)
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def present_table(
+        self,
+        headers: list[str],
+        rows: list[list[str]],
+        *,
+        unknown: Optional[list[bool]] = None,
+        note: Optional[str] = None,
+    ) -> None:
+        if note is not None:
+            self._note.setText(note)
+        self._text.setVisible(False)
+        self._table.setVisible(True)
+        self._fill_table(headers, rows, unknown or [])
+        self._fit_to_table()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _fill_table(
+        self,
+        headers: list[str],
+        rows: list[list[str]],
+        unknown: list[bool],
+    ) -> None:
+        self._table.clear()
+        self._table.setColumnCount(len(headers))
+        self._table.setHorizontalHeaderLabels(headers)
+        self._table.setRowCount(len(rows))
+        unknown_bg = QColor("#FEE2E2")
+        for row_index, row in enumerate(rows):
+            flagged = row_index < len(unknown) and unknown[row_index]
+            for column, value in enumerate(row):
+                item = QTableWidgetItem(value)
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+                )
+                if flagged:
+                    item.setBackground(unknown_bg)
+                self._table.setItem(row_index, column, item)
+        self._table.resizeColumnsToContents()
+        for column in range(self._table.columnCount()):
+            width = self._table.columnWidth(column)
+            self._table.setColumnWidth(column, min(max(width, 72), 420))
+        self._table.resizeRowsToContents()
 
     def _fit_to_text(self, text: str) -> None:
         metrics = QFontMetrics(self._text.font())
@@ -310,6 +404,41 @@ class ResultsWindow(QWidget):
         )
         width = min(max_w, text_w + margin_x)
         height = min(max_h, max(180, doc_h + chrome_h))
+        self.setFixedSize(width, height)
+
+    def _fit_to_table(self) -> None:
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            max_w = max(420, int(avail.width() * 0.9))
+            max_h = max(220, int(avail.height() * 0.85))
+        else:
+            max_w, max_h = 1400, 900
+
+        table = self._table
+        frame = table.frameWidth() * 2
+        content_w = frame + 28
+        for column in range(table.columnCount()):
+            content_w += table.columnWidth(column)
+        content_h = frame + table.horizontalHeader().height() + 8
+        for row in range(table.rowCount()):
+            content_h += table.rowHeight(row)
+
+        margins = self.layout().contentsMargins()
+        margin_x = margins.left() + margins.right()
+        note_h = self._note.sizeHint().height()
+        btn_h = max(self._close.sizeHint().height(), 36)
+        spacing = self.layout().spacing()
+        chrome_h = (
+            margins.top()
+            + margins.bottom()
+            + note_h
+            + btn_h
+            + spacing * 2
+            + 8
+        )
+        width = min(max_w, max(480, content_w + margin_x))
+        height = min(max_h, max(220, content_h + chrome_h))
         self.setFixedSize(width, height)
 
 
@@ -362,6 +491,16 @@ class Dashboard(QMainWindow):
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
+
+        self._slow_label = QLabel("Slow Razor")
+        self._slow_label.setObjectName("slowRazorLabel")
+        self._slow_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._slow_label.setToolTip(
+            "ERP locator, grid, and serial waits are stretched "
+            "until TP DECK is closed."
+        )
+        self._slow_label.setVisible(False)
+        layout.addWidget(self._slow_label)
 
         self.status_label = QLabel("Idle")
         self.status_label.setObjectName("statusLabel")
@@ -454,10 +593,32 @@ class Dashboard(QMainWindow):
             "Auto-cycle eBay scrape (on)" if enabled else "Auto-cycle eBay scrape (off)"
         )
 
-    def show_results(self, text: str) -> None:
+    def set_slow_razor(self, enabled: bool) -> None:
+        """Show the session flag. The window grows only while it is on."""
+        self._slow_label.setVisible(bool(enabled))
+        self.setFixedHeight(372 if enabled else 340)
+
+    def show_results(
+        self,
+        headers: list[str],
+        rows: list[list[str]],
+        *,
+        unknown: Optional[list[bool]] = None,
+        note: str = "Copied to clipboard",
+    ) -> None:
         if self._results is None:
             self._results = ResultsWindow(self)
-        self._results.present(text)
+        display_rows = rows
+        if not display_rows:
+            blank = [""] * max(0, len(headers) - 1)
+            display_rows = [["Nothing to copy", *blank]] if headers else [["Nothing to copy"]]
+            note = note or "Nothing to copy"
+        self._results.present_table(
+            headers,
+            display_rows,
+            unknown=unknown,
+            note=note,
+        )
 
     def show_serial_failures(self, failures: list[tuple[int, str]]) -> None:
         """Report serials the batch did not accept, by scan order."""

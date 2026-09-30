@@ -133,16 +133,16 @@ def is_excluded_pick_location(
     return False
 
 
-def build_pick_list(
+def ordered_pick_rows(
     items: Iterable[tuple[str, str, int]],
     *,
     exclude_names: Iterable[str] | None = None,
     exclude_prefixes: Iterable[str] | None = None,
     exclude_misc: bool = True,
-) -> str:
+) -> list[tuple[str, int, str, str]]:
     """
     items: (sku, location, quantity) already combined per SKU.
-    Output grouped sections, SKUs sorted by walk order then SKU.
+    Return (group title, qty, sku, location) in walk order.
     Tech and other non-walk locations are omitted.
     """
     rows = []
@@ -157,23 +157,45 @@ def build_pick_list(
         ):
             continue
         group, key = location_group_and_key(location)
-        rows.append((group, key, str(sku), str(location), int(qty)))
+        title = GROUP_TITLES.get(group, "Misc")
+        rows.append((group, key, str(sku), str(location), int(qty), title))
 
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    return [
+        (title, qty, sku, location)
+        for _group, _key, sku, location, qty, title in rows
+    ]
 
+
+def build_pick_list(
+    items: Iterable[tuple[str, str, int]],
+    *,
+    exclude_names: Iterable[str] | None = None,
+    exclude_prefixes: Iterable[str] | None = None,
+    exclude_misc: bool = True,
+) -> str:
+    """
+    items: (sku, location, quantity) already combined per SKU.
+    Output grouped sections, SKUs sorted by walk order then SKU.
+    Tech and other non-walk locations are omitted.
+    """
+    structured = ordered_pick_rows(
+        items,
+        exclude_names=exclude_names,
+        exclude_prefixes=exclude_prefixes,
+        exclude_misc=exclude_misc,
+    )
     sections: list[str] = []
-    current_group: int | None = None
+    current_title: str | None = None
     lines: list[str] = []
-    for group, _key, sku, location, qty in rows:
-        if group != current_group:
-            if lines:
-                title = GROUP_TITLES.get(current_group, "Misc")
-                sections.append(f"{title}\n" + "\n".join(lines))
-            current_group = group
+    for title, qty, sku, location in structured:
+        if title != current_title:
+            if lines and current_title is not None:
+                sections.append(f"{current_title}\n" + "\n".join(lines))
+            current_title = title
             lines = []
         lines.append(f"{qty}x - {sku} - {location}")
-    if lines:
-        title = GROUP_TITLES.get(current_group, "Misc")
-        sections.append(f"{title}\n" + "\n".join(lines))
+    if lines and current_title is not None:
+        sections.append(f"{current_title}\n" + "\n".join(lines))
 
     return "\n\n".join(sections)

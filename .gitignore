@@ -12,6 +12,7 @@ ENV/
 # Logs & local runtime
 tp_deck/tpdeck.log
 tp_deck/sku_location_cache.json
+tp_deck/sku_overrides.json
 *.log
 
 # IDE / OS
