@@ -12,7 +12,8 @@
   "erp_submit_key": "Enter",
   "location_blacklist": [
     "tech",
-    "internal"
+    "internal",
+    "LOST"
   ],
   "location_deprioritize": [
     "Andrei & Alex Office"
@@ -35,7 +36,8 @@
   "serial_clear_confirm_ms": 500,
   "pick_list_exclude_locations": [
     "HQ",
-    "unavailable"
+    "unavailable",
+    "LOST"
   ],
   "pick_list_exclude_prefixes": [
     "PR"

@@ -98,6 +98,30 @@ async def read_service_order(page: Page, selector: str, timeout_ms: int) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
+async def wait_for_service_order_match(
+    page: Page,
+    selector: str,
+    expected: str,
+    timeout_ms: int,
+) -> str:
+    """Poll until the service order label matches. Always wait at least 15s."""
+    wait_ms = max(15000, int(timeout_ms))
+    deadline = time.monotonic() + (wait_ms / 1000.0)
+    label = page.locator(selector).first
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            if await label.count() > 0 and await label.is_visible():
+                text = await label.inner_text()
+                last = re.sub(r"\s+", " ", str(text or "")).strip()
+                if order_labels_match(expected, last):
+                    return last
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return last
+
+
 async def _browser_context(browser: Browser):
     for context in browser.contexts:
         return context
@@ -190,49 +214,33 @@ async def _filter_order_list(
             str(await rows.first.locator(".ag-cell").first.inner_text() or ""),
         ).strip()
     query = order_number.strip()
-    attempts = [query]
-    if not query.upper().startswith("SO-"):
-        attempts.append(f"SO-{query}")
-
-    last_count = 0
-    last_text = ""
-    for attempt in attempts:
-        await field.click()
-        await field.fill("")
-        await field.fill(attempt)
-        key = (submit_key or "").strip()
-        if key:
-            await field.press(key)
-        overlay = page.locator("#ag-grid .ag-overlay-loading-wrapper")
-        try:
-            await overlay.wait_for(state="visible", timeout=overlay_ms)
-            await overlay.wait_for(state="hidden", timeout=timeout_ms)
-        except Exception:
-            await asyncio.sleep(0.4)
-        count, text, row = await _wait_for_filter_rows(
-            page,
-            locators["sales_order_rows"],
-            order_number,
-            timeout_ms,
-            previous_text,
-            previous_count,
-        )
-        last_count, last_text = count, text
-        if row is not None:
-            return row
-        if count != 0:
-            break
-        if attempt != attempts[-1]:
-            logger.info(
-                "No row for %r; trying %r",
-                attempt,
-                attempts[-1],
-            )
-    if last_count > 1:
+    await field.click()
+    await field.fill("")
+    await field.fill(query)
+    key = (submit_key or "").strip()
+    if key:
+        await field.press(key)
+    overlay = page.locator("#ag-grid .ag-overlay-loading-wrapper")
+    try:
+        await overlay.wait_for(state="visible", timeout=overlay_ms)
+        await overlay.wait_for(state="hidden", timeout=timeout_ms)
+    except Exception:
+        await asyncio.sleep(0.4)
+    count, text, row = await _wait_for_filter_rows(
+        page,
+        locators["sales_order_rows"],
+        order_number,
+        timeout_ms,
+        previous_text,
+        previous_count,
+    )
+    if row is not None:
+        return row
+    if count > 1:
         raise RuntimeError(f"More than one sales order matched {order_number}.")
-    if last_count == 1 and last_text:
+    if count == 1 and text:
         raise RuntimeError(
-            f"The order on screen does not match {order_number} ({last_text})."
+            f"The order on screen does not match {order_number} ({text})."
         )
     raise RuntimeError(f"No sales order matched {order_number}.")
 
@@ -353,9 +361,10 @@ async def prepare_sales_order(
                 overlay_ms=overlay_ms,
                 submit_key=submit_key,
             )
-        label = await read_service_order(
+        label = await wait_for_service_order_match(
             keeper,
             locators["service_order_label"],
+            typed,
             timeout_ms,
         )
         if not order_labels_match(typed, label):

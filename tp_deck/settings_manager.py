@@ -23,7 +23,7 @@ DEFAULTS: dict[str, Any] = {
     "erp_url_pattern": "",
     "wait_timeout_ms": 10000,
     "erp_submit_key": "Enter",
-    "location_blacklist": ["tech", "internal"],
+    "location_blacklist": ["tech", "internal", "LOST"],
     "location_deprioritize": ["Andrei & Alex Office"],
     "location_deprioritize_prefixes": ["PR"],
     "location_lowest_priority": ["HQ"],
@@ -36,7 +36,7 @@ DEFAULTS: dict[str, Any] = {
     "ebay_autocycle_minutes": 10,
     "serial_timeout_ms": 10000,
     "serial_clear_confirm_ms": 500,
-    "pick_list_exclude_locations": ["HQ", "unavailable"],
+    "pick_list_exclude_locations": ["HQ", "unavailable", "LOST"],
     "pick_list_exclude_prefixes": ["PR"],
     "pick_list_exclude_misc": True,
 }

@@ -144,7 +144,7 @@ def pick_best_location(
 ) -> str:
     """
     Choose one location from many serial rows:
-    - Drop blacklisted names entirely (e.g. Tech, Internal)
+    - Drop blacklisted names entirely (e.g. Tech, Internal, LOST)
     - Prefer highest frequency among remaining rows
     - Then Andrei & Alex Office, then PR*, then HQ last
     - On a frequency tie, favor codes like A-12 (letter + dash)

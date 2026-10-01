@@ -154,7 +154,7 @@ class SettingsDialog(QDialog):
         self.setWindowFlags(
             self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setMinimumSize(480, 640)
+        self.setMinimumSize(480, 960)
         self.setStyleSheet(DIALOG_QSS)
 
         self._build_ui()
