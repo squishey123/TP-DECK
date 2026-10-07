@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Callable, Optional
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -442,6 +443,216 @@ class ResultsWindow(QWidget):
         self.setFixedSize(width, height)
 
 
+class ChassisLight(QWidget):
+    """Small lamp beside the title. It breathes only while auto-cycle is waiting."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(12, 12)
+        self._state = "idle"
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def set_state(self, state: str) -> None:
+        self._state = state or "idle"
+        if self._state == "waiting":
+            if not self._timer.isActive():
+                self._timer.start(33)
+        else:
+            self._timer.stop()
+        self.update()
+
+    def _tick(self) -> None:
+        self._phase = (self._phase + 0.05) % (math.tau)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 — Qt override
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        colors = {
+            "idle": QColor("#334155"),
+            "running": QColor("#38BDF8"),
+            "success": QColor("#4ADE80"),
+            "error": QColor("#FCA5A5"),
+        }
+        color = colors.get(self._state, QColor("#334155"))
+        if self._state == "waiting":
+            wave = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(self._phase))
+            color = QColor("#0EA5E9")
+            color.setAlphaF(wave)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
+        painter.end()
+
+
+class CycleButton(QPushButton):
+    """Auto-cycle toggle with a ring that drains across the wait."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._deadline: Optional[float] = None
+        self._total = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.update)
+
+    def start_countdown(self, seconds: float) -> None:
+        self._total = max(0.001, float(seconds))
+        self._deadline = time.monotonic() + self._total
+        if not self._timer.isActive():
+            self._timer.start(33)
+        self.update()
+
+    def clear_countdown(self) -> None:
+        self._deadline = None
+        self._timer.stop()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 — Qt override
+        super().paintEvent(event)
+        if self._deadline is None or self._total <= 0:
+            return
+        remaining = max(0.0, self._deadline - time.monotonic())
+        fraction = remaining / self._total
+        if fraction <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#E0F2FE"))
+        pen.setWidthF(2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        rect = QRectF(self.rect().adjusted(3, 3, -4, -4))
+        painter.drawArc(rect, 90 * 16, int(-fraction * 360 * 16))
+        painter.end()
+
+
+class StatusWell(QWidget):
+    """Recessed status readout with an optional eased progress track."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(68)
+        self.setFont(QFont("Consolas", 9))
+        self._text = "Idle"
+        self._locked = 0.0
+        self._display = 0.0
+        self._sheen: Optional[tuple[float, float]] = None
+        self._show_track = False
+        self._serial = False
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self.update()
+
+    def set_progress(
+        self,
+        locked: float,
+        sheen: Optional[tuple[float, float]],
+    ) -> None:
+        self._serial = False
+        self._locked = max(0.0, min(1.0, locked))
+        self._sheen = sheen
+        self._show_track = True
+        self._ensure_timer()
+        self.update()
+
+    def set_serial(self, fraction: float) -> None:
+        self._serial = True
+        self._locked = max(0.0, min(1.0, fraction))
+        self._sheen = None
+        self._show_track = True
+        self._ensure_timer()
+        self.update()
+
+    def clear_progress(self) -> None:
+        self._show_track = False
+        self._serial = False
+        self._locked = 0.0
+        self._display = 0.0
+        self._sheen = None
+        self._timer.stop()
+        self.update()
+
+    def _ensure_timer(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start(33)
+
+    def _tick(self) -> None:
+        self._display += (self._locked - self._display) * 0.2
+        if abs(self._display - self._locked) < 0.004:
+            self._display = self._locked
+        self._phase = (self._phase + 0.045) % 1.0
+        moving = abs(self._display - self._locked) >= 0.004 or self._sheen is not None
+        if self._show_track and (moving or self._serial):
+            self.update()
+            return
+        self._timer.stop()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 — Qt override
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(QPen(QColor("#0EA5E9"), 1))
+        painter.setBrush(QColor("#1E293B"))
+        painter.drawRoundedRect(bounds, 6, 6)
+
+        text_bottom = 16 if self._show_track else 8
+        text_rect = bounds.adjusted(8, 6, -8, -text_bottom)
+        painter.setPen(QColor("#F8FAFC"))
+        painter.setFont(self.font())
+        painter.drawText(
+            text_rect,
+            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
+            self._text,
+        )
+        if not self._show_track:
+            painter.end()
+            return
+
+        track = QRectF(10, self.height() - 14, max(1, self.width() - 20), 6)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#0F172A"))
+        painter.drawRoundedRect(track, 3, 3)
+        fill_width = track.width() * self._display
+        if fill_width > 0:
+            painter.setBrush(QColor("#0EA5E9"))
+            painter.drawRoundedRect(
+                QRectF(track.x(), track.y(), fill_width, track.height()),
+                3,
+                3,
+            )
+        if self._sheen is not None:
+            start, end = self._sheen
+            span = max(0.04, end - start)
+            band = min(0.08, span * 0.45)
+            travel = start + self._phase * max(0.0, span - band)
+            painter.setBrush(QColor("#7DD3FC"))
+            painter.drawRoundedRect(
+                QRectF(
+                    track.x() + track.width() * travel,
+                    track.y(),
+                    track.width() * band,
+                    track.height(),
+                ),
+                3,
+                3,
+            )
+        if self._serial and fill_width > 0:
+            painter.setBrush(QColor("#F0F9FF"))
+            cap = QRectF(track.x() + fill_width - 3, track.y(), 4, track.height())
+            painter.drawRoundedRect(cap, 2, 2)
+        painter.end()
+
+
 class Dashboard(QMainWindow):
     """Compact floating panel that stays on top and remembers screen position."""
 
@@ -470,7 +681,8 @@ class Dashboard(QMainWindow):
         self.setWindowFlags(
             Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
         )
-        self.setFixedSize(300, 340)
+        self._cycle_waiting = False
+        self.setFixedSize(300, 356)
         self.setStyleSheet(THEME_QSS)
 
         self._build_ui()
@@ -487,10 +699,17 @@ class Dashboard(QMainWindow):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        title_row.addStretch()
+        self._light = ChassisLight()
+        title_row.addWidget(self._light)
         title = QLabel("TP DECK")
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch()
+        layout.addLayout(title_row)
 
         self._slow_label = QLabel("Slow Razor")
         self._slow_label.setObjectName("slowRazorLabel")
@@ -502,14 +721,8 @@ class Dashboard(QMainWindow):
         self._slow_label.setVisible(False)
         layout.addWidget(self._slow_label)
 
-        self.status_label = QLabel("Idle")
-        self.status_label.setObjectName("statusLabel")
-        self.status_label.setAlignment(
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop
-        )
-        self.status_label.setWordWrap(True)
-        self.status_label.setMinimumHeight(52)
-        layout.addWidget(self.status_label)
+        self._well = StatusWell()
+        layout.addWidget(self._well)
 
         scrape_row = QHBoxLayout()
         scrape_row.setSpacing(8)
@@ -519,7 +732,7 @@ class Dashboard(QMainWindow):
         self.execute_btn.clicked.connect(self._handle_execute)
         scrape_row.addWidget(self.execute_btn)
 
-        self.cycle_btn = QPushButton()
+        self.cycle_btn = CycleButton()
         self.cycle_btn.setObjectName("cycleBtn")
         self.cycle_btn.setFixedWidth(36)
         self.cycle_btn.setIcon(_cycle_icon())
@@ -580,8 +793,51 @@ class Dashboard(QMainWindow):
         super().closeEvent(event)
 
     def set_status(self, text: str) -> None:
-        self.status_label.setText(_format_status(text))
-        self.status_label.setToolTip(str(text or "").strip())
+        raw = str(text or "").strip()
+        self._well.set_text(_format_status(raw))
+        self._well.setToolTip(raw)
+        self._apply_chassis(raw)
+
+    def _apply_chassis(self, text: str) -> None:
+        if text.startswith("Error"):
+            state = "error"
+        elif text.startswith(
+            ("Processing", "Refreshing", "Scraping", "Syncing", "Looking", "Serials", "Checking")
+        ):
+            state = "running"
+        elif text in {"", "Idle", "Stopped"} or text.startswith("Stopped"):
+            state = "idle"
+        elif text.startswith(("Success", "Cycling", "Incomplete")):
+            state = "success"
+        else:
+            state = "running" if self._well._show_track else "idle"
+        if self._cycle_waiting and state != "error" and state != "running":
+            state = "waiting"
+        self._light.set_state(state)
+
+    def set_run_progress(
+        self,
+        locked: float,
+        sheen: Optional[tuple[float, float]],
+    ) -> None:
+        self._well.set_progress(locked, sheen)
+
+    def set_serial_progress(self, done: int, total: int) -> None:
+        fraction = 0.0 if total <= 0 else done / total
+        self._well.set_serial(fraction)
+
+    def clear_progress(self) -> None:
+        self._well.clear_progress()
+
+    def start_cycle_countdown(self, seconds: float) -> None:
+        self._cycle_waiting = True
+        self.cycle_btn.start_countdown(seconds)
+        self._apply_chassis(self._well.toolTip() or self._well._text)
+
+    def clear_cycle_countdown(self) -> None:
+        self._cycle_waiting = False
+        self.cycle_btn.clear_countdown()
+        self._apply_chassis(self._well.toolTip() or self._well._text)
 
     def set_autocycle(self, enabled: bool) -> None:
         """Amber when off, green when the cache cycle is running."""
@@ -592,11 +848,13 @@ class Dashboard(QMainWindow):
         self.cycle_btn.setToolTip(
             "Auto-cycle eBay scrape (on)" if enabled else "Auto-cycle eBay scrape (off)"
         )
+        if not enabled:
+            self.clear_cycle_countdown()
 
     def set_slow_razor(self, enabled: bool) -> None:
         """Show the session flag. The window grows only while it is on."""
         self._slow_label.setVisible(bool(enabled))
-        self.setFixedHeight(372 if enabled else 340)
+        self.setFixedHeight(388 if enabled else 356)
 
     def show_results(
         self,
@@ -658,7 +916,9 @@ class Dashboard(QMainWindow):
             else:
                 self.execute_btn.setText("⏳ Processing...")
             self.set_status("Processing")
+            self._apply_chassis("Processing")
         else:
+            self.clear_progress()
             self.execute_btn.setEnabled(True)
             self.pick_btn.setEnabled(True)
             self.batch_btn.setEnabled(True)

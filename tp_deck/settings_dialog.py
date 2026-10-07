@@ -135,7 +135,9 @@ QPushButton#saveBtn:hover {
 FUNCTION_HELP = """\
 Scrape eBay Orders reads the open Seller Hub list, looks up each SKU, and copies the result.
 
-The cycle button repeats that lookup on a timer and only fills the location cache.
+The cycle button repeats that lookup on a timer and only fills the location cache. ShipStation store orders sync every few of those passes.
+
+Scrape eBay Orders and Generate Pick List also read store orders from the open ShipStation awaiting-shipment tab.
 
 Generate Pick List does the same lookup and copies a walk-sorted quantity list.
 
@@ -247,6 +249,15 @@ class SettingsDialog(QDialog):
             "window turns this on. Those passes fill the SKU cache only."
         )
         ports_form.addRow("Auto-cycle wait:", self.autocycle_spin)
+        self.shipstation_every_spin = QSpinBox()
+        self.shipstation_every_spin.setRange(1, 99)
+        self.shipstation_every_spin.setSuffix(" auto-cycles")
+        self.shipstation_every_spin.setToolTip(
+            "How many auto-cycle passes run between ShipStation syncs. "
+            "The first pass after auto-cycle is turned on always syncs. "
+            "1 syncs on every pass."
+        )
+        ports_form.addRow("Sync ShipStation every:", self.shipstation_every_spin)
         self.serial_timeout_spin = QSpinBox()
         self.serial_timeout_spin.setRange(1000, 60000)
         self.serial_timeout_spin.setSingleStep(500)
@@ -343,6 +354,9 @@ class SettingsDialog(QDialog):
         except (TypeError, ValueError):
             cycle_minutes = 10
         self.autocycle_spin.setValue(max(1, min(180, cycle_minutes)))
+        self.shipstation_every_spin.setValue(
+            _clamp_int(settings.get("shipstation_sync_every_cycles", 3), 1, 99)
+        )
         self.serial_timeout_spin.setValue(
             _clamp_int(settings.get("serial_timeout_ms", 10000), 1000, 60000)
         )
@@ -386,6 +400,7 @@ class SettingsDialog(QDialog):
             ebay_refresh_hold_minutes=self.refresh_hold_spin.value(),
             show_results_popup=self.results_popup_check.isChecked(),
             ebay_autocycle_minutes=self.autocycle_spin.value(),
+            shipstation_sync_every_cycles=self.shipstation_every_spin.value(),
             serial_timeout_ms=self.serial_timeout_spin.value(),
             serial_clear_confirm_ms=self.serial_confirm_spin.value(),
         )

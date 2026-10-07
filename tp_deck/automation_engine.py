@@ -6,20 +6,89 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from playwright.async_api import Browser, Page, Playwright, async_playwright
 
 from tp_deck.duration import cache_ttl_seconds
-from tp_deck.job_results import UNKNOWN_LOCATION, AutomationResult, render_job
+from tp_deck.job_results import (
+    UNKNOWN_LOCATION,
+    AutomationResult,
+    is_unknown_location,
+    render_job,
+)
 from tp_deck.locators import load_locators
 from tp_deck.pick_list import parse_quantity
 from tp_deck.runtime_state import razor_multiplier, scale_ms
 from tp_deck.settings_manager import update_settings
 from tp_deck.sku_cache import SkuLocationCache
-from tp_deck.sku_overrides import load_overrides, resolve_sku
+from tp_deck.sku_overrides import is_no_sister, load_overrides, resolve_sku
 
 logger = logging.getLogger("tpdeck")
+
+_REFRESH_WEIGHT = 0.15
+_SCRAPE_WEIGHT = 0.15
+_LOOKUP_WEIGHT = 0.70
+
+
+class ErpLookup(NamedTuple):
+    """A location, and whether Unknown came from an empty inventory grid."""
+
+    location: str
+    definitive_unknown: bool
+
+
+class _RunProgress:
+    """Map refresh, scrape, and per-SKU lookup onto one 0–1 bar."""
+
+    def __init__(
+        self,
+        callback: Optional[Callable[[float, Optional[tuple[float, float]], str], None]],
+    ) -> None:
+        self._callback = callback
+
+    def report(
+        self,
+        locked: float,
+        sheen: Optional[tuple[float, float]],
+        label: str,
+    ) -> None:
+        if self._callback is None:
+            return
+        self._callback(max(0.0, min(1.0, locked)), sheen, label)
+
+    def phase(
+        self,
+        locked: float,
+        sheen_end: Optional[float],
+        label: str,
+    ) -> None:
+        sheen = None
+        if sheen_end is not None and sheen_end > locked + 0.001:
+            sheen = (locked, sheen_end)
+        self.report(locked, sheen, label)
+
+    def refresh_sheen(self, label: str, done: float = 0.0) -> None:
+        span = _REFRESH_WEIGHT
+        locked = span * max(0.0, min(1.0, done))
+        self.report(locked, (locked, span), label)
+
+    def refresh_done(self, label: str = "Scraping orders") -> None:
+        self.report(_REFRESH_WEIGHT, (_REFRESH_WEIGHT, _REFRESH_WEIGHT + _SCRAPE_WEIGHT), label)
+
+    def scrape_done(self, label: str = "Checking locations") -> None:
+        locked = _REFRESH_WEIGHT + _SCRAPE_WEIGHT
+        self.report(locked, None, label)
+
+    def sku(self, index: int, count: int, label: str, *, finished: bool) -> None:
+        start = _REFRESH_WEIGHT + _SCRAPE_WEIGHT
+        if count <= 0:
+            self.report(1.0, None, label)
+            return
+        share = _LOOKUP_WEIGHT / count
+        locked = start + share * (index + (1 if finished else 0))
+        sheen = None if finished else (locked, min(1.0, locked + share))
+        self.report(locked, sheen, label)
 
 
 _DEFAULT_EBAY_QTY_SEL = "div.quantity strong"
@@ -565,11 +634,11 @@ async def lookup_erp_location(
     location_deprioritize: Optional[list[str]] = None,
     location_deprioritize_prefixes: Optional[list[str]] = None,
     location_lowest_priority: Optional[list[str]] = None,
-) -> str:
+) -> ErpLookup:
     """Type SKU into ERP, wait for grid rows, vote on the best Location.
 
-    Kit SKUs, unknown SKUs, and empty inventory grids return Unknown
-    instead of aborting the rest of the run.
+    An empty inventory grid is a definitive Unknown and may be cached.
+    A timeout or other failure is Unknown for this run only.
     """
     input_sel = _require_selector(selectors, "erp_sku_input")
     location_sel = _require_selector(selectors, "erp_location")
@@ -603,22 +672,33 @@ async def lookup_erp_location(
                     sku,
                     UNKNOWN_LOCATION,
                 )
-                return UNKNOWN_LOCATION
+                return ErpLookup(UNKNOWN_LOCATION, True)
         except Exception:
             pass
 
-        values = await collect_grid_column_texts(
-            page,
-            location_sel,
-            timeout_ms=timeout_ms,
+        column = page.locator(location_sel).first
+        try:
+            await column.wait_for(state="visible", timeout=timeout_ms)
+            column_seen = True
+        except Exception:
+            column_seen = False
+        values = (
+            await collect_grid_column_texts(
+                page,
+                location_sel,
+                timeout_ms=timeout_ms,
+            )
+            if column_seen
+            else []
         )
         if not values:
             logger.warning(
-                "ERP location timeout/empty for sku=%s; using %s",
+                "ERP location %s for sku=%s; using %s",
+                "empty" if column_seen else "timeout",
                 sku,
                 UNKNOWN_LOCATION,
             )
-            return UNKNOWN_LOCATION
+            return ErpLookup(UNKNOWN_LOCATION, column_seen)
 
         location = pick_best_location(
             values,
@@ -633,7 +713,7 @@ async def lookup_erp_location(
             location,
             len(values),
         )
-        return location
+        return ErpLookup(location, False)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -643,7 +723,7 @@ async def lookup_erp_location(
             exc,
             UNKNOWN_LOCATION,
         )
-        return UNKNOWN_LOCATION
+        return ErpLookup(UNKNOWN_LOCATION, False)
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -783,6 +863,111 @@ def erp_wait_pair(settings: dict[str, Any]) -> tuple[int, int, int]:
     return action, scaled_wait, overlay_ms
 
 
+def _promptable_skus(
+    originals: list[str],
+    queried: dict[str, str],
+    overrides: dict[str, Any],
+    definitive: set[str],
+    cache: SkuLocationCache,
+) -> set[str]:
+    """Unknown SKUs that may be asked about once today."""
+    promptable: set[str] = set()
+    for sku in originals:
+        lookup, _factor, _display = resolve_sku(sku, overrides)
+        if not is_unknown_location(queried.get(lookup, UNKNOWN_LOCATION)):
+            continue
+        if is_no_sister(sku, overrides) or sku in overrides:
+            continue
+        if lookup not in definitive:
+            continue
+        if not cache.prompt_due(sku):
+            continue
+        promptable.add(sku)
+    return promptable
+
+
+async def _shipstation_page(browser: Browser, settings: dict[str, Any]) -> Optional[Page]:
+    pattern = str(
+        settings.get(
+            "shipstation_url_pattern",
+            "shipstation.com/orders/awaiting-shipment",
+        )
+    )
+    return await find_page_by_url(
+        browser,
+        pattern,
+        label="ShipStation tab",
+    )
+
+
+async def _sync_and_maybe_note(
+    browser: Browser,
+    settings: dict[str, Any],
+    selectors: dict[str, str],
+    *,
+    sync: bool,
+    progress: _RunProgress,
+    ebay_span: float,
+) -> str:
+    from tp_deck.shipstation import sync_stores
+
+    try:
+        page = await _shipstation_page(browser, settings)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("ShipStation tab lookup failed: %s", exc)
+        return " — ShipStation skipped, store orders not read"
+    if page is None:
+        logger.warning("ShipStation tab is not open; store orders skipped")
+        return " — ShipStation tab not open, store orders skipped"
+    if not sync:
+        return ""
+
+    async def on_store(done: int, total: int, name: str) -> None:
+        span = max(0.0, _REFRESH_WEIGHT - ebay_span)
+        fraction = (done / total) if total else 1.0
+        locked = ebay_span + span * fraction
+        label = f"Syncing {name}" if name else "Syncing ShipStation"
+        progress.phase(locked, _REFRESH_WEIGHT, label)
+
+    try:
+        await sync_stores(page, selectors, on_store)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("ShipStation sync failed: %s", exc)
+        return " — ShipStation sync failed, store orders skipped"
+    return ""
+
+
+async def _scrape_shipstation_lines(
+    browser: Browser,
+    settings: dict[str, Any],
+    selectors: dict[str, str],
+    *,
+    need_qty: bool,
+) -> list[tuple[str, str, str, int]]:
+    from tp_deck.shipstation import scrape_store_orders
+
+    try:
+        page = await _shipstation_page(browser, settings)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("ShipStation tab lookup failed: %s", exc)
+        return []
+    if page is None:
+        return []
+    try:
+        return await scrape_store_orders(page, selectors, need_qty=need_qty)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("ShipStation store-order scrape failed: %s", exc)
+        return []
+
+
 async def lookup_missing_locations(
     settings: dict[str, Any],
     skus: list[str],
@@ -836,7 +1021,7 @@ async def lookup_missing_locations(
         )
         erp_page.set_default_timeout(action_ms)
         for sku in misses:
-            found[sku] = await lookup_erp_location(
+            hit = await lookup_erp_location(
                 erp_page,
                 sku,
                 selectors,
@@ -850,8 +1035,11 @@ async def lookup_missing_locations(
                 ),
                 location_lowest_priority=settings.get("location_lowest_priority"),
             )
-            if cache is not None:
-                cache.put(sku, found[sku])
+            found[sku] = hit.location
+            if cache is not None and hit.definitive_unknown:
+                cache.put(sku, hit.location, allow_unknown=True)
+            elif cache is not None:
+                cache.put(sku, hit.location)
             await asyncio.sleep(0)
         if cache is not None:
             cache.save()
@@ -865,6 +1053,13 @@ async def run_automation(
     *,
     job: str = "orders",
     copy_clipboard: bool = True,
+    refresh_ebay: bool = True,
+    honor_refresh_hold: bool = True,
+    sync_shipstation: bool = False,
+    scrape_shipstation: bool = False,
+    on_progress: Optional[
+        Callable[[float, Optional[tuple[float, float]], str], None]
+    ] = None,
 ) -> AutomationResult:
     """
     job=orders: clipboard Order - Buyer - SKU - Location
@@ -887,6 +1082,8 @@ async def run_automation(
     ebay_browser: Optional[Browser] = None
     erp_browser: Optional[Browser] = None
 
+    progress = _RunProgress(on_progress)
+    ship_note = ""
     try:
         playwright = await async_playwright().start()
         ebay_browser = await connect_over_cdp(playwright, ebay_port)
@@ -901,22 +1098,63 @@ async def run_automation(
                 f"No eBay tab matching {ebay_pattern!r}."
             )
 
-        if not _skip_ebay_refresh(settings):
+        do_refresh = refresh_ebay and not (
+            honor_refresh_hold and _skip_ebay_refresh(settings)
+        )
+        refresh_end = _REFRESH_WEIGHT
+        ebay_span = refresh_end / 2 if sync_shipstation else refresh_end
+        if do_refresh:
+            progress.phase(0.0, ebay_span, "Refreshing eBay")
             await _refresh_ebay_order_page(ebay_page, timeout_ms)
+            progress.phase(
+                ebay_span,
+                refresh_end if sync_shipstation else None,
+                "Syncing ShipStation" if sync_shipstation else "Scraping orders",
+            )
+        elif sync_shipstation:
+            progress.phase(0.0, refresh_end, "Syncing ShipStation")
+        else:
+            progress.phase(refresh_end, refresh_end + _SCRAPE_WEIGHT, "Scraping orders")
+
+        if sync_shipstation or scrape_shipstation:
+            ship_note = await _sync_and_maybe_note(
+                ebay_browser,
+                settings,
+                selectors,
+                sync=sync_shipstation,
+                progress=progress,
+                ebay_span=ebay_span if do_refresh else 0.0,
+            )
+
+        progress.phase(
+            _REFRESH_WEIGHT,
+            _REFRESH_WEIGHT + _SCRAPE_WEIGHT,
+            "Scraping orders",
+        )
         lines_in = await scrape_ebay_orders(
             ebay_page,
             selectors,
             timeout_ms=timeout_ms,
         )
+        if scrape_shipstation and not ship_note:
+            lines_in.extend(
+                await _scrape_shipstation_lines(
+                    ebay_browser,
+                    settings,
+                    selectors,
+                    need_qty=(str(job).lower() == "picklist"),
+                )
+            )
         await asyncio.sleep(0)
+        progress.scrape_done("Checking locations")
 
         cache_enabled = bool(settings.get("cache_enabled", True))
         cache = SkuLocationCache(ttl_seconds=cache_ttl_seconds(settings))
         overrides = load_overrides()
-        unique_ebay = list(dict.fromkeys(sku for _, _, sku, _ in lines_in))
+        unique_skus = list(dict.fromkeys(sku for _, _, sku, _ in lines_in))
         lookup_skus: list[str] = []
         seen_lookup: set[str] = set()
-        for sku in unique_ebay:
+        for sku in unique_skus:
             lookup, _factor, display = resolve_sku(sku, overrides)
             if lookup != sku:
                 logger.info("SKU override %s → %s (%s)", sku, lookup, display)
@@ -926,16 +1164,29 @@ async def run_automation(
 
         queried: dict[str, str] = {}
         misses: list[str] = []
+        definitive: set[str] = set()
         for sku in lookup_skus:
             cached = cache.get(sku) if cache_enabled else None
             if cached:
                 queried[sku] = cached
+                if is_unknown_location(cached):
+                    definitive.add(sku)
                 logger.info("SKU cache hit %s → %s", sku, cached)
             else:
                 misses.append(sku)
 
         if not cache_enabled:
             logger.info("SKU location cache disabled; looking up all SKUs")
+
+        sku_total = len(lookup_skus)
+        done_skus = sku_total - len(misses)
+        if done_skus:
+            progress.sku(
+                done_skus - 1,
+                sku_total,
+                "Checking locations",
+                finished=True,
+            )
 
         if misses:
             if mode == "dual":
@@ -950,8 +1201,10 @@ async def run_automation(
             erp_page.set_default_timeout(action_ms)
             await asyncio.sleep(0)
 
-            for sku in misses:
-                queried[sku] = await lookup_erp_location(
+            for offset, sku in enumerate(misses):
+                index = done_skus + offset
+                progress.sku(index, sku_total, f"Looking up {sku}", finished=False)
+                hit = await lookup_erp_location(
                     erp_page,
                     sku,
                     selectors,
@@ -967,8 +1220,14 @@ async def run_automation(
                         "location_lowest_priority"
                     ),
                 )
-                if cache_enabled:
-                    cache.put(sku, queried[sku])
+                queried[sku] = hit.location
+                if hit.definitive_unknown:
+                    definitive.add(sku)
+                    if cache_enabled:
+                        cache.put(sku, hit.location, allow_unknown=True)
+                elif cache_enabled:
+                    cache.put(sku, hit.location)
+                progress.sku(index, sku_total, f"Looking up {sku}", finished=True)
                 await asyncio.sleep(0)
             if cache_enabled:
                 cache.save()
@@ -976,8 +1235,16 @@ async def run_automation(
             logger.info("All SKUs served from cache; skipping ERP lookup")
             if cache_enabled:
                 cache.save()
+            progress.report(1.0, None, "Checking locations")
 
         hits = len(lookup_skus) - len(misses)
+        promptable = _promptable_skus(
+            unique_skus,
+            queried,
+            overrides,
+            definitive,
+            cache,
+        )
         result = render_job(
             settings,
             job=job,
@@ -989,7 +1256,12 @@ async def run_automation(
             copy_clipboard=copy_clipboard,
             allow_prompt=copy_clipboard,
             cache_enabled=cache_enabled,
+            promptable=promptable,
         )
+        if ship_note and result.status:
+            from dataclasses import replace
+
+            result = replace(result, status=f"{result.status}{ship_note}")
         if (
             copy_clipboard
             and not result.defer_copy

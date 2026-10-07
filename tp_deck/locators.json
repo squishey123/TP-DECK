@@ -11,5 +11,10 @@
   "sales_order_detail_pattern": "SalesOrder.aspx?orderId=",
   "sales_order_filter": "#ag-grid .ag-header-row-floating-filter > div:nth-child(1) input",
   "sales_order_rows": "#ag-grid .ag-center-cols-container .ag-row",
-  "service_order_label": "#div_PageSalesOrder .wrap-sales-list > ul:nth-child(2) > li:nth-child(2)"
+  "service_order_label": "#div_PageSalesOrder .wrap-sales-list > ul:nth-child(2) > li:nth-child(2)",
+  "shipstation_store_status": "[title=\"Store Status\"]",
+  "shipstation_update_all": "[class*=\"update-all-btn\"]",
+  "shipstation_reload": "[class*=\"reload-button-container\"]",
+  "shipstation_footer": "[class*=\"count-container\"]",
+  "shipstation_items": "[class*=\"shipment-items-section-content\"]"
 }

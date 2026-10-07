@@ -7,6 +7,7 @@ import atexit
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -26,8 +27,10 @@ from tp_deck.sales_order import close_detail_tab
 from tp_deck.serial_dialog import SerialDialog
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
+from tp_deck.duration import cache_ttl_seconds
+from tp_deck.sku_cache import SkuLocationCache
 from tp_deck.sku_override_dialog import UnknownSkuDialog
-from tp_deck.sku_overrides import load_overrides, merge_overrides
+from tp_deck.sku_overrides import load_overrides, mark_no_sisters, merge_overrides
 
 LOG_PATH = Path(__file__).resolve().parent / "tpdeck.log"
 DETAIL_CLOSE_SECONDS = 30
@@ -65,6 +68,14 @@ def _configure_logging(*, console: bool) -> None:
     )
 
 
+def _shipstation_every(settings: dict) -> int:
+    try:
+        every = int(settings.get("shipstation_sync_every_cycles", 3))
+    except (TypeError, ValueError):
+        every = 3
+    return max(1, min(99, every))
+
+
 def _autocycle_minutes(settings: dict) -> int:
     try:
         minutes = int(settings.get("ebay_autocycle_minutes", 10))
@@ -90,6 +101,7 @@ class AutomationController:
         self._manual_pending = False
         self._wake: Optional[asyncio.Event] = None
         self._job = "orders"
+        self._cycle_passes = 0
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -152,6 +164,7 @@ class AutomationController:
     def toggle_autocycle(self) -> None:
         if self._autocycle:
             self._autocycle = False
+            self._cycle_passes = 0
             self._cycle_gen += 1
             self._dashboard.set_autocycle(False)
             if (
@@ -168,6 +181,7 @@ class AutomationController:
 
         self._cycle_gen += 1
         generation = self._cycle_gen
+        self._cycle_passes = 0
         self._autocycle = True
         self._dashboard.set_autocycle(True)
         self._cycle_task = asyncio.create_task(
@@ -193,6 +207,7 @@ class AutomationController:
             return
         logger.info("Emergency stop — cancelling task")
         self._autocycle = False
+        self._cycle_passes = 0
         self._cycle_gen += 1
         self._dashboard.set_autocycle(False)
         self._wake_wait()
@@ -222,6 +237,17 @@ class AutomationController:
 
     def _on_serial_progress(self, done: int, total: int) -> None:
         self._dashboard.set_status(f"Serials {done}/{total}")
+        self._dashboard.set_serial_progress(done, total)
+
+    def _on_run_progress(
+        self,
+        locked: float,
+        sheen: Optional[tuple[float, float]],
+        label: str,
+    ) -> None:
+        if label:
+            self._dashboard.set_status(label)
+        self._dashboard.set_run_progress(locked, sheen)
 
     async def _run_manual(
         self,
@@ -239,10 +265,16 @@ class AutomationController:
                         on_progress=self._on_serial_progress,
                         order_number=order_number,
                     )
+                cycling = self._autocycle
                 return await run_automation(
                     settings,
                     job=job,
                     copy_clipboard=True,
+                    refresh_ebay=not cycling,
+                    honor_refresh_hold=True,
+                    sync_shipstation=not cycling,
+                    scrape_shipstation=True,
+                    on_progress=self._on_run_progress,
                 )
         finally:
             self._manual_pending = False
@@ -276,6 +308,10 @@ class AutomationController:
                 )
                 if rendered.clipboard_text and rendered.clipboard_text.strip():
                     copy_to_clipboard(rendered.clipboard_text)
+                    rendered = replace(
+                        rendered,
+                        status=f"{rendered.status} — clipboard updated",
+                    )
                 return rendered
         finally:
             self._manual_pending = False
@@ -299,11 +335,14 @@ class AutomationController:
             return
 
         result = task.result()
+        self._dashboard.set_processing(False)
         if result is not None and result.pending_unknowns:
+            if result.clipboard_text and result.clipboard_text.strip():
+                copy_to_clipboard(result.clipboard_text)
+            self._publish(result)
             self._offer_overrides(result)
             return
 
-        self._dashboard.set_processing(False)
         self._publish(result)
 
     def _offer_overrides(self, result: AutomationResult) -> None:
@@ -313,31 +352,41 @@ class AutomationController:
         noun = "SKU" if count == 1 else "SKUs"
         self._dashboard.set_status(f"{count} unknown {noun} — enter alternatives")
         self.hold_autocycle(True)
-        mappings: list[tuple[str, str, int]] = []
         try:
             dialog = UnknownSkuDialog(
                 list(result.pending_unknowns),
                 parent=self._dashboard,
             )
-            if dialog.exec():
-                mappings = dialog.mappings()
-            if not mappings:
-                self._present_deferred(result)
+            accepted = bool(dialog.exec())
+            self._mark_unknown_prompts(result.pending_unknowns)
+            if not accepted:
+                self._dashboard.set_status(result.status)
                 return
             try:
-                merge_overrides(mappings)
+                if dialog.no_sisters():
+                    mark_no_sisters(dialog.no_sisters())
+                mappings = dialog.mappings()
+                if mappings:
+                    merge_overrides(mappings)
             except (ValueError, OSError) as exc:
                 message = str(exc).strip() or exc.__class__.__name__
                 logger.exception("Could not save SKU overrides")
-                self._present_deferred(result)
                 self._dashboard.set_status(f"Error — {message}")
+                return
+            if not mappings:
+                self._dashboard.set_status(result.status)
                 return
             sisters = [sister for _original, sister, _qty in mappings]
             if not self.start_sister_lookup(result, sisters):
-                self._present_deferred(result)
                 self._dashboard.set_status("Error — busy, try again")
         finally:
             self.hold_autocycle(False)
+
+    def _mark_unknown_prompts(self, skus: tuple[str, ...] | list[str]) -> None:
+        cache = SkuLocationCache(ttl_seconds=cache_ttl_seconds(load_settings()))
+        for sku in skus:
+            cache.mark_prompted(str(sku))
+        cache.save()
 
     def _present_deferred(self, result: AutomationResult) -> None:
         """Copy and show a finished run whose clipboard waited on the prompt."""
@@ -386,6 +435,7 @@ class AutomationController:
             logger.exception("Could not close the sales order tab")
 
     async def _interruptible_sleep(self, seconds: float) -> None:
+        self._dashboard.start_cycle_countdown(seconds)
         self._wake = asyncio.Event()
         try:
             await asyncio.wait_for(self._wake.wait(), timeout=max(0.0, seconds))
@@ -393,6 +443,7 @@ class AutomationController:
             pass
         finally:
             self._wake = None
+            self._dashboard.clear_cycle_countdown()
 
     async def _autocycle_loop(self, generation: int) -> None:
         logger = logging.getLogger("tpdeck")
@@ -419,10 +470,21 @@ class AutomationController:
                     try:
                         settings = load_settings()
                         minutes = _autocycle_minutes(settings)
+                        self._cycle_passes += 1
+                        every = _shipstation_every(settings)
+                        sync_shipstation = (
+                            self._cycle_passes == 1
+                            or (self._cycle_passes - 1) % every == 0
+                        )
                         result = await run_automation(
                             settings,
                             job="orders",
                             copy_clipboard=False,
+                            refresh_ebay=True,
+                            honor_refresh_hold=False,
+                            sync_shipstation=sync_shipstation,
+                            scrape_shipstation=sync_shipstation,
+                            on_progress=self._on_run_progress,
                         )
                         status_text = result.status
                     except asyncio.CancelledError:

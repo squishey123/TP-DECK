@@ -155,43 +155,231 @@ async def _open_list_page(
     return page
 
 
+_GRID_ROWS_JS = """
+() => {
+    const grid = document.querySelector('#ag-grid');
+    if (!grid) return [];
+    const onScreen = (el) => {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        const view = el.closest('.ag-pinned-left-cols-viewport')
+            || el.closest('.ag-center-cols-viewport')
+            || el.closest('.ag-body-viewport');
+        if (!view) return true;
+        const viewRect = view.getBoundingClientRect();
+        return rect.bottom > viewRect.top + 1
+            && rect.top < viewRect.bottom - 1
+            && rect.right > viewRect.left
+            && rect.left < viewRect.right;
+    };
+    const groups = new Map();
+    const parts = grid.querySelectorAll(
+        '.ag-pinned-left-cols-container .ag-row, .ag-center-cols-container .ag-row'
+    );
+    for (const el of parts) {
+        const rowId = el.getAttribute('row-id') || '';
+        const rowIndex = el.getAttribute('row-index') || '';
+        const key = rowId || ('index:' + rowIndex);
+        let group = groups.get(key);
+        if (!group) {
+            group = { rowId, visible: false, cells: [] };
+            groups.set(key, group);
+        }
+        if (onScreen(el)) group.visible = true;
+        for (const cell of el.querySelectorAll('.ag-cell')) {
+            const text = (
+                cell.innerText || cell.getAttribute('title') || ''
+            ).replace(/\\s+/g, ' ').trim();
+            if (text) group.cells.push(text);
+        }
+        const rowText = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+        if (rowText) group.cells.push(rowText);
+    }
+    return Array.from(groups.values());
+}
+"""
+
+
+def _css_attr(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _matched_rows(
+    snapshot: list[dict[str, Any]],
+    original: str,
+    *,
+    visible_only: bool,
+) -> list[tuple[str, str, list[str]]]:
+    """Rows whose pinned or center cells contain the order number."""
+    found: list[tuple[str, str, list[str]]] = []
+    for item in snapshot or []:
+        if visible_only and not item.get("visible"):
+            continue
+        cells = [str(cell or "").strip() for cell in (item.get("cells") or [])]
+        cells = [cell for cell in cells if cell]
+        matched = next(
+            (cell for cell in cells if order_labels_match(original, cell)),
+            "",
+        )
+        if not matched:
+            continue
+        found.append((str(item.get("rowId") or "").strip(), matched, cells))
+    return found
+
+
+def _row_target(page: Page, row_id: str, row_selector: str) -> Any:
+    if row_id:
+        return page.locator(
+            f'#ag-grid .ag-row[row-id="{_css_attr(row_id)}"]'
+        ).first
+    return page.locator(row_selector).first
+
+
+async def _scroll_row_into_view(page: Page, row_id: str) -> None:
+    if not row_id:
+        return
+    try:
+        await page.evaluate(
+            """(rowId) => {
+                const row = document.querySelector(
+                    '#ag-grid .ag-row[row-id="' + CSS.escape(rowId) + '"]'
+                );
+                if (row) {
+                    row.scrollIntoView({ block: 'center', inline: 'nearest' });
+                }
+            }""",
+            row_id,
+        )
+    except Exception as exc:
+        logger.info("Could not scroll sales order row %s: %s", row_id, exc)
+
+
+async def _read_order_grid(page: Page) -> list[dict[str, Any]]:
+    try:
+        snapshot = await page.evaluate(_GRID_ROWS_JS)
+    except Exception as exc:
+        logger.info("Sales order grid snapshot failed: %s", exc)
+        return []
+    return list(snapshot or [])
+
+
+def _visible_cells(snapshot: list[dict[str, Any]]) -> list[list[str]]:
+    shown: list[list[str]] = []
+    for item in snapshot or []:
+        if not item.get("visible"):
+            continue
+        cells = [
+            str(cell or "").strip()
+            for cell in (item.get("cells") or [])
+            if str(cell or "").strip()
+        ]
+        if cells:
+            shown.append(cells)
+    return shown
+
+
 async def _wait_for_filter_rows(
     page: Page,
     row_selector: str,
     original: str,
     timeout_ms: int,
-    previous_text: str,
-    previous_count: int,
 ) -> tuple[int, str, Optional[Any]]:
-    rows = page.locator(row_selector)
+    """Wait until a pinned or center row shows the order number.
+
+    The order number lives in the pinned column, which is a separate row
+    element from the center cells. One matching row is enough, even when
+    other rows are still in the grid.
+    """
+    loading = page.locator("#ag-grid .ag-overlay-loading-wrapper")
     deadline = time.monotonic() + (max(1, timeout_ms) / 1000.0)
-    seen: Optional[int] = None
-    stable = 0
-    count = 0
+    last_snapshot: list[dict[str, Any]] = []
+    announced = False
+    scrolled: set[str] = set()
     while time.monotonic() < deadline:
-        count = await rows.count()
-        if count == seen:
-            stable += 1
-        else:
-            seen = count
-            stable = 0
-        unchanged = count == previous_count and count != 1
-        if stable >= 2 and count != 1 and not unchanged:
-            return count, "", None
-        if stable >= 2 and count == 1:
-            text = await rows.first.locator(".ag-cell").first.inner_text()
-            cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
-            stale = (
-                bool(previous_text)
-                and cleaned == previous_text
-                and not order_labels_match(original, cleaned)
+        try:
+            if await loading.count() > 0 and await loading.is_visible():
+                await asyncio.sleep(0.25)
+                continue
+        except Exception:
+            pass
+        last_snapshot = await _read_order_grid(page)
+        visible_matches = _matched_rows(
+            last_snapshot, original, visible_only=True
+        )
+        if len(visible_matches) == 1:
+            row_id, matched, _cells = visible_matches[0]
+            logger.info("Sales order row ready for %s: %s", original, matched)
+            return 1, matched, _row_target(page, row_id, row_selector)
+        if len(visible_matches) > 1:
+            return len(visible_matches), "", None
+        hidden = _matched_rows(last_snapshot, original, visible_only=False)
+        if len(hidden) == 1:
+            row_id = hidden[0][0]
+            if row_id and row_id not in scrolled:
+                scrolled.add(row_id)
+                await _scroll_row_into_view(page, row_id)
+        if not announced and _visible_cells(last_snapshot):
+            logger.info(
+                "Sales order grid showing %s row(s); waiting for %s",
+                len(_visible_cells(last_snapshot)),
+                original,
             )
-            if not stale:
-                if order_labels_match(original, cleaned):
-                    return count, cleaned, rows.first
-                return count, cleaned, None
+            announced = True
         await asyncio.sleep(0.25)
-    return count, "", None
+
+    visible_matches = _matched_rows(last_snapshot, original, visible_only=True)
+    if len(visible_matches) == 1:
+        row_id, matched, _cells = visible_matches[0]
+        logger.info("Sales order row ready for %s: %s", original, matched)
+        return 1, matched, _row_target(page, row_id, row_selector)
+    matches = _matched_rows(last_snapshot, original, visible_only=False)
+    if len(matches) == 1:
+        row_id, matched, _cells = matches[0]
+        await _scroll_row_into_view(page, row_id)
+        logger.info("Sales order row ready for %s: %s", original, matched)
+        return 1, matched, _row_target(page, row_id, row_selector)
+    if len(matches) > 1:
+        return len(matches), "", None
+    visible = [item for item in last_snapshot if item.get("visible")]
+    if len(visible) == 1:
+        text = " ".join(
+            str(cell or "").strip()
+            for cell in (visible[0].get("cells") or [])
+            if str(cell or "").strip()
+        )
+        return 1, text, None
+    logger.info(
+        "No sales order row showed %s (%s visible row(s)): %s",
+        original,
+        len(_visible_cells(last_snapshot)),
+        _visible_cells(last_snapshot)[:8],
+    )
+    return 0, "", None
+
+
+async def _click_order_row(row: Any, order_number: str) -> None:
+    """Click the cell that shows the order number, including a pinned column."""
+    row_id = str(await row.get_attribute("row-id") or "").strip()
+    if row_id:
+        cells = row.page.locator(
+            f'#ag-grid .ag-row[row-id="{_css_attr(row_id)}"] .ag-cell'
+        )
+    else:
+        cells = row.locator(".ag-cell")
+    count = await cells.count()
+    for index in range(count):
+        cell = cells.nth(index)
+        try:
+            text = await cell.inner_text()
+        except Exception:
+            continue
+        if order_labels_match(order_number, text):
+            await cell.click()
+            return
+    await row.locator(".ag-cell").first.click()
 
 
 async def _filter_order_list(
@@ -204,15 +392,6 @@ async def _filter_order_list(
     submit_key: str,
 ) -> Any:
     field = await _input_field(page, locators["sales_order_filter"], timeout_ms)
-    rows = page.locator(locators["sales_order_rows"])
-    previous_count = await rows.count()
-    previous_text = ""
-    if previous_count == 1:
-        previous_text = re.sub(
-            r"\s+",
-            " ",
-            str(await rows.first.locator(".ag-cell").first.inner_text() or ""),
-        ).strip()
     query = order_number.strip()
     await field.click()
     await field.fill("")
@@ -231,8 +410,6 @@ async def _filter_order_list(
         locators["sales_order_rows"],
         order_number,
         timeout_ms,
-        previous_text,
-        previous_count,
     )
     if row is not None:
         return row
@@ -289,7 +466,7 @@ async def _open_order_from_list(
         submit_key=submit_key,
     )
     known_urls = {(page.url or "") for page in _iter_pages(browser)}
-    await row.locator(".ag-cell").first.click()
+    await _click_order_row(row, order_number)
     return await _wait_for_detail_page(
         browser,
         list_page,

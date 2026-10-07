@@ -17,6 +17,7 @@ OVERRIDES_PATH = Path(__file__).resolve().parent / "sku_overrides.json"
 class SkuOverride:
     sister: str
     qty: int
+    none: bool = False
 
 
 def validate_override(original: str, sister: str, qty: int) -> Optional[str]:
@@ -45,7 +46,7 @@ def resolve_sku(
     """Return (lookup SKU, qty factor, display SKU)."""
     key = (sku or "").strip()
     found = overrides.get(key)
-    if found is None:
+    if found is None or found.none:
         return key, 1, key
     return found.sister, found.qty, f"{key} / {found.sister}"
 
@@ -67,6 +68,9 @@ def load_overrides() -> dict[str, SkuOverride]:
         original = str(raw_sku or "").strip()
         if not original or not isinstance(entry, dict):
             continue
+        if bool(entry.get("none")):
+            loaded[original] = SkuOverride(sister="", qty=1, none=True)
+            continue
         sister = str(entry.get("sister") or "").strip()
         try:
             qty = int(entry.get("qty") or 1)
@@ -78,11 +82,18 @@ def load_overrides() -> dict[str, SkuOverride]:
     return loaded
 
 
+def is_no_sister(sku: str, overrides: dict[str, SkuOverride]) -> bool:
+    found = overrides.get((sku or "").strip())
+    return found is not None and found.none
+
+
 def save_overrides(overrides: dict[str, SkuOverride]) -> None:
-    payload = {
-        sku: {"sister": item.sister, "qty": int(item.qty)}
-        for sku, item in sorted(overrides.items())
-    }
+    payload = {}
+    for sku, item in sorted(overrides.items()):
+        if item.none:
+            payload[sku] = {"none": True}
+        else:
+            payload[sku] = {"sister": item.sister, "qty": int(item.qty)}
     try:
         with OVERRIDES_PATH.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
@@ -106,14 +117,33 @@ def merge_overrides(entries: list[tuple[str, str, int]]) -> None:
     save_overrides(current)
 
 
-def replace_overrides(entries: list[tuple[str, str, int]]) -> None:
+def mark_no_sisters(skus: list[str]) -> None:
+    """Remember that these SKUs have no alternative and should not be asked again."""
+    current = load_overrides()
+    for raw in skus:
+        original = (raw or "").strip()
+        if not original:
+            continue
+        current[original] = SkuOverride(sister="", qty=1, none=True)
+    save_overrides(current)
+
+
+def replace_overrides(entries: list[tuple[str, str, int, bool]]) -> None:
     """Replace the whole list with the editor contents."""
     cleaned: dict[str, SkuOverride] = {}
     seen: set[str] = set()
-    for original, sister, qty in entries:
+    for original, sister, qty, none in entries:
         original = (original or "").strip()
         sister = (sister or "").strip()
-        if not original and not sister:
+        if not original and not sister and not none:
+            continue
+        if none:
+            if not original:
+                raise ValueError("Original SKU is empty")
+            if original in seen:
+                raise ValueError(f"{original} is listed more than once")
+            seen.add(original)
+            cleaned[original] = SkuOverride(sister="", qty=1, none=True)
             continue
         error = validate_override(original, sister, qty)
         if error:

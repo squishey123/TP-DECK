@@ -39,6 +39,11 @@ DEFAULTS: dict[str, str] = {
     "service_order_label": (
         "#div_PageSalesOrder .wrap-sales-list > ul:nth-child(2) > li:nth-child(2)"
     ),
+    "shipstation_store_status": "[title=\"Store Status\"]",
+    "shipstation_update_all": "[class*=\"update-all-btn\"]",
+    "shipstation_reload": "[class*=\"reload-button-container\"]",
+    "shipstation_footer": "[class*=\"count-container\"]",
+    "shipstation_items": "[class*=\"shipment-items-section-content\"]",
 }
 
 _MOVED_SETTING_KEYS = ("selectors", "sales_order_url_pattern")

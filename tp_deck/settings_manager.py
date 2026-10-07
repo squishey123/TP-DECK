@@ -34,6 +34,8 @@ DEFAULTS: dict[str, Any] = {
     "ebay_refresh_hold_minutes": 5,
     "show_results_popup": False,
     "ebay_autocycle_minutes": 10,
+    "shipstation_url_pattern": "shipstation.com/orders/awaiting-shipment",
+    "shipstation_sync_every_cycles": 3,
     "serial_timeout_ms": 10000,
     "serial_clear_confirm_ms": 500,
     "pick_list_exclude_locations": ["HQ", "unavailable", "LOST"],

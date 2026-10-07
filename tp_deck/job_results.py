@@ -11,7 +11,7 @@ from tp_deck.pick_list import (
     is_excluded_pick_location,
     ordered_pick_rows,
 )
-from tp_deck.sku_overrides import SkuOverride, resolve_sku
+from tp_deck.sku_overrides import SkuOverride, is_no_sister, resolve_sku
 
 logger = logging.getLogger("tpdeck")
 
@@ -56,6 +56,7 @@ def render_job(
     copy_clipboard: bool,
     allow_prompt: bool,
     cache_enabled: bool,
+    promptable: Optional[set[str]] = None,
 ) -> AutomationResult:
     """Turn scraped lines and looked-up locations into clipboard text and table rows."""
     job_name = str(job or "orders").lower()
@@ -71,9 +72,11 @@ def render_job(
     for sku in ebay_skus:
         if not is_unknown_location(location_of(sku)):
             continue
+        if is_no_sister(sku, overrides):
+            continue
         if sku in overrides:
             alt_misses += 1
-        elif allow_prompt:
+        elif allow_prompt and (promptable is None or sku in promptable):
             pending.append(sku)
 
     unknowns = sum(1 for sku in ebay_skus if is_unknown_location(location_of(sku)))

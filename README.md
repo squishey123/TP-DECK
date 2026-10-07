@@ -64,7 +64,7 @@ From the repo root in PowerShell:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-Output: `dist\TP-DECK-0.2.6-windows-x64.zip`
+Output: `dist\TP-DECK-0.2.7-windows-x64.zip`
 
 Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 
@@ -72,12 +72,12 @@ Coworkers unzip it and double-click `TP-DECK.bat`. No Python install required.
 
 Pushing a version tag runs `.github/workflows/release.yml` on Windows: it builds the zip and creates the GitHub Release with the asset attached.
 
-1. Bump `tp_deck/__init__.py` (e.g. `0.2.6`), commit, and push `main`.
+1. Bump `tp_deck/__init__.py` (e.g. `0.2.7`), commit, and push `main`.
 2. Tag that commit and push the tag (tag must match `v` + `__version__`):
 
 ```powershell
-git tag -a v0.2.6 -m "TP DECK 0.2.6"
-git push origin v0.2.6
+git tag -a v0.2.7 -m "TP DECK 0.2.7"
+git push origin v0.2.7
 ```
 
 3. Watch **Actions → Release**. When it finishes, the zip is on the **Releases** page.
