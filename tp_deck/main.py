@@ -7,7 +7,9 @@ import atexit
 import logging
 import os
 import sys
+import time
 from dataclasses import replace
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +43,8 @@ from tp_deck.sku_override_dialog import UnknownSkuDialog
 from tp_deck.sku_overrides import load_overrides, mark_no_sisters, merge_overrides
 
 LOG_PATH = Path(__file__).resolve().parent / "tpdeck.log"
+LOG_MAX_BYTES = 1_000_000
+LOG_BACKUP_COUNT = 5
 DETAIL_CLOSE_SECONDS = 30
 
 
@@ -62,8 +66,18 @@ def _detach_windows_console() -> None:
 
 
 def _configure_logging(*, console: bool) -> None:
+    """Keep tpdeck.log from growing without bound.
+
+    The active file rolls at 1 MB. Five older files are kept
+    (tpdeck.log.1 through tpdeck.log.5) and then deleted.
+    """
     handlers: list[logging.Handler] = [
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        RotatingFileHandler(
+            LOG_PATH,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        ),
     ]
     if console:
         handlers.append(logging.StreamHandler(sys.stdout))
@@ -719,9 +733,12 @@ class AutomationController:
                         minutes = _autocycle_minutes(settings)
                         self._cycle_passes += 1
                         every = _shipstation_every(settings)
-                        sync_shipstation = (
-                            self._cycle_passes == 1
-                            or (self._cycle_passes - 1) % every == 0
+                        sync_shipstation = (self._cycle_passes - 1) % every == 0
+                        logger.info(
+                            "ShipStation sync %s on auto-cycle pass %s (every %s)",
+                            "due" if sync_shipstation else "skipped",
+                            self._cycle_passes,
+                            every,
                         )
                         result = await run_automation(
                             settings,
@@ -768,6 +785,12 @@ class AutomationController:
                 self._dashboard.set_autocycle(False)
             if self._cycle_gen == generation or not self._autocycle:
                 self._dashboard.set_status("Stopped")
+        except Exception:
+            logger.exception("Auto-cycle stopped unexpectedly")
+            self._cycle_busy = False
+            self._dashboard.set_processing(False)
+            if self._cycle_gen == generation:
+                self._dashboard.set_status("Error — auto-cycle stopped")
         finally:
             if self._cycle_gen == generation:
                 self._autocycle = False
@@ -870,7 +893,12 @@ def main() -> int:
 
     _configure_logging(console=keep_console)
     logger = logging.getLogger("tpdeck")
-    logger.info("TP DECK starting (%s)", __version__)
+    logger.info(
+        "TP DECK starting (%s). Log rolls at %s MB, keeping %s archives.",
+        __version__,
+        LOG_MAX_BYTES // 1_000_000,
+        LOG_BACKUP_COUNT,
+    )
 
     app = QApplication(sys.argv)
     app.setApplicationName("TP DECK")

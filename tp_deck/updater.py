@@ -46,7 +46,7 @@ if not errorlevel 1 (
   timeout /t 1 /nobreak >nul
   goto wait
 )
-robocopy "%SRC%" "%DEST%" /E /NFL /NDL /NJH /NJS /XD browser /XF settings.json sku_overrides.json sku_location_cache.json tpdeck.log
+robocopy "%SRC%" "%DEST%" /E /NFL /NDL /NJH /NJS /XD browser /XF settings.json sku_overrides.json sku_location_cache.json tpdeck.log tpdeck.log.1 tpdeck.log.2 tpdeck.log.3 tpdeck.log.4 tpdeck.log.5
 >> "%DEST%\\tp_deck\\tpdeck.log" echo Update copy finished with robocopy code %ERRORLEVEL%
 powershell -NoProfile -Command "Get-ChildItem -LiteralPath $env:DEST -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\\\browser\\\\' } | Unblock-File"
 if exist "%DEST%\\TP-DECK.bat" start "" "%DEST%\\TP-DECK.bat"

@@ -28,10 +28,64 @@ _SYNC_CAP_SECONDS = 180
 StoreProgress = Callable[[int, int, str], Awaitable[None]]
 
 
+_ITEM_COUNT = re.compile(r"^\(\s*\d+\s+items?\s*\)$", re.IGNORECASE)
+_COMBINED = re.compile(r"^\(?\s*multiple\s*\)?$", re.IGNORECASE)
+
+
+def _label(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\u00a0", " ")).strip()
+
+
+def is_item_count_label(text: str) -> bool:
+    """True for grid text like '(2 Items)', which is not a SKU."""
+    return _ITEM_COUNT.match(_label(text)) is not None
+
+
+def is_combined_order(order_number: str) -> bool:
+    """True for a combined-shipment summary row, not an order number."""
+    return _COMBINED.match(_label(order_number)) is not None
+
+
+def is_usable_sku(sku: str) -> bool:
+    """False for blanks and ShipStation placeholders such as '(2 Items)'."""
+    text = _label(sku)
+    if not text or is_item_count_label(text):
+        return False
+    if text.casefold() in {"(multiple)", "multiple", "item sku"}:
+        return False
+    return True
+
+
+def classify_store_row(order_number: str, sku: str) -> str:
+    """combined, multi, store, or skip.
+
+    combined: a '(Multiple)' shipment summary, often with SKU '(2 Items)'.
+    multi: a real store order whose SKU cell is an item count, not a SKU.
+    store: a store order with a real SKU.
+    skip: an eBay order or any other row the eBay scrape already covers.
+    """
+    if is_combined_order(order_number) or (
+        is_item_count_label(sku) and not is_store_order(order_number)
+    ):
+        return "combined"
+    if not is_store_order(order_number):
+        return "skip"
+    if not is_usable_sku(sku):
+        return "multi"
+    return "store"
+
+
 def is_store_order(order_number: str) -> bool:
-    """Store orders are order numbers with no hyphen."""
-    text = (order_number or "").strip()
-    return bool(text) and "-" not in text
+    """Store orders are order numbers with no hyphen.
+
+    Combined-shipment rows are labeled '(Multiple)' and are not store orders.
+    """
+    text = _label(order_number)
+    if not text or "-" in text or text.startswith("("):
+        return False
+    if is_combined_order(text) or is_item_count_label(text):
+        return False
+    return True
 
 
 def parse_updated(text: str) -> Optional[datetime]:
@@ -379,7 +433,40 @@ async def _collect_grid(page: Page, footer_selector: str) -> list[dict[str, str]
     return list(collected.values())
 
 
+async def _group_is_open(page: Page, row_id: str) -> bool:
+    """True when a combined row is already expanded.
+
+    ShipStation marks that grid row with a visible- or expanded- class.
+    Clicking the expander again would collapse it.
+    """
+    try:
+        opened = await page.evaluate(
+            """(rowId) => {
+                const cell = document.querySelector(
+                    '[data-row-id="' + CSS.escape(rowId) + '"]'
+                );
+                let node = cell;
+                while (node) {
+                    const cls = String(node.className || '');
+                    if (cls.includes('expandable')) {
+                        return cls.includes('visible-') || cls.includes('expanded-');
+                    }
+                    node = node.parentElement;
+                }
+                return false;
+            }""",
+            row_id,
+        )
+    except Exception as exc:
+        logger.info("ShipStation expand state unreadable for %s: %s", row_id, exc)
+        return False
+    return bool(opened)
+
+
 async def _expand_row(page: Page, row_id: str) -> bool:
+    """Open a combined row. The expander is a button-link, so match it by class."""
+    if await _group_is_open(page, row_id):
+        return False
     try:
         clicked = await page.evaluate(
             """(rowId) => {
@@ -392,11 +479,10 @@ async def _expand_row(page: Page, row_id: str) -> bool:
                             button.getAttribute('aria-label') || ''
                         ).toLowerCase();
                         const cls = String(button.className || '');
-                        const isOrder = button.classList.contains('button-link');
-                        if (isOrder) continue;
                         if (
-                            label.includes('expand')
+                            cls.includes('expander')
                             || cls.includes('expand')
+                            || label.includes('expand')
                             || cls.includes('chevron')
                         ) {
                             button.click();
@@ -414,11 +500,23 @@ async def _expand_row(page: Page, row_id: str) -> bool:
     return bool(clicked)
 
 
+async def _has_order_button(page: Page, row_id: str) -> bool:
+    button = page.locator(
+        f'[data-column="order-number"][data-row-id="{row_id}"] button'
+    )
+    try:
+        return await button.count() > 0
+    except Exception:
+        return False
+
+
 async def _open_items(page: Page, row_id: str, items_selector: str) -> str:
+    if not await _has_order_button(page, row_id):
+        raise RuntimeError(f"store order {row_id} has no order button")
     button = page.locator(
         f'[data-column="order-number"][data-row-id="{row_id}"] button'
     ).first
-    await button.click()
+    await button.click(timeout=5000)
     section = page.locator(items_selector).first
     await section.wait_for(state="visible", timeout=15000)
     try:
@@ -446,85 +544,166 @@ async def _close_items(page: Page, items_selector: str) -> None:
         logger.info("ShipStation order list did not return after the drawer")
 
 
+async def _reveal_children(
+    page: Page,
+    row_id: str,
+    seen: set[str],
+) -> list[dict[str, str]]:
+    """Expand a closed group and return rows that were not already collected."""
+    if await _group_is_open(page, row_id):
+        return []
+    expanded = await _expand_row(page, row_id)
+    if not expanded:
+        return []
+    await asyncio.sleep(0.3)
+    found: list[dict[str, str]] = []
+    for child in await _grid_rows(page):
+        child_id = child["id"]
+        if not child_id or child_id in seen:
+            continue
+        seen.add(child_id)
+        found.append(child)
+    return found
+
+
+def _note(on_status: Optional[Callable[[str], None]], label: str) -> None:
+    if on_status is not None:
+        on_status(label)
+
+
+async def _lines_from_drawer(
+    page: Page,
+    row_id: str,
+    order_id: str,
+    buyer: str,
+    sku: str,
+    items_selector: str,
+) -> Optional[list[tuple[str, str, str, int]]]:
+    """Read SKUs from the order drawer. None means the drawer was not opened."""
+    if not await _has_order_button(page, row_id):
+        return None
+    try:
+        text = await _open_items(page, row_id, items_selector)
+    except Exception as exc:
+        logger.warning("Could not open store order %s: %s", order_id, exc)
+        return None
+    parsed = [
+        item for item in parse_shipment_items(text) if is_usable_sku(item[0])
+    ]
+    if is_usable_sku(sku) and parsed:
+        matched = [item for item in parsed if item[0].casefold() == sku.casefold()]
+        chosen = matched or parsed
+    else:
+        chosen = parsed
+    if not chosen and is_usable_sku(sku):
+        chosen = [(sku, 1, True)]
+    lines: list[tuple[str, str, str, int]] = []
+    for item_sku, qty, assumed in chosen:
+        if assumed:
+            logger.info(
+                "Store order %s SKU %s quantity assumed as 1",
+                order_id,
+                item_sku,
+            )
+        lines.append((order_id, buyer, item_sku, qty))
+    try:
+        await _close_items(page, items_selector)
+    except Exception as exc:
+        logger.info("Drawer close for %s: %s", order_id, exc)
+    return lines
+
+
 async def scrape_store_orders(
     page: Page,
     locators: dict[str, str],
     *,
     need_qty: bool,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> list[tuple[str, str, str, int]]:
-    """Read store orders (no hyphen). Open a drawer only when the grid lacks SKUs or qty."""
+    """Read store orders (no hyphen).
+
+    A combined shipment is one grid row labeled '(Multiple)' with a SKU
+    cell of '(2 Items)'. That text is not a SKU. Child orders are their
+    own rows once the group is expanded, and eBay orders among them are
+    left to the eBay scrape.
+    """
     rows = await _collect_grid(page, locators["shipstation_footer"])
     lines: list[tuple[str, str, str, int]] = []
     items_selector = locators["shipstation_items"]
-    for row in rows:
+    pending = list(rows)
+    seen = {row["id"] for row in pending if row["id"]}
+    index = 0
+    while index < len(pending):
+        row = pending[index]
+        index += 1
         order_id = row["order"]
-        if not is_store_order(order_id):
-            continue
         buyer = row["buyer"] or "?"
         sku = row["sku"]
-        if sku and not need_qty:
+
+        kind = classify_store_row(order_id, sku)
+        if kind == "combined":
+            _note(on_status, "Reading combined order")
+            pending.extend(await _reveal_children(page, row["id"], seen))
+            logger.info(
+                "Skipping combined ShipStation row %s (%s)",
+                order_id or "?",
+                sku or "no sku",
+            )
+            continue
+
+        if kind == "skip":
+            continue
+
+        _note(on_status, f"Reading store order {order_id}")
+        if kind == "multi":
+            drawer = await _lines_from_drawer(
+                page,
+                row["id"],
+                order_id,
+                buyer,
+                "",
+                items_selector,
+            )
+            if drawer:
+                lines.extend(drawer)
+                continue
+            children = await _reveal_children(page, row["id"], seen)
+            harvested = [
+                (order_id, buyer, child["sku"], 1)
+                for child in children
+                if is_usable_sku(child["sku"])
+            ]
+            if harvested:
+                lines.extend(harvested)
+                if need_qty:
+                    logger.info(
+                        "Store order %s item quantities assumed as 1",
+                        order_id,
+                    )
+                continue
+            logger.warning(
+                "ShipStation order %s showed %s and no SKU could be read",
+                order_id,
+                sku or "(no sku)",
+            )
+            continue
+
+        if not need_qty:
             lines.append((order_id, buyer, sku, 1))
             continue
-        if not sku:
-            known = {item["id"] for item in rows}
-            expanded = await _expand_row(page, row["id"])
-            if expanded:
-                await asyncio.sleep(0.3)
-                refreshed = await _grid_rows(page)
-                same = next(
-                    (item for item in refreshed if item["id"] == row["id"]),
-                    None,
-                )
-                children = [
-                    item
-                    for item in refreshed
-                    if item["id"] not in known and item["sku"]
-                ]
-                if children and not need_qty:
-                    for child in children:
-                        lines.append((order_id, buyer, child["sku"], 1))
-                    continue
-                if same and same["sku"]:
-                    sku = same["sku"]
-                    if not need_qty:
-                        lines.append((order_id, buyer, sku, 1))
-                        continue
-            elif not expanded:
-                logger.info(
-                    "No expand control for store order %s; opening the order",
-                    order_id,
-                )
-        try:
-            text = await _open_items(page, row["id"], items_selector)
-        except Exception as exc:
-            logger.warning(
-                "Could not open store order %s: %s",
-                order_id,
-                exc,
-            )
-            if sku:
-                lines.append((order_id, buyer, sku, 1))
-                logger.info("Store order %s quantity assumed as 1", order_id)
+
+        drawer = await _lines_from_drawer(
+            page,
+            row["id"],
+            order_id,
+            buyer,
+            sku,
+            items_selector,
+        )
+        if drawer:
+            lines.extend(drawer)
             continue
-        parsed = parse_shipment_items(text)
-        if sku and parsed:
-            matched = [item for item in parsed if item[0].casefold() == sku.casefold()]
-            chosen = matched or parsed
-        else:
-            chosen = parsed
-        if not chosen and sku:
-            chosen = [(sku, 1, True)]
-        for item_sku, qty, assumed in chosen:
-            if assumed:
-                logger.info(
-                    "Store order %s SKU %s quantity assumed as 1",
-                    order_id,
-                    item_sku,
-                )
-            lines.append((order_id, buyer, item_sku, qty))
-        try:
-            await _close_items(page, items_selector)
-        except Exception as exc:
-            logger.info("Drawer close for %s: %s", order_id, exc)
+        lines.append((order_id, buyer, sku, 1))
+        logger.info("Store order %s quantity assumed as 1", order_id)
     logger.info("ShipStation store orders: %s line(s)", len(lines))
     return lines

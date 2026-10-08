@@ -22,6 +22,7 @@ from tp_deck.pick_list import parse_quantity
 from tp_deck.runtime_state import razor_multiplier, scale_ms
 from tp_deck.settings_manager import update_settings
 from tp_deck.sku_cache import SkuLocationCache
+from tp_deck.shipstation import is_usable_sku
 from tp_deck.sku_overrides import is_no_sister, load_overrides, resolve_sku
 
 logger = logging.getLogger("tpdeck")
@@ -867,18 +868,21 @@ def _promptable_skus(
     originals: list[str],
     queried: dict[str, str],
     overrides: dict[str, Any],
-    definitive: set[str],
     cache: SkuLocationCache,
 ) -> set[str]:
-    """Unknown SKUs that may be asked about once today."""
+    """Unknown SKUs that may be asked about once today.
+
+    A timeout is Unknown for this run only and is not cached, but it still
+    prompts. An empty grid is cached and prompts the same way.
+    """
     promptable: set[str] = set()
     for sku in originals:
+        if not is_usable_sku(sku):
+            continue
         lookup, _factor, _display = resolve_sku(sku, overrides)
         if not is_unknown_location(queried.get(lookup, UNKNOWN_LOCATION)):
             continue
         if is_no_sister(sku, overrides) or sku in overrides:
-            continue
-        if lookup not in definitive:
             continue
         if not cache.prompt_due(sku):
             continue
@@ -947,6 +951,7 @@ async def _scrape_shipstation_lines(
     selectors: dict[str, str],
     *,
     need_qty: bool,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> list[tuple[str, str, str, int]]:
     from tp_deck.shipstation import scrape_store_orders
 
@@ -960,7 +965,12 @@ async def _scrape_shipstation_lines(
     if page is None:
         return []
     try:
-        return await scrape_store_orders(page, selectors, need_qty=need_qty)
+        return await scrape_store_orders(
+            page,
+            selectors,
+            need_qty=need_qty,
+            on_status=on_status,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -1137,14 +1147,36 @@ async def run_automation(
             timeout_ms=timeout_ms,
         )
         if scrape_shipstation and not ship_note:
+            progress.phase(
+                _REFRESH_WEIGHT,
+                _REFRESH_WEIGHT + _SCRAPE_WEIGHT,
+                "Reading store orders",
+            )
+
+            def on_store_status(label: str) -> None:
+                progress.phase(
+                    _REFRESH_WEIGHT,
+                    _REFRESH_WEIGHT + _SCRAPE_WEIGHT,
+                    label,
+                )
+
             lines_in.extend(
                 await _scrape_shipstation_lines(
                     ebay_browser,
                     settings,
                     selectors,
                     need_qty=(str(job).lower() == "picklist"),
+                    on_status=on_store_status,
                 )
             )
+        dropped = [line for line in lines_in if not is_usable_sku(line[2])]
+        if dropped:
+            logger.info(
+                "Dropped %s non-SKU label(s): %s",
+                len(dropped),
+                ", ".join(sorted({line[2] for line in dropped})),
+            )
+            lines_in = [line for line in lines_in if is_usable_sku(line[2])]
         await asyncio.sleep(0)
         progress.scrape_done("Checking locations")
 
@@ -1164,13 +1196,10 @@ async def run_automation(
 
         queried: dict[str, str] = {}
         misses: list[str] = []
-        definitive: set[str] = set()
         for sku in lookup_skus:
             cached = cache.get(sku) if cache_enabled else None
             if cached:
                 queried[sku] = cached
-                if is_unknown_location(cached):
-                    definitive.add(sku)
                 logger.info("SKU cache hit %s → %s", sku, cached)
             else:
                 misses.append(sku)
@@ -1221,10 +1250,8 @@ async def run_automation(
                     ),
                 )
                 queried[sku] = hit.location
-                if hit.definitive_unknown:
-                    definitive.add(sku)
-                    if cache_enabled:
-                        cache.put(sku, hit.location, allow_unknown=True)
+                if cache_enabled and hit.definitive_unknown:
+                    cache.put(sku, hit.location, allow_unknown=True)
                 elif cache_enabled:
                     cache.put(sku, hit.location)
                 progress.sku(index, sku_total, f"Looking up {sku}", finished=True)
@@ -1242,9 +1269,13 @@ async def run_automation(
             unique_skus,
             queried,
             overrides,
-            definitive,
             cache,
         )
+        if copy_clipboard and promptable:
+            logger.info(
+                "Sister prompt due for %s",
+                ", ".join(sorted(promptable)),
+            )
         result = render_job(
             settings,
             job=job,
