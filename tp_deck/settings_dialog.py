@@ -135,7 +135,7 @@ QPushButton#saveBtn:hover {
 FUNCTION_HELP = """\
 Scrape eBay Orders reads the open Seller Hub list, looks up each SKU, and copies the result.
 
-The cycle button repeats that lookup on a timer and only fills the location cache. ShipStation store orders sync every few of those passes.
+The cycle button repeats that lookup on a timer and only fills the location cache. ShipStation store orders sync every few of those passes. Batch Serial stays available during a pass and runs when that pass finishes.
 
 Scrape eBay Orders and Generate Pick List also read store orders from the open ShipStation awaiting-shipment tab.
 
@@ -143,7 +143,11 @@ Generate Pick List does the same lookup and copies a walk-sorted quantity list.
 
 Batch Serial types serial numbers into a Razor sales order. A service order number opens that order first; a blank number uses the one open order tab.
 
+The power button shuts down for the day. The panel fades to grey for 5 seconds. Emergency Stop during that fade cancels it. Otherwise TP DECK finishes the current task, closes extra sales-order tabs, and closes Chromium.
+
 Emergency Stop and the Pause key cancel the current run.
+
+On a release install, opening TP DECK downloads a newer GitHub release when one is published and keeps the browser profile and settings.
 """
 
 

@@ -18,6 +18,7 @@ from tp_deck.automation_engine import (
     connect_over_cdp,
     erp_wait_pair,
 )
+from tp_deck.chrome_launcher import capture_foreground, restore_foreground
 from tp_deck.locators import load_locators
 
 logger = logging.getLogger("tpdeck")
@@ -144,15 +145,19 @@ async def _open_list_page(
         return matches[0]
     url = locators["sales_orders_url"]
     context = await _browser_context(browser)
-    page = await context.new_page()
-    logger.info("Opening sales order list: %s", url)
+    foreground = capture_foreground()
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not open the sales order list ({exc})."
-        ) from exc
-    return page
+        page = await context.new_page()
+        logger.info("Opening sales order list: %s", url)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not open the sales order list ({exc})."
+            ) from exc
+        return page
+    finally:
+        restore_foreground(*foreground)
 
 
 _GRID_ROWS_JS = """
@@ -466,15 +471,19 @@ async def _open_order_from_list(
         submit_key=submit_key,
     )
     known_urls = {(page.url or "") for page in _iter_pages(browser)}
-    await _click_order_row(row, order_number)
-    return await _wait_for_detail_page(
-        browser,
-        list_page,
-        known_urls,
-        locators["sales_order_detail_pattern"],
-        locators["sales_orders_url_pattern"],
-        timeout_ms,
-    )
+    foreground = capture_foreground()
+    try:
+        await _click_order_row(row, order_number)
+        return await _wait_for_detail_page(
+            browser,
+            list_page,
+            known_urls,
+            locators["sales_order_detail_pattern"],
+            locators["sales_orders_url_pattern"],
+            timeout_ms,
+        )
+    finally:
+        restore_foreground(*foreground)
 
 
 async def _close_other_details(
@@ -559,6 +568,100 @@ async def prepare_sales_order(
 
     await _close_other_details(browser, keeper, detail_pattern, list_pattern)
     return keeper
+
+
+async def _close_all_details(browser: Browser, locators: dict[str, str]) -> None:
+    detail_pattern = locators["sales_order_detail_pattern"]
+    list_pattern = locators["sales_orders_url_pattern"]
+    for page in list(_detail_pages(browser, detail_pattern, list_pattern)):
+        url = page.url or ""
+        try:
+            await page.close()
+        except Exception as exc:
+            logger.info("Could not close sales order tab %s: %s", url, exc)
+        else:
+            logger.info("Closed sales order tab %s", url)
+
+
+async def _clear_order_filter(
+    browser: Browser,
+    locators: dict[str, str],
+    submit_key: str,
+) -> None:
+    """Empty the sales-order search so the restored list is not stuck on one order."""
+    list_pattern = locators["sales_orders_url_pattern"]
+    detail_pattern = locators["sales_order_detail_pattern"]
+    selector = locators["sales_order_filter"]
+    foreground = capture_foreground()
+    try:
+        for page in _iter_pages(browser):
+            url = page.url or ""
+            if not _url_matches(url, list_pattern):
+                continue
+            if _is_detail_url(url, detail_pattern, list_pattern):
+                continue
+            field = page.locator(selector).first
+            try:
+                await field.fill("", timeout=3000)
+                key = (submit_key or "").strip()
+                if key:
+                    await field.press(key)
+            except Exception as exc:
+                logger.info("Could not clear the sales order filter on %s: %s", url, exc)
+            else:
+                logger.info("Cleared sales order filter on %s", url)
+    finally:
+        restore_foreground(*foreground)
+
+
+async def shutdown_workday(settings: dict[str, Any]) -> None:
+    """Close leftover order tabs, clear the order filter, then close Chromium.
+
+    Playwright's browser.close() on a CDP connection only disconnects. Browser.close
+    over CDP asks Chromium to write the session and exit.
+    """
+    from playwright.async_api import async_playwright
+
+    from tp_deck.chrome_launcher import _debug_port_ready
+
+    locators = load_locators()
+    mode = str(settings.get("mode", "single")).lower()
+    ports = [int(settings.get("ebay_port", 9222))]
+    if mode == "dual":
+        erp_port = int(settings.get("erp_port", 9223))
+        if erp_port not in ports:
+            ports.append(erp_port)
+    ready = [port for port in ports if _debug_port_ready(port)]
+    if not ready:
+        logger.info("No Chromium debug port is open")
+        return
+
+    submit_key = str(settings.get("erp_submit_key") or "Enter")
+    playwright = await async_playwright().start()
+    browsers: list[Browser] = []
+    try:
+        for port in ready:
+            browsers.append(await connect_over_cdp(playwright, port))
+        for browser in browsers:
+            await _close_all_details(browser, locators)
+            await _clear_order_filter(browser, locators, submit_key)
+        for browser in browsers:
+            try:
+                session = await browser.new_browser_cdp_session()
+                await session.send("Browser.close")
+            except Exception as exc:
+                raise RuntimeError(f"Could not close Chromium ({exc}).") from exc
+            logger.info("Chromium closed")
+    finally:
+        for browser in browsers:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
 
 
 async def close_detail_tab(settings: dict[str, Any], url: str) -> None:

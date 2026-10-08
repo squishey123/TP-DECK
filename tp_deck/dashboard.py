@@ -38,14 +38,28 @@ from tp_deck.settings_manager import load_settings, update_settings
 logger = logging.getLogger("tpdeck")
 
 
-def _cycle_icon() -> QIcon:
+def _mix_color(start: QColor, end: QColor, amount: float) -> QColor:
+    """Blend start toward end. amount 0 leaves start unchanged."""
+    t = max(0.0, min(1.0, amount))
+    return QColor(
+        int(start.red() + (end.red() - start.red()) * t),
+        int(start.green() + (end.green() - start.green()) * t),
+        int(start.blue() + (end.blue() - start.blue()) * t),
+    )
+
+
+def _mix_hex(start: str, end: str, amount: float) -> str:
+    return _mix_color(QColor(start), QColor(end), amount).name()
+
+
+def _cycle_icon(color: QColor | None = None) -> QIcon:
     """Two arrows chasing each other around a circle."""
     size = 20
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor("#F8FAFC"))
+    pen = QPen(color or QColor("#F8FAFC"))
     pen.setWidthF(1.7)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -131,6 +145,7 @@ QPushButton#executeBtn, QPushButton#pickBtn, QPushButton#batchBtn {
     color: #0F172A;
     font-weight: bold;
     min-height: 28px;
+    padding: 6px 6px;
 }
 QPushButton#executeBtn:hover, QPushButton#pickBtn:hover, QPushButton#batchBtn:hover {
     background-color: #38BDF8;
@@ -144,9 +159,11 @@ QPushButton#cycleBtn {
     background-color: #B45309;
     color: #F8FAFC;
     border: 1px solid #F59E0B;
-    padding: 4px;
-    min-width: 36px;
-    max-width: 36px;
+    padding: 0px;
+    min-width: 34px;
+    max-width: 34px;
+    min-height: 34px;
+    max-height: 34px;
 }
 QPushButton#cycleBtn:hover {
     background-color: #D97706;
@@ -170,13 +187,20 @@ QPushButton#stopBtn {
     color: #FCA5A5;
     border: 1px solid #FCA5A5;
     font-weight: bold;
+    font-size: 11px;
+    padding: 4px 4px;
 }
 QPushButton#stopBtn:hover {
     background-color: #991B1B;
     color: #FEE2E2;
 }
-QPushButton#settingsBtn {
+QPushButton#settingsBtn, QPushButton#powerBtn {
     border-color: #64748B;
+    padding: 0px;
+    min-width: 34px;
+    max-width: 34px;
+    min-height: 34px;
+    max-height: 34px;
 }
 QLabel#slowRazorLabel {
     color: #FBBF24;
@@ -291,7 +315,7 @@ class ResultsWindow(QWidget):
         self._table.setWordWrap(True)
         self._table.setShowGrid(True)
         self._table.verticalHeader().setVisible(False)
-        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.horizontalHeader().setStretchLastSection(False)
         self._table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive
         )
@@ -368,11 +392,56 @@ class ResultsWindow(QWidget):
                 if flagged:
                     item.setBackground(unknown_bg)
                 self._table.setItem(row_index, column, item)
+        self._table.horizontalHeader().setStretchLastSection(False)
         self._table.resizeColumnsToContents()
-        for column in range(self._table.columnCount()):
-            width = self._table.columnWidth(column)
-            self._table.setColumnWidth(column, min(max(width, 72), 420))
+        body = QFont("Consolas")
+        body.setPixelSize(18)
+        body_metrics = QFontMetrics(body)
+        header_font = QFont("Consolas")
+        header_font.setPixelSize(18)
+        header_font.setBold(True)
+        header_metrics = QFontMetrics(header_font)
+        buyer_at: Optional[int] = None
+        for column, header in enumerate(headers):
+            if header == "Buyer":
+                longest = header_metrics.horizontalAdvance(header)
+                for row in rows:
+                    if column < len(row):
+                        longest = max(
+                            longest,
+                            body_metrics.horizontalAdvance(str(row[column])),
+                        )
+                self._table.setColumnWidth(column, longest + 28)
+                buyer_at = column
+            elif header == "Location":
+                cap = max(header_metrics.horizontalAdvance(header) + 24, 120)
+                width = min(self._table.columnWidth(column), cap)
+                self._table.setColumnWidth(column, max(48, width))
+            else:
+                width = self._table.columnWidth(column)
+                self._table.setColumnWidth(column, min(max(width, 72), 420))
+        self._shrink_buyer_to_screen(buyer_at)
         self._table.resizeRowsToContents()
+
+    def _shrink_buyer_to_screen(self, buyer_at: Optional[int]) -> None:
+        """Keep a long buyer name on one line unless the screen cannot hold it."""
+        if buyer_at is None:
+            return
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        max_w = max(420, int(screen.availableGeometry().width() * 0.9))
+        margins = self.layout().contentsMargins()
+        budget = max_w - margins.left() - margins.right() - 28
+        table = self._table
+        total = table.frameWidth() * 2
+        for column in range(table.columnCount()):
+            total += table.columnWidth(column)
+        overflow = total - budget
+        if overflow <= 0:
+            return
+        current = table.columnWidth(buyer_at)
+        table.setColumnWidth(buyer_at, max(72, current - overflow))
 
     def _fit_to_text(self, text: str) -> None:
         metrics = QFontMetrics(self._text.font())
@@ -451,6 +520,7 @@ class ChassisLight(QWidget):
         self.setFixedSize(12, 12)
         self._state = "idle"
         self._phase = 0.0
+        self._fade = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
@@ -467,21 +537,26 @@ class ChassisLight(QWidget):
         self._phase = (self._phase + 0.05) % (math.tau)
         self.update()
 
+    def set_fade(self, amount: float) -> None:
+        self._fade = max(0.0, min(1.0, amount))
+        self.update()
+
     def paintEvent(self, event) -> None:  # noqa: N802 — Qt override
         del event
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         colors = {
-            "idle": QColor("#334155"),
-            "running": QColor("#38BDF8"),
-            "success": QColor("#4ADE80"),
+            "idle": QColor("#FCA5A5"),
+            "running": QColor("#4ADE80"),
             "error": QColor("#FCA5A5"),
         }
-        color = colors.get(self._state, QColor("#334155"))
+        color = colors.get(self._state, QColor("#FCA5A5"))
         if self._state == "waiting":
             wave = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(self._phase))
             color = QColor("#0EA5E9")
             color.setAlphaF(wave)
+        if self._fade > 0:
+            color = _mix_color(QColor(color.red(), color.green(), color.blue()), QColor("#94A3B8"), self._fade)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
         painter.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
@@ -495,8 +570,14 @@ class CycleButton(QPushButton):
         super().__init__(parent)
         self._deadline: Optional[float] = None
         self._total = 0.0
+        self._fade = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update)
+
+    def set_fade(self, amount: float) -> None:
+        self._fade = max(0.0, min(1.0, amount))
+        self.setIcon(_cycle_icon(_mix_color(QColor("#F8FAFC"), QColor("#94A3B8"), self._fade)))
+        self.update()
 
     def start_countdown(self, seconds: float) -> None:
         self._total = max(0.001, float(seconds))
@@ -523,10 +604,49 @@ class CycleButton(QPushButton):
         pen = QPen(QColor("#E0F2FE"))
         pen.setWidthF(2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        if self._fade > 0:
+            pen.setColor(_mix_color(QColor("#E0F2FE"), QColor("#94A3B8"), self._fade))
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        rect = QRectF(self.rect().adjusted(3, 3, -4, -4))
-        painter.drawArc(rect, 90 * 16, int(-fraction * 360 * 16))
+        side = min(self.width(), self.height()) - 8
+        if side <= 4:
+            painter.end()
+            return
+        left = (self.width() - side) / 2
+        top = (self.height() - side) / 2
+        painter.drawArc(QRectF(left, top, side, side), 90 * 16, int(-fraction * 360 * 16))
+        painter.end()
+
+
+class PowerButton(QPushButton):
+    """Safe Shutdown control. The glyph eases to grey while shutdown is armed."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._fade = 0.0
+        self.setFixedSize(36, 36)
+
+    def set_fade(self, amount: float) -> None:
+        self._fade = max(0.0, min(1.0, amount))
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 — Qt override
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = _mix_color(QColor("#F8FAFC"), QColor("#94A3B8"), self._fade)
+        pen = QPen(color)
+        pen.setWidthF(1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        side = 14.0
+        left = (self.width() - side) / 2
+        top = (self.height() - side) / 2 + 1
+        rect = QRectF(left, top, side, side)
+        painter.drawArc(rect, int(125 * 16), int(290 * 16))
+        center = rect.center()
+        painter.drawLine(QPointF(center.x(), center.y() - 1), QPointF(center.x(), rect.top() - 2))
         painter.end()
 
 
@@ -544,8 +664,13 @@ class StatusWell(QWidget):
         self._show_track = False
         self._serial = False
         self._phase = 0.0
+        self._fade = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
+
+    def set_fade(self, amount: float) -> None:
+        self._fade = max(0.0, min(1.0, amount))
+        self.update()
 
     def set_text(self, text: str) -> None:
         self._text = text
@@ -601,13 +726,14 @@ class StatusWell(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         bounds = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.setPen(QPen(QColor("#0EA5E9"), 1))
+        border = _mix_color(QColor("#0EA5E9"), QColor("#94A3B8"), self._fade)
+        painter.setPen(QPen(border, 1))
         painter.setBrush(QColor("#1E293B"))
         painter.drawRoundedRect(bounds, 6, 6)
 
         text_bottom = 16 if self._show_track else 8
         text_rect = bounds.adjusted(8, 6, -8, -text_bottom)
-        painter.setPen(QColor("#F8FAFC"))
+        painter.setPen(_mix_color(QColor("#F8FAFC"), QColor("#94A3B8"), self._fade))
         painter.setFont(self.font())
         painter.drawText(
             text_rect,
@@ -624,7 +750,7 @@ class StatusWell(QWidget):
         painter.drawRoundedRect(track, 3, 3)
         fill_width = track.width() * self._display
         if fill_width > 0:
-            painter.setBrush(QColor("#0EA5E9"))
+            painter.setBrush(_mix_color(QColor("#0EA5E9"), QColor("#64748B"), self._fade))
             painter.drawRoundedRect(
                 QRectF(track.x(), track.y(), fill_width, track.height()),
                 3,
@@ -635,7 +761,7 @@ class StatusWell(QWidget):
             span = max(0.04, end - start)
             band = min(0.08, span * 0.45)
             travel = start + self._phase * max(0.0, span - band)
-            painter.setBrush(QColor("#7DD3FC"))
+            painter.setBrush(_mix_color(QColor("#7DD3FC"), QColor("#94A3B8"), self._fade))
             painter.drawRoundedRect(
                 QRectF(
                     track.x() + track.width() * travel,
@@ -664,6 +790,8 @@ class Dashboard(QMainWindow):
         on_cycle: Optional[Callable[[], None]] = None,
         on_stop: Optional[Callable[[], None]] = None,
         on_open_settings: Optional[Callable[[], None]] = None,
+        on_shutdown: Optional[Callable[[], None]] = None,
+        on_arm_shutdown: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -673,15 +801,28 @@ class Dashboard(QMainWindow):
         self._on_cycle = on_cycle
         self._on_stop = on_stop
         self._on_open_settings = on_open_settings
+        self._on_shutdown = on_shutdown
+        self._on_arm_shutdown = on_arm_shutdown
         self._persist_enabled = False
         self._results: Optional[ResultsWindow] = None
         self._failures: Optional[ResultsWindow] = None
+        self._active = False
+        self._error = False
+        self._serial_queued = False
+        self._job = ""
+        self._autocycle_on = False
+        self._armed = False
+        self._shutting_down = False
+        self._arm_started = 0.0
+        self._fade = 0.0
 
         self.setWindowTitle("TP DECK")
         self.setWindowFlags(
             Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
         )
         self._cycle_waiting = False
+        self._arm_timer = QTimer(self)
+        self._arm_timer.timeout.connect(self._tick_shutdown_arm)
         self.setFixedSize(300, 356)
         self.setStyleSheet(THEME_QSS)
 
@@ -704,10 +845,10 @@ class Dashboard(QMainWindow):
         title_row.addStretch()
         self._light = ChassisLight()
         title_row.addWidget(self._light)
-        title = QLabel("TP DECK")
-        title.setObjectName("titleLabel")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_row.addWidget(title)
+        self._title = QLabel("TP DECK")
+        self._title.setObjectName("titleLabel")
+        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_row.addWidget(self._title)
         title_row.addStretch()
         layout.addLayout(title_row)
 
@@ -726,6 +867,7 @@ class Dashboard(QMainWindow):
 
         scrape_row = QHBoxLayout()
         scrape_row.setSpacing(8)
+        scrape_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.execute_btn = QPushButton("Scrape eBay Orders")
         self.execute_btn.setObjectName("executeBtn")
@@ -734,7 +876,7 @@ class Dashboard(QMainWindow):
 
         self.cycle_btn = CycleButton()
         self.cycle_btn.setObjectName("cycleBtn")
-        self.cycle_btn.setFixedWidth(36)
+        self.cycle_btn.setFixedSize(36, 36)
         self.cycle_btn.setIcon(_cycle_icon())
         self.cycle_btn.setIconSize(QSize(18, 18))
         self.cycle_btn.setToolTip("Auto-cycle eBay scrape (off)")
@@ -754,16 +896,23 @@ class Dashboard(QMainWindow):
         layout.addWidget(self.batch_btn)
 
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(6)
+        row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.stop_btn = QPushButton("🛑 Emergency Stop")
         self.stop_btn.setObjectName("stopBtn")
         self.stop_btn.clicked.connect(self._handle_stop)
         row.addWidget(self.stop_btn)
 
+        self.power_btn = PowerButton()
+        self.power_btn.setObjectName("powerBtn")
+        self.power_btn.setToolTip("Safe Shutdown")
+        self.power_btn.clicked.connect(self._handle_power)
+        row.addWidget(self.power_btn)
+
         self.settings_btn = QPushButton("⚙")
         self.settings_btn.setObjectName("settingsBtn")
-        self.settings_btn.setFixedWidth(36)
+        self.settings_btn.setFixedSize(36, 36)
         self.settings_btn.setToolTip("Settings")
         self.settings_btn.clicked.connect(self._handle_settings)
         row.addWidget(self.settings_btn)
@@ -796,24 +945,122 @@ class Dashboard(QMainWindow):
         raw = str(text or "").strip()
         self._well.set_text(_format_status(raw))
         self._well.setToolTip(raw)
-        self._apply_chassis(raw)
+        self._error = raw.startswith("Error")
+        self._apply_lamp()
 
-    def _apply_chassis(self, text: str) -> None:
-        if text.startswith("Error"):
-            state = "error"
-        elif text.startswith(
-            ("Processing", "Refreshing", "Scraping", "Syncing", "Looking", "Serials", "Checking")
-        ):
+    def set_active(self, active: bool) -> None:
+        self._active = bool(active)
+        self._apply_lamp()
+
+    def set_serial_queued(self, queued: bool) -> None:
+        self._serial_queued = bool(queued)
+        if not (self._active and self._job == "serials"):
+            self.batch_btn.setText("Queued" if self._serial_queued else "Batch Serial")
+        self._apply_lamp()
+
+    def input_blocked(self) -> bool:
+        """True while shutdown is armed or already running. Emergency Stop still works."""
+        return self._armed or self._shutting_down
+
+    def _apply_lamp(self) -> None:
+        if self._active or self._serial_queued:
             state = "running"
-        elif text in {"", "Idle", "Stopped"} or text.startswith("Stopped"):
-            state = "idle"
-        elif text.startswith(("Success", "Cycling", "Incomplete")):
-            state = "success"
-        else:
-            state = "running" if self._well._show_track else "idle"
-        if self._cycle_waiting and state != "error" and state != "running":
+        elif self._error:
+            state = "error"
+        elif self._cycle_waiting:
             state = "waiting"
+        else:
+            state = "idle"
         self._light.set_state(state)
+
+    def begin_shutdown_arm(self) -> None:
+        """Ease the panel to grey over 5 seconds, then start Safe Shutdown."""
+        if self._armed or self._shutting_down:
+            return
+        self._armed = True
+        self._arm_started = time.monotonic()
+        self._apply_fade(0.0)
+        if not self._arm_timer.isActive():
+            self._arm_timer.start(33)
+
+    def cancel_shutdown_arm(self) -> None:
+        """Restore the normal colors and leave the app open."""
+        self._armed = False
+        self._shutting_down = False
+        self._arm_timer.stop()
+        self._apply_fade(0.0)
+
+    def mark_shutting_down(self) -> None:
+        self._armed = False
+        self._shutting_down = True
+        self._arm_timer.stop()
+        self._apply_fade(1.0)
+
+    def _tick_shutdown_arm(self) -> None:
+        elapsed = time.monotonic() - self._arm_started
+        self._apply_fade(min(1.0, elapsed / 5.0))
+        if elapsed < 5.0 or not self._armed:
+            return
+        self._arm_timer.stop()
+        self._armed = False
+        self._shutting_down = True
+        if self._on_shutdown:
+            self._on_shutdown()
+
+    def _apply_fade(self, amount: float) -> None:
+        t = max(0.0, min(1.0, amount))
+        self._fade = t
+        self._light.set_fade(t)
+        self._well.set_fade(t)
+        self.cycle_btn.set_fade(t)
+        self.power_btn.set_fade(t)
+        if t <= 0:
+            for widget in (
+                self._title,
+                self._slow_label,
+                self.execute_btn,
+                self.pick_btn,
+                self.batch_btn,
+                self.settings_btn,
+                self.power_btn,
+                self.cycle_btn,
+            ):
+                widget.setStyleSheet("")
+            self.set_autocycle(self._autocycle_on)
+            return
+        grey_text = _mix_hex("#F8FAFC", "#94A3B8", t)
+        self._title.setStyleSheet(
+            f"color: {_mix_hex('#0EA5E9', '#94A3B8', t)}; background: transparent; font-weight: bold;"
+        )
+        self._slow_label.setStyleSheet(
+            f"color: {_mix_hex('#FBBF24', '#94A3B8', t)}; background: transparent; font-weight: bold;"
+        )
+        blue_bg = _mix_hex("#0EA5E9", "#334155", t)
+        blue_text = _mix_hex("#0F172A", "#94A3B8", t)
+        action_qss = (
+            f"background-color: {blue_bg}; color: {blue_text}; "
+            f"border: 1px solid {blue_bg}; font-weight: bold;"
+        )
+        for button in (self.execute_btn, self.pick_btn, self.batch_btn):
+            button.setStyleSheet(action_qss)
+        self.settings_btn.setStyleSheet(
+            f"background-color: {_mix_hex('#1E293B', '#334155', t)}; "
+            f"color: {grey_text}; border: 1px solid {_mix_hex('#64748B', '#94A3B8', t)};"
+        )
+        self.power_btn.setStyleSheet(
+            f"background-color: {_mix_hex('#1E293B', '#334155', t)}; "
+            f"border: 1px solid {_mix_hex('#64748B', '#94A3B8', t)};"
+        )
+        if self._autocycle_on:
+            cycle_bg = _mix_hex("#15803D", "#334155", t)
+            cycle_border = _mix_hex("#4ADE80", "#94A3B8", t)
+        else:
+            cycle_bg = _mix_hex("#B45309", "#334155", t)
+            cycle_border = _mix_hex("#F59E0B", "#94A3B8", t)
+        self.cycle_btn.setStyleSheet(
+            f"background-color: {cycle_bg}; color: {grey_text}; "
+            f"border: 1px solid {cycle_border};"
+        )
 
     def set_run_progress(
         self,
@@ -832,15 +1079,16 @@ class Dashboard(QMainWindow):
     def start_cycle_countdown(self, seconds: float) -> None:
         self._cycle_waiting = True
         self.cycle_btn.start_countdown(seconds)
-        self._apply_chassis(self._well.toolTip() or self._well._text)
+        self._apply_lamp()
 
     def clear_cycle_countdown(self) -> None:
         self._cycle_waiting = False
         self.cycle_btn.clear_countdown()
-        self._apply_chassis(self._well.toolTip() or self._well._text)
+        self._apply_lamp()
 
     def set_autocycle(self, enabled: bool) -> None:
         """Amber when off, green when the cache cycle is running."""
+        self._autocycle_on = bool(enabled)
         self.cycle_btn.setProperty("cycleOn", "true" if enabled else "false")
         self.cycle_btn.style().unpolish(self.cycle_btn)
         self.cycle_btn.style().polish(self.cycle_btn)
@@ -905,40 +1153,56 @@ class Dashboard(QMainWindow):
 
     def set_processing(self, active: bool, job: str = "orders") -> None:
         """Disable action buttons while a run is in flight; leave the cycle toggle clickable."""
+        self._active = bool(active)
+        self._job = job if active else self._job
+        blocked = self.input_blocked()
         if active:
-            self.execute_btn.setEnabled(False)
-            self.pick_btn.setEnabled(False)
-            self.batch_btn.setEnabled(False)
+            if not blocked:
+                self.execute_btn.setEnabled(False)
+                self.pick_btn.setEnabled(False)
+                self.batch_btn.setEnabled(job in {"cycle", "serials"})
             if job == "picklist":
                 self.pick_btn.setText("⏳ Processing...")
             elif job == "serials":
                 self.batch_btn.setText("⏳ Processing...")
             else:
                 self.execute_btn.setText("⏳ Processing...")
+            if job == "cycle" and self._serial_queued:
+                self.batch_btn.setText("Queued")
             self.set_status("Processing")
-            self._apply_chassis("Processing")
         else:
             self.clear_progress()
-            self.execute_btn.setEnabled(True)
-            self.pick_btn.setEnabled(True)
-            self.batch_btn.setEnabled(True)
+            if not blocked:
+                self.execute_btn.setEnabled(True)
+                self.pick_btn.setEnabled(True)
+                self.batch_btn.setEnabled(True)
+                self.cycle_btn.setEnabled(True)
             self.execute_btn.setText("Scrape eBay Orders")
             self.pick_btn.setText("Generate Pick List")
-            self.batch_btn.setText("Batch Serial")
+            self.batch_btn.setText("Queued" if self._serial_queued else "Batch Serial")
+            self._apply_lamp()
 
     def _handle_execute(self) -> None:
+        if self.input_blocked():
+            return
         if self._on_execute:
             self._on_execute()
 
     def _handle_pick_list(self) -> None:
+        if self.input_blocked():
+            return
         if self._on_pick_list:
             self._on_pick_list()
 
     def _handle_batch_serial(self) -> None:
+        if self.input_blocked():
+            return
         if self._on_batch_serial:
             self._on_batch_serial()
 
     def _handle_cycle(self) -> None:
+        if self.input_blocked():
+            return
         if self._on_cycle:
             self._on_cycle()
 
@@ -946,6 +1210,16 @@ class Dashboard(QMainWindow):
         if self._on_stop:
             self._on_stop()
 
+    def _handle_power(self) -> None:
+        if self._armed or self._shutting_down:
+            return
+        if self._on_arm_shutdown:
+            self._on_arm_shutdown()
+            return
+        self.begin_shutdown_arm()
+
     def _handle_settings(self) -> None:
+        if self.input_blocked():
+            return
         if self._on_open_settings:
             self._on_open_settings()

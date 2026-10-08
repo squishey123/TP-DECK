@@ -14,19 +14,27 @@ from typing import Optional
 from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
+from tp_deck import __version__
 from tp_deck.automation_engine import (
     copy_to_clipboard,
     lookup_missing_locations,
     run_automation,
     run_batch_serials,
 )
-from tp_deck.chrome_launcher import ensure_debug_chromium
+from tp_deck.chrome_launcher import app_root, ensure_debug_chromium
 from tp_deck.dashboard import Dashboard
 from tp_deck.job_results import AutomationResult, render_job
-from tp_deck.sales_order import close_detail_tab
+from tp_deck.sales_order import close_detail_tab, shutdown_workday
 from tp_deck.serial_dialog import SerialDialog
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
+from tp_deck.updater import (
+    download_and_spawn,
+    fetch_latest,
+    find_windows_asset,
+    is_newer,
+    is_release_layout,
+)
 from tp_deck.duration import cache_ttl_seconds
 from tp_deck.sku_cache import SkuLocationCache
 from tp_deck.sku_override_dialog import UnknownSkuDialog
@@ -102,6 +110,12 @@ class AutomationController:
         self._wake: Optional[asyncio.Event] = None
         self._job = "orders"
         self._cycle_passes = 0
+        self._serial_queue: list[tuple[list[str], str]] = []
+        self._serial_dialog: Optional[SerialDialog] = None
+        self._drain_task: Optional[asyncio.Task] = None
+        self._draining = False
+        self._shutdown_task: Optional[asyncio.Task] = None
+        self._shutdown_abort = False
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -116,6 +130,8 @@ class AutomationController:
         serials: Optional[list[str]] = None,
         order_number: str = "",
     ) -> bool:
+        if self._dashboard.input_blocked():
+            return False
         if job == "serials":
             self._cancel_detail_close()
         if self._lock.locked() or self._manual_pending:
@@ -192,6 +208,17 @@ class AutomationController:
 
     def stop(self) -> None:
         logger = logging.getLogger("tpdeck")
+        self.hold_autocycle(False)
+        self._dashboard.cancel_shutdown_arm()
+        self._serial_queue.clear()
+        self._dashboard.set_serial_queued(False)
+        shutdown_running = (
+            self._shutdown_task is not None and not self._shutdown_task.done()
+        )
+        if shutdown_running:
+            self._shutdown_abort = True
+            assert self._shutdown_task is not None
+            self._shutdown_task.cancel()
         close_running = (
             self._close_task is not None and not self._close_task.done()
         )
@@ -201,8 +228,13 @@ class AutomationController:
             self._manual_task is not None and not self._manual_task.done()
         )
         cycle_running = self._cycle_task is not None and not self._cycle_task.done()
-        if not manual_running and not cycle_running:
-            if not close_running:
+        drain_running = (
+            self._drain_task is not None and not self._drain_task.done()
+        )
+        if not manual_running and not cycle_running and not drain_running:
+            if shutdown_running:
+                logger.info("Emergency stop — cancelling shutdown")
+            elif not close_running:
                 logger.info("Emergency stop — no active task")
             return
         logger.info("Emergency stop — cancelling task")
@@ -217,6 +249,9 @@ class AutomationController:
         if cycle_running:
             assert self._cycle_task is not None
             self._cycle_task.cancel()
+        if drain_running:
+            assert self._drain_task is not None
+            self._drain_task.cancel()
 
     def stop_from_other_thread(self) -> None:
         """Marshal Pause-key cancels onto the asyncio/Qt loop."""
@@ -234,6 +269,79 @@ class AutomationController:
     def _wake_wait(self) -> None:
         if self._wake is not None:
             self._wake.set()
+
+    def open_batch_serial(self) -> None:
+        """Show the serial dialog without freezing the auto-cycle pass."""
+        if self._dashboard.input_blocked():
+            return
+        if self._serial_dialog is not None:
+            self._serial_dialog.raise_()
+            self._serial_dialog.activateWindow()
+            return
+        dialog = SerialDialog(self._dashboard)
+        dialog.setModal(False)
+        dialog.accepted.connect(lambda: self._accept_serial_dialog(dialog))
+        dialog.finished.connect(self._finish_serial_dialog)
+        self._serial_dialog = dialog
+        self.hold_autocycle(True)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _accept_serial_dialog(self, dialog: SerialDialog) -> None:
+        serials = dialog.serials()
+        if not serials:
+            return
+        self._serial_queue.append((serials, dialog.order_number()))
+        self._dashboard.set_serial_queued(True)
+        logging.getLogger("tpdeck").info("Batch serial queued (%s)", len(serials))
+
+    def _finish_serial_dialog(self, _code: int) -> None:
+        self._serial_dialog = None
+        self.hold_autocycle(False)
+        self._wake_wait()
+        if not self._autocycle:
+            self._kick_serial_drain()
+
+    def _dismiss_serial_dialog(self) -> None:
+        dialog = self._serial_dialog
+        if dialog is None:
+            return
+        dialog.reject()
+
+    def _kick_serial_drain(self) -> None:
+        if self._autocycle or self._dashboard.input_blocked():
+            return
+        if self._draining:
+            return
+        if self._drain_task is not None and not self._drain_task.done():
+            return
+        if not self._serial_queue:
+            return
+        self._drain_task = asyncio.create_task(
+            self._drain_serial_queue(),
+            name="tpdeck-serial-drain",
+        )
+
+    def arm_shutdown(self) -> None:
+        if self._dashboard.input_blocked():
+            return
+        self._dismiss_serial_dialog()
+        self.hold_autocycle(True)
+        self._shutdown_abort = False
+        self._dashboard.begin_shutdown_arm()
+
+    def begin_shutdown(self) -> None:
+        if self._shutdown_abort:
+            self._dashboard.cancel_shutdown_arm()
+            return
+        if self._shutdown_task is not None and not self._shutdown_task.done():
+            return
+        self._dashboard.mark_shutting_down()
+        self._shutdown_task = asyncio.create_task(
+            self._shutdown(),
+            name="tpdeck-shutdown",
+        )
 
     def _on_serial_progress(self, done: int, total: int) -> None:
         self._dashboard.set_status(f"Serials {done}/{total}")
@@ -344,6 +452,8 @@ class AutomationController:
             return
 
         self._publish(result)
+        if self._serial_queue and not self._autocycle:
+            self._kick_serial_drain()
 
     def _offer_overrides(self, result: AutomationResult) -> None:
         """Ask once for every unknown SKU, then look up any alternatives."""
@@ -434,24 +544,160 @@ class AutomationController:
         except Exception:
             logger.exception("Could not close the sales order tab")
 
-    async def _interruptible_sleep(self, seconds: float) -> None:
-        self._dashboard.start_cycle_countdown(seconds)
-        self._wake = asyncio.Event()
+    async def _execute_serial_batch(
+        self,
+        serials: list[str],
+        order_number: str,
+    ) -> None:
+        """Run one queued batch. Caller holds the decision to take the lock."""
+        logger = logging.getLogger("tpdeck")
+        self._cancel_detail_close()
+        self._manual_pending = True
+        self._dashboard.set_processing(True, job="serials")
         try:
-            await asyncio.wait_for(self._wake.wait(), timeout=max(0.0, seconds))
-        except asyncio.TimeoutError:
-            pass
+            result = await run_batch_serials(
+                load_settings(),
+                serials,
+                on_progress=self._on_serial_progress,
+                order_number=order_number,
+            )
+        except asyncio.CancelledError:
+            self._dashboard.set_processing(False)
+            self._dashboard.set_status("Stopped")
+            raise
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            logger.exception("Batch serial failed: %s", exc)
+            self._dashboard.set_processing(False)
+            self._dashboard.set_status(f"Error — {message}")
+        else:
+            self._dashboard.set_serial_queued(bool(self._serial_queue))
+            self._dashboard.set_processing(False)
+            self._publish(result)
         finally:
-            self._wake = None
-            self._dashboard.clear_cycle_countdown()
+            self._manual_pending = False
+
+    async def _drain_serial_queue_locked(self) -> None:
+        """Run queued batches. Caller already holds self._lock."""
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            while self._serial_queue and not self._shutdown_abort:
+                serials, order_number = self._serial_queue.pop(0)
+                self._dashboard.set_serial_queued(bool(self._serial_queue))
+                await self._execute_serial_batch(serials, order_number)
+        finally:
+            self._draining = False
+            self._dashboard.set_serial_queued(bool(self._serial_queue))
+
+    async def _drain_serial_queue(self) -> None:
+        """Run queued batches, taking the automation lock for each one."""
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            while self._serial_queue and not self._shutdown_abort:
+                serials, order_number = self._serial_queue.pop(0)
+                self._dashboard.set_serial_queued(bool(self._serial_queue))
+                async with self._lock:
+                    await self._execute_serial_batch(serials, order_number)
+        finally:
+            self._draining = False
+            self._dashboard.set_serial_queued(bool(self._serial_queue))
+
+    async def _interruptible_sleep(self, seconds: float, generation: int) -> None:
+        """Wait out the auto-cycle interval, running a queued batch without losing the remainder."""
+        deadline = time.monotonic() + max(0.0, seconds)
+        while self._autocycle and self._cycle_gen == generation:
+            if self._serial_queue and not self._hold and not self._draining:
+                await self._drain_serial_queue()
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._dashboard.start_cycle_countdown(remaining)
+            self._wake = asyncio.Event()
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return
+            finally:
+                self._wake = None
+                self._dashboard.clear_cycle_countdown()
+            if not self._autocycle or self._cycle_gen != generation:
+                return
+            if self._serial_queue:
+                continue
+            if self._hold:
+                await asyncio.sleep(0.2)
+                continue
+            return
+
+    async def _shutdown(self) -> None:
+        """Finish the current task, close leftover order tabs, then exit."""
+        logger = logging.getLogger("tpdeck")
+        try:
+            if self._shutdown_abort:
+                self._dashboard.cancel_shutdown_arm()
+                return
+            logger.info("Safe shutdown started")
+            self._autocycle = False
+            self._cycle_gen += 1
+            self._dashboard.set_autocycle(False)
+            self._wake_wait()
+            self._dashboard.set_active(True)
+            self._dashboard.set_status("Finishing current task")
+            pending = [
+                task
+                for task in (self._cycle_task, self._manual_task, self._drain_task)
+                if task is not None and not task.done()
+            ]
+            if pending:
+                await asyncio.wait(pending)
+            if self._shutdown_abort:
+                return
+            await self._drain_serial_queue()
+            if self._shutdown_abort:
+                return
+            self._cancel_detail_close()
+            self._dashboard.set_active(True)
+            self._dashboard.set_status("Closing order tabs")
+            async with self._lock:
+                await shutdown_workday(load_settings())
+            if self._shutdown_abort:
+                return
+            logger.info("Safe shutdown complete")
+            self._dashboard.close()
+        except asyncio.CancelledError:
+            logger.info("Safe shutdown cancelled")
+            self.hold_autocycle(False)
+            self._dashboard.cancel_shutdown_arm()
+            raise
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            logger.exception("Safe shutdown failed: %s", exc)
+            self.hold_autocycle(False)
+            self._dashboard.cancel_shutdown_arm()
+            self._dashboard.set_status(f"Error — {message}")
+        finally:
+            self._shutdown_abort = False
 
     async def _autocycle_loop(self, generation: int) -> None:
         logger = logging.getLogger("tpdeck")
         logger.info("Auto-cycle started")
         try:
             while self._autocycle and self._cycle_gen == generation:
-                if self._hold or self._manual_pending or self._lock.locked():
+                if (
+                    self._hold
+                    or self._manual_pending
+                    or self._lock.locked()
+                    or self._draining
+                ):
                     await asyncio.sleep(0.2)
+                    continue
+                if self._serial_queue:
+                    await self._drain_serial_queue()
                     continue
                 minutes = 10
                 status_text = ""
@@ -461,6 +707,7 @@ class AutomationController:
                         or self._cycle_gen != generation
                         or self._hold
                         or self._manual_pending
+                        or self._serial_queue
                     ):
                         continue
                     self._job = "cycle"
@@ -496,13 +743,22 @@ class AutomationController:
                         status_text = f"Error — {message}"
                     finally:
                         self._cycle_busy = False
-                        self._dashboard.set_processing(False)
+                    if (
+                        self._serial_queue
+                        and self._autocycle
+                        and self._cycle_gen == generation
+                        and not self._shutdown_abort
+                    ):
+                        await self._drain_serial_queue_locked()
+                    self._dashboard.set_processing(False)
                 if not self._autocycle or self._cycle_gen != generation:
                     break
+                if self._hold or self._serial_queue or not status_text:
+                    continue
                 self._dashboard.set_status(
                     f"{status_text} — next in {minutes} min"
                 )
-                await self._interruptible_sleep(minutes * 60)
+                await self._interruptible_sleep(minutes * 60, generation)
         except asyncio.CancelledError:
             logger.info("Auto-cycle cancelled")
             self._cycle_busy = False
@@ -516,6 +772,8 @@ class AutomationController:
             if self._cycle_gen == generation:
                 self._autocycle = False
                 self._dashboard.set_autocycle(False)
+            if self._serial_queue and not self._autocycle and not self._dashboard.input_blocked():
+                self._kick_serial_drain()
 
 
 def _register_emergency_hotkey(controller: AutomationController) -> None:
@@ -539,6 +797,7 @@ def _register_emergency_hotkey(controller: AutomationController) -> None:
 async def _prepare_chromium(dashboard: Dashboard) -> None:
     """Start minimized Chromium before scrape and pick list can run."""
     logger = logging.getLogger("tpdeck")
+    dashboard.set_active(True)
     try:
         await ensure_debug_chromium(load_settings(), dashboard.set_status)
     except Exception as exc:
@@ -549,7 +808,55 @@ async def _prepare_chromium(dashboard: Dashboard) -> None:
         dashboard.set_status("Idle")
         logger.info("Chromium ready")
     finally:
+        dashboard.set_active(False)
         dashboard.set_actions_enabled(True)
+
+
+async def _startup(dashboard: Dashboard) -> None:
+    """Install a newer public release when one exists, then start Chromium."""
+    logger = logging.getLogger("tpdeck")
+    updated = False
+    try:
+        updated = await _apply_update(dashboard)
+    except Exception as exc:
+        message = str(exc).strip() or exc.__class__.__name__
+        logger.exception("Update failed: %s", exc)
+        dashboard.set_status(f"Error — {message}")
+    if updated:
+        logger.info("Update helper started; closing")
+        dashboard.close()
+        return
+    await _prepare_chromium(dashboard)
+
+
+async def _apply_update(dashboard: Dashboard) -> bool:
+    logger = logging.getLogger("tpdeck")
+    if not is_release_layout():
+        logger.info("Update check skipped; this is not a release install")
+        return False
+    settings = load_settings()
+    repo = str(settings.get("update_repo") or "").strip()
+    if "/" not in repo:
+        logger.info("Update check skipped; update_repo is empty")
+        return False
+    dashboard.set_active(True)
+    dashboard.set_status("Checking for updates")
+    release = await asyncio.to_thread(fetch_latest, repo)
+    if not release:
+        return False
+    tag = str(release.get("tag_name") or "")
+    if not is_newer(tag, __version__):
+        logger.info("No update; installed %s, latest %s", __version__, tag or "unknown")
+        return False
+    asset = find_windows_asset(release)
+    if asset is None:
+        logger.info("Release %s has no Windows zip", tag or "unknown")
+        return False
+    name, url = asset
+    dashboard.set_status("Downloading update")
+    logger.info("Downloading update %s", name)
+    await asyncio.to_thread(download_and_spawn, name, url, app_root())
+    return True
 
 
 def main() -> int:
@@ -563,7 +870,7 @@ def main() -> int:
 
     _configure_logging(console=keep_console)
     logger = logging.getLogger("tpdeck")
-    logger.info("TP DECK starting (v1 — Shell, Kill Switch, CDP, Scrape)")
+    logger.info("TP DECK starting (%s)", __version__)
 
     app = QApplication(sys.argv)
     app.setApplicationName("TP DECK")
@@ -579,18 +886,7 @@ def main() -> int:
         controller.start("picklist")
 
     def _batch_serial() -> None:
-        controller.hold_autocycle(True)
-        serials: list[str] = []
-        try:
-            dialog = SerialDialog(parent=dashboard)
-            order_number = ""
-            if dialog.exec() == SerialDialog.DialogCode.Accepted:
-                serials = dialog.serials()
-                order_number = dialog.order_number()
-            if serials and not controller.start("serials", serials, order_number):
-                dashboard.set_status("Error — busy, try again")
-        finally:
-            controller.hold_autocycle(False)
+        controller.open_batch_serial()
 
     def _cycle() -> None:
         controller.toggle_autocycle()
@@ -601,6 +897,12 @@ def main() -> int:
     def _settings() -> None:
         _open_settings(dashboard)
 
+    def _arm_shutdown() -> None:
+        controller.arm_shutdown()
+
+    def _shutdown() -> None:
+        controller.begin_shutdown()
+
     dashboard = Dashboard(
         on_execute=_execute,
         on_pick_list=_pick_list,
@@ -608,6 +910,8 @@ def main() -> int:
         on_cycle=_cycle,
         on_stop=_stop,
         on_open_settings=_settings,
+        on_shutdown=_shutdown,
+        on_arm_shutdown=_arm_shutdown,
     )
     controller = AutomationController(dashboard)
     controller.bind_loop(loop)
@@ -621,11 +925,12 @@ def main() -> int:
         )
 
     dashboard.set_actions_enabled(False)
+    dashboard.set_active(True)
     dashboard.set_status("Starting Chromium")
     dashboard.show()
 
     with loop:
-        loop.create_task(_prepare_chromium(dashboard), name="tpdeck-chromium")
+        loop.create_task(_startup(dashboard), name="tpdeck-startup")
         loop.run_forever()
     return 0
 

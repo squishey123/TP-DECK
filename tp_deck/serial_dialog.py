@@ -90,7 +90,7 @@ class SerialDialog(QDialog):
         layout.addWidget(self._order)
 
         self._editor = QTextEdit()
-        self._editor.setPlaceholderText("Serial numbers from Google Sheets")
+        self._editor.setPlaceholderText("Serial Numbers")
         self._editor.setAcceptRichText(False)
         layout.addWidget(self._editor)
 

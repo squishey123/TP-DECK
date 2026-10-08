@@ -383,6 +383,73 @@ def _minimize_process_tree(root_pid: int) -> int:
     return _minimize_windows(_process_tree(root_pid))
 
 
+def capture_foreground() -> tuple[int, dict[int, bool]]:
+    """Foreground window, plus whether each top-level window is minimized."""
+    if sys.platform != "win32":
+        return 0, {}
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    previous = int(user32.GetForegroundWindow() or 0)
+    iconic: dict[int, bool] = {}
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _callback(hwnd: int, _lparam: int) -> bool:
+        iconic[int(hwnd)] = bool(user32.IsIconic(hwnd))
+        return True
+
+    user32.EnumWindows.argtypes = [type(_callback), wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.EnumWindows(_callback, 0)
+    return previous, iconic
+
+
+def restore_foreground(previous: int, iconic: dict[int, bool]) -> None:
+    """Return focus to the window that was in front, and re-minimize a Chromium that popped up."""
+    if sys.platform != "win32" or not previous:
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    current = int(user32.GetForegroundWindow() or 0)
+    if current and current != previous and iconic.get(current, False):
+        user32.ShowWindow(current, _SW_SHOWMINNOACTIVE)
+    now = int(user32.GetForegroundWindow() or 0)
+    if now == previous:
+        return
+    pid = wintypes.DWORD()
+    fg_thread = int(user32.GetWindowThreadProcessId(now or current, ctypes.byref(pid)) or 0)
+    our_thread = int(kernel32.GetCurrentThreadId() or 0)
+    attached = False
+    if fg_thread and our_thread and fg_thread != our_thread:
+        attached = bool(user32.AttachThreadInput(fg_thread, our_thread, True))
+    user32.SetForegroundWindow(previous)
+    if attached:
+        user32.AttachThreadInput(fg_thread, our_thread, False)
+
+
 async def _keep_minimized(root_pid: int) -> None:
     """Keep a Chromium we just started in the taskbar.
 

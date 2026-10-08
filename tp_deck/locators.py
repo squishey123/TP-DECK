@@ -41,7 +41,9 @@ DEFAULTS: dict[str, str] = {
     ),
     "shipstation_store_status": "[title=\"Store Status\"]",
     "shipstation_update_all": "[class*=\"update-all-btn\"]",
-    "shipstation_reload": "[class*=\"reload-button-container\"]",
+    "shipstation_reload": (
+        "[class*=\"grid-header\"] [class*=\"view-details-container\"] > button"
+    ),
     "shipstation_footer": "[class*=\"count-container\"]",
     "shipstation_items": "[class*=\"shipment-items-section-content\"]",
 }

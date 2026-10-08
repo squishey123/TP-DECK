@@ -44,5 +44,6 @@
   "pick_list_exclude_prefixes": [
     "PR"
   ],
-  "pick_list_exclude_misc": true
+  "pick_list_exclude_misc": true,
+  "update_repo": "squishey123/TP-DECK"
 }

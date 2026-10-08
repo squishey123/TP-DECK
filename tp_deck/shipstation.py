@@ -247,11 +247,25 @@ async def sync_stores(
             await asyncio.sleep(0.5)
 
     await asyncio.sleep(0.5)
-    reload_button = page.locator(locators["shipstation_reload"]).first
+    selector = locators["shipstation_reload"]
+    buttons = page.locator(selector)
     try:
-        await reload_button.click(timeout=5000)
+        count = await buttons.count()
     except Exception as exc:
-        logger.warning("ShipStation reload was not clicked: %s", exc)
+        count = 0
+        logger.warning("ShipStation refresh button could not be counted: %s", exc)
+    logger.info("ShipStation refresh buttons matched: %s (%s)", count, selector)
+    if count != 1:
+        logger.warning("Expected 1 ShipStation refresh button, found %s", count)
+    if count < 1:
+        logger.warning("ShipStation reload was not clicked: button missing")
+    else:
+        try:
+            button = buttons.first
+            await button.wait_for(state="visible", timeout=5000)
+            await button.evaluate("el => el.click()")
+        except Exception as exc:
+            logger.warning("ShipStation reload was not clicked: %s", exc)
     try:
         await page.locator('[data-column="order-number"]').first.wait_for(
             state="visible",

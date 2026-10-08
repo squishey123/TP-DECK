@@ -41,6 +41,7 @@ DEFAULTS: dict[str, Any] = {
     "pick_list_exclude_locations": ["HQ", "unavailable", "LOST"],
     "pick_list_exclude_prefixes": ["PR"],
     "pick_list_exclude_misc": True,
+    "update_repo": "squishey123/TP-DECK",
 }
 
 
