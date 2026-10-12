@@ -18,7 +18,11 @@ from tp_deck.automation_engine import (
     connect_over_cdp,
     erp_wait_pair,
 )
-from tp_deck.chrome_launcher import capture_foreground, restore_foreground
+from tp_deck.chrome_launcher import (
+    capture_foreground,
+    close_listening_browsers,
+    restore_foreground,
+)
 from tp_deck.locators import load_locators
 
 logger = logging.getLogger("tpdeck")
@@ -617,8 +621,9 @@ async def _clear_order_filter(
 async def shutdown_workday(settings: dict[str, Any]) -> None:
     """Close leftover order tabs, clear the order filter, then close Chromium.
 
-    Playwright's browser.close() on a CDP connection only disconnects. Browser.close
-    over CDP asks Chromium to write the session and exit.
+    DevTools is disconnected before the window is closed. Closing through
+    CDP Browser.close while a debugger is attached marks the profile crashed,
+    and the next launch asks for a manual tab restore.
     """
     from playwright.async_api import async_playwright
 
@@ -639,29 +644,30 @@ async def shutdown_workday(settings: dict[str, Any]) -> None:
     submit_key = str(settings.get("erp_submit_key") or "Enter")
     playwright = await async_playwright().start()
     browsers: list[Browser] = []
+    cancelled = False
+    failure: Optional[Exception] = None
     try:
         for port in ready:
             browsers.append(await connect_over_cdp(playwright, port))
         for browser in browsers:
             await _close_all_details(browser, locators)
             await _clear_order_filter(browser, locators, submit_key)
-        for browser in browsers:
-            try:
-                session = await browser.new_browser_cdp_session()
-                await session.send("Browser.close")
-            except Exception as exc:
-                raise RuntimeError(f"Could not close Chromium ({exc}).") from exc
-            logger.info("Chromium closed")
+    except asyncio.CancelledError:
+        cancelled = True
+    except Exception as exc:
+        failure = exc
     finally:
-        for browser in browsers:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-        try:
-            await playwright.stop()
-        except Exception:
-            pass
+        await _disconnect_browsers(
+            playwright,
+            *browsers,
+            close_browser=False,
+            stop_timeout_s=8,
+        )
+    if cancelled:
+        raise asyncio.CancelledError()
+    await close_listening_browsers(ready)
+    if failure is not None:
+        raise failure
 
 
 async def close_detail_tab(settings: dict[str, Any], url: str) -> None:

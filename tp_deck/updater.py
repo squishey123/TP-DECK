@@ -2,7 +2,7 @@
 
 Only a release install (python\\pythonw.exe beside TP-DECK.bat) updates itself.
 A git checkout is left alone. The running process cannot overwrite its own
-interpreter, so a detached cmd helper copies the files after this process exits.
+interpreter, so a hidden PowerShell helper copies the files after this process exits.
 """
 
 from __future__ import annotations
@@ -31,28 +31,106 @@ _DOWNLOAD_DEADLINE_S = 15 * 60
 _USER_AGENT = "TP-DECK"
 _ASSET_SUFFIX = "-windows-x64.zip"
 
-# DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-_HELPER_FLAGS = 0x00000008 | 0x00000200 | 0x08000000
+# CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP.
+# DETACHED_PROCESS is left off. With no console, child programs such as
+# find.exe and timeout.exe open their own window and wait for keyboard input.
+_HELPER_FLAGS = 0x08000000 | 0x00000200
 
-_HELPER_BAT = """\
-@echo off
-setlocal
-set "PID=%~1"
-set "SRC=%~2"
-set "DEST=%~3"
-:wait
-tasklist /FI "PID eq %PID%" 2>nul | find " %PID% " >nul
-if not errorlevel 1 (
-  timeout /t 1 /nobreak >nul
-  goto wait
+_HELPER_PS1 = r"""
+param(
+  [Parameter(Mandatory = $true)][int]$WaitPid,
+  [Parameter(Mandatory = $true)][string]$Source,
+  [Parameter(Mandatory = $true)][string]$Dest,
+  [Parameter(Mandatory = $true)][string]$Stage
 )
-robocopy "%SRC%" "%DEST%" /E /NFL /NDL /NJH /NJS /XD browser /XF settings.json sku_overrides.json sku_location_cache.json tpdeck.log tpdeck.log.1 tpdeck.log.2 tpdeck.log.3 tpdeck.log.4 tpdeck.log.5
->> "%DEST%\\tp_deck\\tpdeck.log" echo Update copy finished with robocopy code %ERRORLEVEL%
-powershell -NoProfile -Command "Get-ChildItem -LiteralPath $env:DEST -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\\\browser\\\\' } | Unblock-File"
-if exist "%DEST%\\TP-DECK.bat" start "" "%DEST%\\TP-DECK.bat"
-echo %~4 | find /I "tpdeck-update-" >nul
-if not errorlevel 1 rmdir /s /q "%~4"
-exit /b 0
+$ErrorActionPreference = 'Continue'
+$marker = Join-Path $env:TEMP 'tpdeck-update-last.txt'
+
+function Note([string]$msg) {
+  $line = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' [INFO] tpdeck: ' + $msg
+  Add-Content -LiteralPath $marker -Value $line -ErrorAction SilentlyContinue
+}
+
+function Rel([string]$root, [string]$full) {
+  $base = $root.TrimEnd('\') + '\'
+  if ($full.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return $full.Substring($base.Length)
+  }
+  try {
+    $rootUri = New-Object System.Uri ($base)
+    $fullUri = New-Object System.Uri ($full)
+    $rel = [System.Uri]::UnescapeDataString($rootUri.MakeRelativeUri($fullUri).ToString())
+    return ($rel -replace '/', '\')
+  } catch {
+    return ''
+  }
+}
+
+Note ("helper start wait=" + $WaitPid)
+try { Wait-Process -Id $WaitPid -ErrorAction Stop } catch { Note ("wait ended: " + $_.Exception.Message) }
+Start-Sleep -Seconds 2
+
+$destRoot = [System.IO.Path]::GetFullPath($Dest).TrimEnd('\')
+$keepNames = @('settings.json', 'sku_overrides.json', 'sku_location_cache.json')
+$keep = Join-Path $env:TEMP ("tpdeck-keep-" + $WaitPid)
+$code = 16
+try {
+  if (Test-Path -LiteralPath $keep) { Remove-Item -LiteralPath $keep -Recurse -Force -ErrorAction SilentlyContinue }
+  New-Item -ItemType Directory -Path $keep -Force | Out-Null
+  Get-ChildItem -LiteralPath $destRoot -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+    ($keepNames -contains $_.Name) -and ($_.FullName -notmatch '\\browser\\')
+  } | ForEach-Object {
+    $rel = Rel $destRoot $_.FullName
+    if (-not $rel) { return }
+    $out = Join-Path $keep $rel
+    $dir = Split-Path -Parent $out
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Copy-Item -LiteralPath $_.FullName -Destination $out -Force
+  }
+
+  $attempt = 0
+  do {
+    $attempt++
+    & robocopy $Source $destRoot /E /NFL /NDL /NJH /NJS /R:2 /W:1 /XD browser /XF settings.json sku_overrides.json sku_location_cache.json tpdeck.log tpdeck.log.1 tpdeck.log.2 tpdeck.log.3 tpdeck.log.4 tpdeck.log.5
+    if ($null -ne $LASTEXITCODE) { $code = $LASTEXITCODE } else { $code = 0 }
+    if ($code -lt 8) { break }
+    Note ("robocopy attempt " + $attempt + " code " + $code)
+    Start-Sleep -Seconds 2
+  } while ($attempt -lt 5)
+
+  Get-ChildItem -LiteralPath $keep -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+    $rel = Rel $keep $_.FullName
+    if (-not $rel) { return }
+    $out = Join-Path $destRoot $rel
+    $dir = Split-Path -Parent $out
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Copy-Item -LiteralPath $_.FullName -Destination $out -Force
+  }
+} catch {
+  Note ("copy failed: " + $_.Exception.Message)
+} finally {
+  Remove-Item -LiteralPath $keep -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Get-ChildItem -LiteralPath $destRoot -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+  $_.FullName -notmatch '\\browser\\'
+} | Unblock-File -ErrorAction SilentlyContinue
+
+$log = Join-Path $destRoot 'tp_deck\tpdeck.log'
+$stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+Add-Content -LiteralPath $log -Value "$stamp [INFO] tpdeck: Update copy finished with robocopy code $code" -ErrorAction SilentlyContinue
+Note ("robocopy code " + $code)
+
+$bat = Join-Path $destRoot 'TP-DECK.bat'
+if (Test-Path -LiteralPath $bat) {
+  Start-Process -FilePath $bat -WorkingDirectory $destRoot
+  Note 'relaunched'
+} else {
+  Note 'TP-DECK.bat missing; did not relaunch'
+}
+if ($code -ge 8) { Note 'update copy incomplete; previous files were left in place where the copy failed' }
+if ($Stage -like '*tpdeck-update-*') { Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue }
+exit 0
 """
 
 
@@ -159,16 +237,25 @@ def extract_payload(zip_path: Path, dest: Path) -> Path:
 
 
 def spawn_helper(source: Path, dest: Path, stage: Path) -> None:
-    helper = Path(tempfile.gettempdir()) / "tpdeck-update.bat"
-    helper.write_text(_HELPER_BAT, encoding="ascii")
+    """Copy the payload after this process exits, without a visible console."""
+    helper = Path(tempfile.gettempdir()) / "tpdeck-update.ps1"
+    helper.write_text(_HELPER_PS1, encoding="ascii")
     subprocess.Popen(
         [
-            "cmd.exe",
-            "/c",
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
             str(helper),
+            "-WaitPid",
             str(os.getpid()),
+            "-Source",
             str(source),
+            "-Dest",
             str(dest),
+            "-Stage",
             str(stage),
         ],
         creationflags=_HELPER_FLAGS,

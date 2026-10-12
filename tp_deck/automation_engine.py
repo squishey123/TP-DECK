@@ -1328,19 +1328,33 @@ async def run_automation(
 async def _disconnect_browsers(
     playwright: Optional[Playwright],
     *browsers: Optional[Browser],
+    close_browser: bool = True,
+    stop_timeout_s: Optional[float] = None,
 ) -> None:
-    for browser in browsers:
-        if browser is None:
-            continue
-        try:
-            await browser.close()
-        except Exception as exc:
-            logger.debug("Browser disconnect: %s", exc)
-    if playwright is not None:
-        try:
+    """Drop the CDP connection. close_browser=False leaves Chromium running.
+
+    Safe shutdown uses that path, then closes the Chromium window after the
+    debugger is gone so the profile is not marked crashed.
+    """
+    if close_browser:
+        for browser in browsers:
+            if browser is None:
+                continue
+            try:
+                await browser.close()
+            except Exception as exc:
+                logger.debug("Browser disconnect: %s", exc)
+    if playwright is None:
+        return
+    try:
+        if stop_timeout_s:
+            await asyncio.wait_for(playwright.stop(), stop_timeout_s)
+        else:
             await playwright.stop()
-        except Exception as exc:
-            logger.debug("Playwright stop: %s", exc)
+    except asyncio.TimeoutError:
+        logger.warning("Playwright did not disconnect within %ss", stop_timeout_s)
+    except Exception as exc:
+        logger.debug("Playwright stop: %s", exc)
 
 
 async def _serial_field(page: Page, selector: str, timeout_ms: int):

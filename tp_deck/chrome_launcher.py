@@ -96,6 +96,219 @@ def _debug_port_ready(port: int) -> bool:
         return False
 
 
+def _pid_from_tcp_table(port: int) -> Optional[int]:
+    """Listener PID from the Windows TCP table. Independent of netstat's language."""
+    if sys.platform != "win32":
+        return None
+
+    import ctypes
+    import socket
+    from ctypes import wintypes
+
+    iphlpapi = ctypes.WinDLL("iphlpapi")
+    no_error = 0
+    insufficient = 122
+    af_inet = 2
+    af_inet6 = 23
+    listeners = 3
+
+    class MIB_TCPROW_OWNER_PID(ctypes.Structure):
+        _fields_ = [
+            ("dwState", wintypes.DWORD),
+            ("dwLocalAddr", wintypes.DWORD),
+            ("dwLocalPort", wintypes.DWORD),
+            ("dwRemoteAddr", wintypes.DWORD),
+            ("dwRemotePort", wintypes.DWORD),
+            ("dwOwningPid", wintypes.DWORD),
+        ]
+
+    class MIB_TCP6ROW_OWNER_PID(ctypes.Structure):
+        _fields_ = [
+            ("ucLocalAddr", ctypes.c_ubyte * 16),
+            ("dwLocalScopeId", wintypes.DWORD),
+            ("dwLocalPort", wintypes.DWORD),
+            ("ucRemoteAddr", ctypes.c_ubyte * 16),
+            ("dwRemoteScopeId", wintypes.DWORD),
+            ("dwRemotePort", wintypes.DWORD),
+            ("dwState", wintypes.DWORD),
+            ("dwOwningPid", wintypes.DWORD),
+        ]
+
+    get_table = iphlpapi.GetExtendedTcpTable
+    get_table.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.BOOL,
+        wintypes.ULONG,
+        ctypes.c_int,
+        wintypes.ULONG,
+    ]
+    get_table.restype = wintypes.DWORD
+    wanted = int(port)
+
+    def _scan(family: int, row_type: type) -> Optional[int]:
+        size = wintypes.DWORD(0)
+        status = get_table(None, ctypes.byref(size), False, family, listeners, 0)
+        if status not in (insufficient, no_error) or not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        status = get_table(buf, ctypes.byref(size), False, family, listeners, 0)
+        if status != no_error:
+            return None
+        count = int(ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD)).contents.value)
+        row_size = ctypes.sizeof(row_type)
+        base = ctypes.addressof(buf) + ctypes.sizeof(wintypes.DWORD)
+        for index in range(count):
+            row = row_type.from_address(base + index * row_size)
+            local = socket.ntohs(int(row.dwLocalPort) & 0xFFFF)
+            owner = int(row.dwOwningPid)
+            if local == wanted and owner > 0:
+                return owner
+        return None
+
+    return _scan(af_inet, MIB_TCPROW_OWNER_PID) or _scan(af_inet6, MIB_TCP6ROW_OWNER_PID)
+
+
+def _pid_from_netstat(port: int) -> Optional[int]:
+    result = subprocess.run(
+        ["netstat", "-ano", "-p", "TCP"],
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    wanted = str(int(port))
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[3].upper() != "LISTENING":
+            continue
+        _host, _sep, local_port = parts[1].rpartition(":")
+        if local_port != wanted:
+            continue
+        try:
+            return int(parts[4])
+        except ValueError:
+            continue
+    return None
+
+
+def pid_listening_on(port: int) -> Optional[int]:
+    """PID of the process listening on this TCP port."""
+    if sys.platform != "win32":
+        return None
+    return _pid_from_tcp_table(port) or _pid_from_netstat(port)
+
+
+def request_process_close(pid: int) -> int:
+    """Post WM_CLOSE to that process's visible windows. Returns how many."""
+    if sys.platform != "win32" or pid <= 0:
+        return 0
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.PostMessageW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.PostMessageW.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+    posted = 0
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _callback(hwnd: int, _lparam: int) -> bool:
+        nonlocal posted
+        if not user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+            return True
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if int(owner.value) != pid:
+            return True
+        if user32.PostMessageW(hwnd, 0x0010, 0, 0):
+            posted += 1
+        return True
+
+    user32.EnumWindows.argtypes = [type(_callback), wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.EnumWindows(_callback, 0)
+    return posted
+
+
+def _taskkill_gentle(pid: int) -> None:
+    """Ask Windows to close the process. No /F, so Chrome can write its session."""
+    if sys.platform != "win32" or pid <= 0:
+        return
+    subprocess.run(
+        ["taskkill", "/PID", str(int(pid))],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=15,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+async def wait_until_ports_closed(ports: list[int], timeout_s: float = 20.0) -> bool:
+    """True once none of the debug ports are still answering."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        ready = [port for port in ports if await asyncio.to_thread(_debug_port_ready, port)]
+        if not ready:
+            return True
+        await asyncio.sleep(0.25)
+    return False
+
+
+async def close_listening_browsers(ports: list[int]) -> None:
+    """Close Chromium the way the window X does, after DevTools has disconnected.
+
+    CDP Browser.close while a debugger is attached leaves the profile marked
+    crashed, so the next launch asks the user to restore tabs by hand.
+    """
+    pids: list[int] = []
+    for port in ports:
+        pid = await asyncio.to_thread(pid_listening_on, port)
+        if pid is None:
+            logger.warning("No process is listening on debug port %s", port)
+            continue
+        if pid not in pids:
+            pids.append(pid)
+            logger.info("Chromium debug port %s is pid %s", port, pid)
+    for pid in pids:
+        count = await asyncio.to_thread(request_process_close, pid)
+        logger.info("Posted close to %s window(s) for pid %s", count, pid)
+    if not ports:
+        return
+    if await wait_until_ports_closed(ports, timeout_s=8):
+        logger.info("Chromium exited cleanly")
+        return
+    for pid in pids:
+        logger.info("Chromium pid %s is still up; asking Windows to close it", pid)
+        try:
+            await asyncio.to_thread(_taskkill_gentle, pid)
+        except subprocess.TimeoutExpired:
+            logger.warning("Close request for pid %s timed out", pid)
+    if await wait_until_ports_closed(ports, timeout_s=12):
+        logger.info("Chromium exited cleanly")
+        return
+    logger.warning(
+        "Chromium is still listening after the close request. "
+        "It was left running so the session is not force-killed."
+    )
+
+
 def _clip(text: str, limit: int = 240) -> str:
     clean = " ".join(text.split())
     if len(clean) <= limit:

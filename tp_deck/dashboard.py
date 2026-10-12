@@ -20,6 +20,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -402,6 +403,7 @@ class ResultsWindow(QWidget):
         header_font.setBold(True)
         header_metrics = QFontMetrics(header_font)
         buyer_at: Optional[int] = None
+        char_w = max(body_metrics.horizontalAdvance("0"), 8)
         for column, header in enumerate(headers):
             if header == "Buyer":
                 longest = header_metrics.horizontalAdvance(header)
@@ -413,9 +415,8 @@ class ResultsWindow(QWidget):
                         )
                 self._table.setColumnWidth(column, longest + 28)
                 buyer_at = column
-            elif header == "Location":
-                cap = max(header_metrics.horizontalAdvance(header) + 24, 120)
-                width = min(self._table.columnWidth(column), cap)
+            elif header.casefold() in {"order", "sku", "location"}:
+                width = self._table.columnWidth(column) + char_w
                 self._table.setColumnWidth(column, max(48, width))
             else:
                 width = self._table.columnWidth(column)
@@ -815,6 +816,11 @@ class Dashboard(QMainWindow):
         self._shutting_down = False
         self._arm_started = 0.0
         self._fade = 0.0
+        self._update_warning = False
+        self._update_cancelled = False
+        self._update_started = 0.0
+        self._update_restore_enabled: Optional[list[bool]] = None
+        self._quitting = False
 
         self.setWindowTitle("TP DECK")
         self.setWindowFlags(
@@ -823,6 +829,8 @@ class Dashboard(QMainWindow):
         self._cycle_waiting = False
         self._arm_timer = QTimer(self)
         self._arm_timer.timeout.connect(self._tick_shutdown_arm)
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._tick_update_warning)
         self.setFixedSize(300, 356)
         self.setStyleSheet(THEME_QSS)
 
@@ -940,6 +948,12 @@ class Dashboard(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt override
         self._persist_position()
         super().closeEvent(event)
+        if self._quitting:
+            return
+        self._quitting = True
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def set_status(self, text: str) -> None:
         raw = str(text or "").strip()
@@ -959,8 +973,8 @@ class Dashboard(QMainWindow):
         self._apply_lamp()
 
     def input_blocked(self) -> bool:
-        """True while shutdown is armed or already running. Emergency Stop still works."""
-        return self._armed or self._shutting_down
+        """True while shutdown or an update warning is in progress. Emergency Stop still works."""
+        return self._armed or self._shutting_down or self._update_warning
 
     def _apply_lamp(self) -> None:
         if self._active or self._serial_queued:
@@ -989,6 +1003,63 @@ class Dashboard(QMainWindow):
         self._shutting_down = False
         self._arm_timer.stop()
         self._apply_fade(0.0)
+
+    def begin_update_warning(self) -> None:
+        """Pulse the blue action buttons orange so an update can be cancelled."""
+        buttons = (self.execute_btn, self.pick_btn, self.batch_btn)
+        self._update_restore_enabled = [button.isEnabled() for button in buttons]
+        self._update_cancelled = False
+        self._update_warning = True
+        self._update_started = time.monotonic()
+        for button in buttons:
+            button.setEnabled(True)
+        self._paint_update_pulse(1.0)
+        if not self._update_timer.isActive():
+            self._update_timer.start(33)
+
+    def cancel_update_warning(self) -> bool:
+        """Stop the pulse. True only when a warning was still running."""
+        if not self._update_warning:
+            return False
+        self._update_cancelled = True
+        self.end_update_warning()
+        return True
+
+    def update_warning_cancelled(self) -> bool:
+        return self._update_cancelled
+
+    def end_update_warning(self) -> None:
+        self._update_warning = False
+        self._update_timer.stop()
+        buttons = (self.execute_btn, self.pick_btn, self.batch_btn)
+        for button in buttons:
+            button.setStyleSheet("")
+        saved = getattr(self, "_update_restore_enabled", None)
+        if saved is not None:
+            for button, enabled in zip(buttons, saved):
+                button.setEnabled(enabled)
+            self._update_restore_enabled = None
+
+    def _tick_update_warning(self) -> None:
+        if not self._update_warning:
+            return
+        elapsed = time.monotonic() - self._update_started
+        amount = (math.sin(elapsed * math.tau / 0.8) + 1.0) / 2.0
+        self._paint_update_pulse(amount)
+
+    def _paint_update_pulse(self, amount: float) -> None:
+        bg = _mix_hex("#0EA5E9", "#F97316", amount)
+        rule = (
+            f"background-color: {bg}; color: #0F172A; "
+            f"border: 1px solid {bg}; font-weight: bold;"
+        )
+        qss = (
+            "QPushButton#executeBtn, QPushButton#pickBtn, QPushButton#batchBtn, "
+            "QPushButton#executeBtn:disabled, QPushButton#pickBtn:disabled, "
+            f"QPushButton#batchBtn:disabled {{ {rule} }}"
+        )
+        for button in (self.execute_btn, self.pick_btn, self.batch_btn):
+            button.setStyleSheet(qss)
 
     def mark_shutting_down(self) -> None:
         self._armed = False
@@ -1211,7 +1282,7 @@ class Dashboard(QMainWindow):
             self._on_stop()
 
     def _handle_power(self) -> None:
-        if self._armed or self._shutting_down:
+        if self._armed or self._shutting_down or self._update_warning:
             return
         if self._on_arm_shutdown:
             self._on_arm_shutdown()

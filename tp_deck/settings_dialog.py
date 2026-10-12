@@ -147,7 +147,7 @@ The power button shuts down for the day. The panel fades to grey for 5 seconds. 
 
 Emergency Stop and the Pause key cancel the current run.
 
-On a release install, opening TP DECK downloads a newer GitHub release when one is published and keeps the browser profile and settings.
+On a release install, opening TP DECK checks for a newer GitHub release. The blue buttons pulse orange for 5 seconds first. Emergency Stop cancels that update until the next launch. An update keeps the browser profile, settings, and saved SKUs.
 """
 
 
@@ -351,7 +351,7 @@ class SettingsDialog(QDialog):
             hold_minutes = 5
         self.refresh_hold_spin.setValue(max(1, min(180, hold_minutes)))
         self.results_popup_check.setChecked(
-            bool(settings.get("show_results_popup", False))
+            bool(settings.get("show_results_popup", True))
         )
         try:
             cycle_minutes = int(settings.get("ebay_autocycle_minutes", 10))
@@ -403,6 +403,7 @@ class SettingsDialog(QDialog):
             ebay_refresh_hold_enabled=self.refresh_hold_check.isChecked(),
             ebay_refresh_hold_minutes=self.refresh_hold_spin.value(),
             show_results_popup=self.results_popup_check.isChecked(),
+            show_results_popup_user_set=True,
             ebay_autocycle_minutes=self.autocycle_spin.value(),
             shipstation_sync_every_cycles=self.shipstation_every_spin.value(),
             serial_timeout_ms=self.serial_timeout_spin.value(),

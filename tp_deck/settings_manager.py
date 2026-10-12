@@ -32,7 +32,7 @@ DEFAULTS: dict[str, Any] = {
     "slow_razor_multiplier": 10,
     "ebay_refresh_hold_enabled": True,
     "ebay_refresh_hold_minutes": 5,
-    "show_results_popup": False,
+    "show_results_popup": True,
     "ebay_autocycle_minutes": 10,
     "shipstation_url_pattern": "shipstation.com/orders/awaiting-shipment",
     "shipstation_sync_every_cycles": 3,
@@ -61,8 +61,16 @@ def load_settings() -> dict[str, Any]:
         logger.error("Failed to read settings.json: %s — using defaults", exc)
         return DEFAULTS.copy()
 
+    if not isinstance(data, dict):
+        logger.error("settings.json was not an object — using defaults")
+        return DEFAULTS.copy()
+
     merged = DEFAULTS.copy()
     merged.update(data)
+    # Older installs shipped this off. Treat that as the old default until
+    # the user saves Settings, which records show_results_popup_user_set.
+    if not data.get("show_results_popup_user_set"):
+        merged["show_results_popup"] = True
     return merged
 
 

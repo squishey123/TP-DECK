@@ -245,12 +245,17 @@ class AutomationController:
         drain_running = (
             self._drain_task is not None and not self._drain_task.done()
         )
+        update_cancelled = self._dashboard.cancel_update_warning()
         if not manual_running and not cycle_running and not drain_running:
-            if shutdown_running:
+            if update_cancelled:
+                logger.info("Update cancelled — will try again next launch")
+            elif shutdown_running:
                 logger.info("Emergency stop — cancelling shutdown")
             elif not close_running:
                 logger.info("Emergency stop — no active task")
             return
+        if update_cancelled:
+            logger.info("Update cancelled — will try again next launch")
         logger.info("Emergency stop — cancelling task")
         self._autocycle = False
         self._cycle_passes = 0
@@ -528,7 +533,7 @@ class AutomationController:
         if (
             result is not None
             and result.job in {"orders", "picklist"}
-            and bool(load_settings().get("show_results_popup", False))
+            and bool(load_settings().get("show_results_popup", True))
         ):
             self._dashboard.show_results(
                 list(result.headers),
@@ -876,10 +881,28 @@ async def _apply_update(dashboard: Dashboard) -> bool:
         logger.info("Release %s has no Windows zip", tag or "unknown")
         return False
     name, url = asset
+    logger.info("Update %s is ready", tag or name)
+    if await _confirm_update(dashboard):
+        return False
     dashboard.set_status("Downloading update")
     logger.info("Downloading update %s", name)
     await asyncio.to_thread(download_and_spawn, name, url, app_root())
     return True
+
+
+async def _confirm_update(dashboard: Dashboard) -> bool:
+    """Pulse the action buttons for 5 seconds. True when Emergency Stop cancelled."""
+    dashboard.set_status("Update starting — Emergency Stop to cancel")
+    dashboard.begin_update_warning()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if dashboard.update_warning_cancelled():
+                return True
+            await asyncio.sleep(0.05)
+        return dashboard.update_warning_cancelled()
+    finally:
+        dashboard.end_update_warning()
 
 
 def main() -> int:
@@ -902,7 +925,10 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("TP DECK")
-    app.setQuitOnLastWindowClosed(True)
+    # The dashboard is a tool window, so Qt does not count it as a main window.
+    # Leaving this on makes closing Settings, Batch Serial, or a sister-SKU
+    # dialog quit the process. The dashboard closeEvent quits explicitly.
+    app.setQuitOnLastWindowClosed(False)
 
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
