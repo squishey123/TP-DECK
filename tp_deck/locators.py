@@ -35,6 +35,10 @@ DEFAULTS: dict[str, str] = {
     "sales_order_filter": (
         "#ag-grid .ag-header-row-floating-filter > div:nth-child(1) input"
     ),
+    "sales_order_external_filter": (
+        "#ag-grid .ag-header-viewport "
+        ".ag-header-row-floating-filter > div:nth-child(11)"
+    ),
     "sales_order_rows": "#ag-grid .ag-center-cols-container .ag-row",
     "service_order_label": (
         "#div_PageSalesOrder .wrap-sales-list > ul:nth-child(2) > li:nth-child(2)"
@@ -46,6 +50,7 @@ DEFAULTS: dict[str, str] = {
     ),
     "shipstation_footer": "[class*=\"count-container\"]",
     "shipstation_items": "[class*=\"shipment-items-section-content\"]",
+    "shipstation_drawer": "[class*=\"drawer-container\"]",
 }
 
 _MOVED_SETTING_KEYS = ("selectors", "sales_order_url_pattern")

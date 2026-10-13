@@ -30,6 +30,7 @@ StoreProgress = Callable[[int, int, str], Awaitable[None]]
 
 _ITEM_COUNT = re.compile(r"^\(\s*\d+\s+items?\s*\)$", re.IGNORECASE)
 _COMBINED = re.compile(r"^\(?\s*multiple\s*\)?$", re.IGNORECASE)
+_EBAY_ORDER = re.compile(r"^\d{2}-\d{5}-\d{5}$")
 
 
 def _label(text: str) -> str:
@@ -56,36 +57,38 @@ def is_usable_sku(sku: str) -> bool:
     return True
 
 
+def is_ebay_order_number(order_number: str) -> bool:
+    """Seller Hub order ids look like 12-34567-89012. That scrape owns them."""
+    return _EBAY_ORDER.match(_label(order_number)) is not None
+
+
+def is_management_order(order_number: str) -> bool:
+    """INV2 orders are custom and handled by management."""
+    return _label(order_number).upper().startswith("INV2")
+
+
 def classify_store_row(order_number: str, sku: str) -> str:
     """combined, multi, store, or skip.
 
     combined: a '(Multiple)' shipment summary, often with SKU '(2 Items)'.
-    multi: a real store order whose SKU cell is an item count, not a SKU.
-    store: a store order with a real SKU.
-    skip: an eBay order or any other row the eBay scrape already covers.
+    multi: one order whose SKU cell is an item count, not a SKU. The SKUs
+    are only in the order drawer.
+    store: one non-eBay order with a real SKU in the grid.
+    skip: an eBay order, or an INV2 order handled by management.
     """
-    if is_combined_order(order_number) or (
-        is_item_count_label(sku) and not is_store_order(order_number)
-    ):
+    if is_combined_order(order_number):
         return "combined"
-    if not is_store_order(order_number):
+    text = _label(order_number)
+    if (
+        not text
+        or text.startswith("(")
+        or is_ebay_order_number(text)
+        or is_management_order(text)
+    ):
         return "skip"
     if not is_usable_sku(sku):
         return "multi"
     return "store"
-
-
-def is_store_order(order_number: str) -> bool:
-    """Store orders are order numbers with no hyphen.
-
-    Combined-shipment rows are labeled '(Multiple)' and are not store orders.
-    """
-    text = _label(order_number)
-    if not text or "-" in text or text.startswith("("):
-        return False
-    if is_combined_order(text) or is_item_count_label(text):
-        return False
-    return True
 
 
 def parse_updated(text: str) -> Optional[datetime]:
@@ -233,6 +236,8 @@ async def sync_stores(
 
     A store still syncing at three minutes is logged. The reload still runs.
     """
+    drawer_selector = locators.get("shipstation_drawer") or "[class*='drawer-container']"
+    await _dismiss_drawer(page, drawer_selector)
     trigger = page.locator(locators["shipstation_store_status"]).first
     try:
         await trigger.hover(timeout=3000)
@@ -510,31 +515,74 @@ async def _has_order_button(page: Page, row_id: str) -> bool:
         return False
 
 
-async def _open_items(page: Page, row_id: str, items_selector: str) -> str:
-    if not await _has_order_button(page, row_id):
-        raise RuntimeError(f"store order {row_id} has no order button")
-    button = page.locator(
-        f'[data-column="order-number"][data-row-id="{row_id}"] button'
-    ).first
-    await button.click(timeout=5000)
-    section = page.locator(items_selector).first
-    await section.wait_for(state="visible", timeout=15000)
+async def _drawer_is_open(page: Page, drawer_selector: str) -> bool:
     try:
-        return str(await section.inner_text() or "")
-    except Exception:
-        return ""
+        opened = await page.evaluate(
+            """(selector) => {
+                const el = document.querySelector(selector);
+                if (!el) return false;
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 40
+                    && rect.height > 40;
+            }""",
+            drawer_selector,
+        )
+    except Exception as exc:
+        logger.info("ShipStation drawer state unreadable: %s", exc)
+        return False
+    return bool(opened)
 
 
-async def _close_items(page: Page, items_selector: str) -> None:
+async def _dismiss_drawer(page: Page, drawer_selector: str) -> None:
+    """Close a drawer left open by the previous order.
+
+    A real mouse click cannot reach the order list while that drawer is up.
+    The next order's SKUs are only inside its own drawer.
+    """
+    if not await _drawer_is_open(page, drawer_selector):
+        return
     try:
         await page.keyboard.press("Escape")
-        await page.locator(items_selector).first.wait_for(state="hidden", timeout=3000)
     except Exception:
-        if "/order/" in (page.url or ""):
-            try:
-                await page.go_back(wait_until="domcontentloaded", timeout=15000)
-            except Exception as exc:
-                logger.info("Could not leave the ShipStation order: %s", exc)
+        pass
+    deadline = asyncio.get_running_loop().time() + 3
+    while await _drawer_is_open(page, drawer_selector):
+        if asyncio.get_running_loop().time() >= deadline:
+            logger.info("ShipStation drawer stayed open after close")
+            break
+        try:
+            await page.evaluate(
+                """(selector) => {
+                    const drawer = document.querySelector(selector);
+                    if (!drawer) return;
+                    const button = [...drawer.querySelectorAll('button')].find((el) => {
+                        const label = (
+                            el.getAttribute('aria-label')
+                            || el.getAttribute('title')
+                            || ''
+                        ).toLowerCase();
+                        return label === 'close' || label.includes('close');
+                    });
+                    if (button) {
+                        button.click();
+                        return;
+                    }
+                    const backdrop = document.querySelector('[class*="drawer-background"]');
+                    if (backdrop) backdrop.click();
+                }""",
+                drawer_selector,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
+    if "/order/" in (page.url or ""):
+        try:
+            await page.go_back(wait_until="domcontentloaded", timeout=15000)
+        except Exception as exc:
+            logger.info("Could not leave the ShipStation order: %s", exc)
     try:
         await page.locator('[data-column="order-number"]').first.wait_for(
             state="visible",
@@ -542,6 +590,139 @@ async def _close_items(page: Page, items_selector: str) -> None:
         )
     except Exception:
         logger.info("ShipStation order list did not return after the drawer")
+
+
+async def _read_item_text(
+    page: Page,
+    items_selector: str,
+    drawer_selector: str,
+) -> str:
+    try:
+        text = await page.evaluate(
+            """({ items, drawer }) => {
+                const section = document.querySelector(items);
+                const panel = document.querySelector(drawer);
+                const sectionText = section ? (section.innerText || '') : '';
+                if (/SKU\\s*:/i.test(sectionText)) return sectionText;
+                return panel ? (panel.innerText || '') : sectionText;
+            }""",
+            {"items": items_selector, "drawer": drawer_selector},
+        )
+    except Exception as exc:
+        logger.info("ShipStation drawer text unreadable: %s", exc)
+        return ""
+    return str(text or "")
+
+
+async def _expand_drawer_items(
+    page: Page,
+    items_selector: str,
+    drawer_selector: str,
+) -> None:
+    try:
+        await page.evaluate(
+            """({ items, drawer }) => {
+                const section = document.querySelector(items);
+                const panel = document.querySelector(drawer);
+                if (!panel) return;
+                if (section && /SKU\\s*:/i.test(section.innerText || '')) return;
+                const header = section ? section.previousElementSibling : null;
+                if (header) {
+                    header.click();
+                    return;
+                }
+                const button = [...panel.querySelectorAll('button, [role="button"]')].find((el) => {
+                    const label = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return /\\bitems?\\b/i.test(label) && label.length < 40;
+                });
+                if (button) button.click();
+            }""",
+            {"items": items_selector, "drawer": drawer_selector},
+        )
+    except Exception as exc:
+        logger.info("Could not expand ShipStation items: %s", exc)
+
+
+async def _wait_for_item_text(
+    page: Page,
+    items_selector: str,
+    drawer_selector: str,
+    previous: str = "",
+) -> str:
+    """Wait until the drawer shows SKU lines that are not the previous order."""
+    deadline = asyncio.get_running_loop().time() + 15
+    expanded = False
+    prior = previous.strip()
+    while asyncio.get_running_loop().time() < deadline:
+        text = await _read_item_text(page, items_selector, drawer_selector)
+        fresh = text.strip() != prior
+        if fresh and re.search(r"SKU\s*:", text, re.IGNORECASE):
+            return text
+        if not expanded:
+            expanded = True
+            await _expand_drawer_items(page, items_selector, drawer_selector)
+        await asyncio.sleep(0.25)
+    text = await _read_item_text(page, items_selector, drawer_selector)
+    if text.strip() == prior:
+        return ""
+    return text
+
+
+async def _open_items(
+    page: Page,
+    row_id: str,
+    items_selector: str,
+    drawer_selector: str,
+) -> str:
+    """Open the order drawer and return its item text.
+
+    The grid cell for a multi-item store order says '(4 Items)' and does
+    not contain SKUs. Playwright's mouse click times out once a drawer is
+    already open, because the drawer covers the order button. Close that
+    drawer, then fire the button's own click.
+    """
+    await _dismiss_drawer(page, drawer_selector)
+    previous = await _read_item_text(page, items_selector, drawer_selector)
+    if not await _has_order_button(page, row_id):
+        raise RuntimeError(f"store order {row_id} has no order button")
+    try:
+        await page.evaluate(
+            """(rowId) => {
+                const button = document.querySelector(
+                    '[data-column="order-number"][data-row-id="'
+                    + CSS.escape(rowId) + '"] button'
+                );
+                if (button) {
+                    button.scrollIntoView({ block: 'center', inline: 'nearest' });
+                }
+            }""",
+            row_id,
+        )
+    except Exception as exc:
+        logger.info("Could not scroll store order %s into view: %s", row_id, exc)
+    await asyncio.sleep(0.15)
+    button = page.locator(
+        f'[data-column="order-number"][data-row-id="{row_id}"] button'
+    ).first
+    await button.evaluate("el => el.click()")
+    text = await _wait_for_item_text(
+        page,
+        items_selector,
+        drawer_selector,
+        previous,
+    )
+    if not re.search(r"SKU\s*:", text, re.IGNORECASE):
+        raise RuntimeError("the order drawer did not list any SKUs")
+    return text
+
+
+async def _close_items(
+    page: Page,
+    items_selector: str,
+    drawer_selector: str,
+) -> None:
+    del items_selector
+    await _dismiss_drawer(page, drawer_selector)
 
 
 async def _reveal_children(
@@ -578,23 +759,20 @@ async def _lines_from_drawer(
     buyer: str,
     sku: str,
     items_selector: str,
+    drawer_selector: str,
 ) -> Optional[list[tuple[str, str, str, int]]]:
-    """Read SKUs from the order drawer. None means the drawer was not opened."""
+    """Read every SKU from the order drawer. None means it did not open."""
     if not await _has_order_button(page, row_id):
         return None
     try:
-        text = await _open_items(page, row_id, items_selector)
+        text = await _open_items(page, row_id, items_selector, drawer_selector)
     except Exception as exc:
         logger.warning("Could not open store order %s: %s", order_id, exc)
         return None
     parsed = [
         item for item in parse_shipment_items(text) if is_usable_sku(item[0])
     ]
-    if is_usable_sku(sku) and parsed:
-        matched = [item for item in parsed if item[0].casefold() == sku.casefold()]
-        chosen = matched or parsed
-    else:
-        chosen = parsed
+    chosen = parsed
     if not chosen and is_usable_sku(sku):
         chosen = [(sku, 1, True)]
     lines: list[tuple[str, str, str, int]] = []
@@ -606,8 +784,14 @@ async def _lines_from_drawer(
                 item_sku,
             )
         lines.append((order_id, buyer, item_sku, qty))
+    if lines:
+        logger.info(
+            "Store order %s: %s SKU(s) from the drawer",
+            order_id,
+            len(lines),
+        )
     try:
-        await _close_items(page, items_selector)
+        await _close_items(page, items_selector, drawer_selector)
     except Exception as exc:
         logger.info("Drawer close for %s: %s", order_id, exc)
     return lines
@@ -620,16 +804,21 @@ async def scrape_store_orders(
     need_qty: bool,
     on_status: Optional[Callable[[str], None]] = None,
 ) -> list[tuple[str, str, str, int]]:
-    """Read store orders (no hyphen).
+    """Read non-eBay orders from the awaiting-shipment grid.
 
     A combined shipment is one grid row labeled '(Multiple)' with a SKU
     cell of '(2 Items)'. That text is not a SKU. Child orders are their
     own rows once the group is expanded, and eBay orders among them are
-    left to the eBay scrape.
+    left to the eBay scrape. Orders that begin with INV2 are custom and
+    ignored. Any other order whose SKU cell is an item count is opened
+    so the drawer can supply the SKUs.
     """
     rows = await _collect_grid(page, locators["shipstation_footer"])
     lines: list[tuple[str, str, str, int]] = []
     items_selector = locators["shipstation_items"]
+    drawer_selector = (
+        locators.get("shipstation_drawer") or "[class*='drawer-container']"
+    )
     pending = list(rows)
     seen = {row["id"] for row in pending if row["id"]}
     index = 0
@@ -652,6 +841,8 @@ async def scrape_store_orders(
             continue
 
         if kind == "skip":
+            if is_management_order(order_id):
+                logger.info("Skipping management order %s", order_id)
             continue
 
         _note(on_status, f"Reading store order {order_id}")
@@ -663,6 +854,7 @@ async def scrape_store_orders(
                 buyer,
                 "",
                 items_selector,
+                drawer_selector,
             )
             if drawer:
                 lines.extend(drawer)
@@ -699,6 +891,7 @@ async def scrape_store_orders(
             buyer,
             sku,
             items_selector,
+            drawer_selector,
         )
         if drawer:
             lines.extend(drawer)

@@ -141,7 +141,7 @@ Scrape eBay Orders and Generate Pick List also read store orders from the open S
 
 Generate Pick List does the same lookup and copies a walk-sorted quantity list.
 
-Batch Serial types serial numbers into a Razor sales order. A service order number opens that order first; a blank number uses the one open order tab.
+Batch Serial types serial numbers into a Razor sales order. An SO number, an eBay order number, or a store order number opens that order first. A blank number uses the one open order tab.
 
 The power button shuts down for the day. The panel fades to grey for 5 seconds. Emergency Stop during that fade cancels it. Otherwise TP DECK finishes the current task, closes extra sales-order tabs, and closes Chromium.
 

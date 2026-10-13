@@ -28,6 +28,8 @@ from tp_deck.locators import load_locators
 logger = logging.getLogger("tpdeck")
 
 _SO_PREFIX = re.compile(r"^so-", re.IGNORECASE)
+_EBAY_ORDER = re.compile(r"\d{2}-\d{5}-\d{5}")
+_DIGITS = re.compile(r"^\d+$")
 _TOKEN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 
 
@@ -36,6 +38,28 @@ def order_key(value: str) -> str:
     text = re.sub(r"\s+", " ", (value or "")).strip()
     text = _SO_PREFIX.sub("", text, count=1)
     return text.casefold()
+
+
+def normalize_order_number(value: str) -> str:
+    """Trim spaces and rewrite any so-/So-/SO- prefix as SO-."""
+    text = re.sub(r"\s+", " ", (value or "")).strip()
+    if not _SO_PREFIX.match(text):
+        return text
+    return "SO-" + _SO_PREFIX.sub("", text, count=1)
+
+
+def external_order_number(value: str) -> bool:
+    """True for an eBay order or a digits-only store order.
+
+    Those search the external-order column. An SO-prefixed number stays on
+    the service-order column. The SO- prefix is case-insensitive.
+    """
+    text = re.sub(r"\s+", "", (value or "").strip())
+    if not text or _SO_PREFIX.match(text):
+        return False
+    if _EBAY_ORDER.fullmatch(text):
+        return True
+    return _DIGITS.fullmatch(text) is not None
 
 
 def order_labels_match(typed: str, label: str) -> bool:
@@ -120,6 +144,29 @@ async def wait_for_service_order_match(
                 text = await label.inner_text()
                 last = re.sub(r"\s+", " ", str(text or "")).strip()
                 if order_labels_match(expected, last):
+                    return last
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return last
+
+
+async def wait_for_service_order_text(
+    page: Page,
+    selector: str,
+    timeout_ms: int,
+) -> str:
+    """Poll until the service order label has any text. Always wait at least 15s."""
+    wait_ms = max(15000, int(timeout_ms))
+    deadline = time.monotonic() + (wait_ms / 1000.0)
+    label = page.locator(selector).first
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            if await label.count() > 0 and await label.is_visible():
+                text = await label.inner_text()
+                last = re.sub(r"\s+", " ", str(text or "")).strip()
+                if last:
                     return last
         except Exception:
             pass
@@ -295,6 +342,8 @@ async def _wait_for_filter_rows(
     row_selector: str,
     original: str,
     timeout_ms: int,
+    *,
+    accept_lone_row: bool = False,
 ) -> tuple[int, str, Optional[Any]]:
     """Wait until a pinned or center row shows the order number.
 
@@ -307,6 +356,7 @@ async def _wait_for_filter_rows(
     last_snapshot: list[dict[str, Any]] = []
     announced = False
     scrolled: set[str] = set()
+    lone_seen = 0
     while time.monotonic() < deadline:
         try:
             if await loading.count() > 0 and await loading.is_visible():
@@ -324,6 +374,15 @@ async def _wait_for_filter_rows(
             return 1, matched, _row_target(page, row_id, row_selector)
         if len(visible_matches) > 1:
             return len(visible_matches), "", None
+        visible_rows = [item for item in last_snapshot if item.get("visible")]
+        if accept_lone_row and len(visible_rows) == 1 and not visible_matches:
+            lone_seen += 1
+            if lone_seen >= 2:
+                row_id = str(visible_rows[0].get("rowId") or "").strip()
+                logger.info("Using the only visible order row for %s", original)
+                return 1, original, _row_target(page, row_id, row_selector)
+        else:
+            lone_seen = 0
         hidden = _matched_rows(last_snapshot, original, visible_only=False)
         if len(hidden) == 1:
             row_id = hidden[0][0]
@@ -353,6 +412,10 @@ async def _wait_for_filter_rows(
     if len(matches) > 1:
         return len(matches), "", None
     visible = [item for item in last_snapshot if item.get("visible")]
+    if accept_lone_row and len(visible) == 1:
+        row_id = str(visible[0].get("rowId") or "").strip()
+        logger.info("Using the only visible order row for %s", original)
+        return 1, original, _row_target(page, row_id, row_selector)
     if len(visible) == 1:
         text = " ".join(
             str(cell or "").strip()
@@ -391,6 +454,29 @@ async def _click_order_row(row: Any, order_number: str) -> None:
     await row.locator(".ag-cell").first.click()
 
 
+async def _clear_filter_if_set(page: Page, selector: str, submit_key: str) -> bool:
+    """Empty one floating filter when a previous search left text in it."""
+    if not selector:
+        return False
+    root = page.locator(selector).first
+    try:
+        if await root.count() == 0:
+            return False
+        inner = root.locator("input:not([type='hidden'])")
+        field = inner.first if await inner.count() > 0 else root
+        current = await field.input_value(timeout=1000)
+        if not str(current or "").strip():
+            return False
+        await field.fill("", timeout=3000)
+        key = (submit_key or "").strip()
+        if key:
+            await field.press(key)
+    except Exception as exc:
+        logger.info("Could not clear order filter %s: %s", selector, exc)
+        return False
+    return True
+
+
 async def _filter_order_list(
     page: Page,
     order_number: str,
@@ -400,7 +486,27 @@ async def _filter_order_list(
     overlay_ms: int,
     submit_key: str,
 ) -> Any:
-    field = await _input_field(page, locators["sales_order_filter"], timeout_ms)
+    external = external_order_number(order_number)
+    primary = (
+        locators["sales_order_external_filter"]
+        if external
+        else locators["sales_order_filter"]
+    )
+    other = (
+        locators["sales_order_filter"]
+        if external
+        else locators.get("sales_order_external_filter", "")
+    )
+    if external:
+        logger.info("Searching the external order column for %s", order_number.strip())
+    overlay = page.locator("#ag-grid .ag-overlay-loading-wrapper")
+    if await _clear_filter_if_set(page, other, submit_key):
+        try:
+            await overlay.wait_for(state="visible", timeout=overlay_ms)
+            await overlay.wait_for(state="hidden", timeout=timeout_ms)
+        except Exception:
+            await asyncio.sleep(0.4)
+    field = await _input_field(page, primary, timeout_ms)
     query = order_number.strip()
     await field.click()
     await field.fill("")
@@ -408,7 +514,6 @@ async def _filter_order_list(
     key = (submit_key or "").strip()
     if key:
         await field.press(key)
-    overlay = page.locator("#ag-grid .ag-overlay-loading-wrapper")
     try:
         await overlay.wait_for(state="visible", timeout=overlay_ms)
         await overlay.wait_for(state="hidden", timeout=timeout_ms)
@@ -419,6 +524,7 @@ async def _filter_order_list(
         locators["sales_order_rows"],
         order_number,
         timeout_ms,
+        accept_lone_row=external,
     )
     if row is not None:
         return row
@@ -526,21 +632,23 @@ async def prepare_sales_order(
     locators = load_locators()
     detail_pattern = locators["sales_order_detail_pattern"]
     list_pattern = locators["sales_orders_url_pattern"]
-    typed = (order_number or "").strip()
+    typed = normalize_order_number(order_number)
+    external = external_order_number(typed)
     details = _detail_pages(browser, detail_pattern, list_pattern)
     keeper: Optional[Page] = None
 
     if typed:
-        for page in details:
-            label = await read_service_order(
-                page,
-                locators["service_order_label"],
-                timeout_ms,
-            )
-            if order_labels_match(typed, label):
-                keeper = page
-                logger.info("Reusing sales order tab %s (%s)", page.url, label)
-                break
+        if not external:
+            for page in details:
+                label = await read_service_order(
+                    page,
+                    locators["service_order_label"],
+                    timeout_ms,
+                )
+                if order_labels_match(typed, label):
+                    keeper = page
+                    logger.info("Reusing sales order tab %s (%s)", page.url, label)
+                    break
         if keeper is None:
             keeper = await _open_order_from_list(
                 browser,
@@ -551,22 +659,34 @@ async def prepare_sales_order(
                 overlay_ms=overlay_ms,
                 submit_key=submit_key,
             )
-        label = await wait_for_service_order_match(
-            keeper,
-            locators["service_order_label"],
-            typed,
-            timeout_ms,
-        )
-        if not order_labels_match(typed, label):
-            raise RuntimeError(
-                f"Opened order does not match {typed}"
-                + (f" ({label})." if label else ".")
+        if external:
+            label = await wait_for_service_order_text(
+                keeper,
+                locators["service_order_label"],
+                timeout_ms,
             )
+            if not label:
+                raise RuntimeError(
+                    f"Opened order for {typed} did not show a service order number."
+                )
+            logger.info("Opened %s as service order %s", typed, label)
+        else:
+            label = await wait_for_service_order_match(
+                keeper,
+                locators["service_order_label"],
+                typed,
+                timeout_ms,
+            )
+            if not order_labels_match(typed, label):
+                raise RuntimeError(
+                    f"Opened order does not match {typed}"
+                    + (f" ({label})." if label else ".")
+                )
     else:
         if not details:
             raise RuntimeError("No sales order tab is open.")
         if len(details) > 1:
-            raise RuntimeError("Type a service order number.")
+            raise RuntimeError("Type an SO number, eBay order, or store order.")
         keeper = details[0]
         logger.info("Using the open sales order tab: %s", keeper.url)
 
@@ -595,7 +715,10 @@ async def _clear_order_filter(
     """Empty the sales-order search so the restored list is not stuck on one order."""
     list_pattern = locators["sales_orders_url_pattern"]
     detail_pattern = locators["sales_order_detail_pattern"]
-    selector = locators["sales_order_filter"]
+    selectors = [
+        locators["sales_order_filter"],
+        locators.get("sales_order_external_filter", ""),
+    ]
     foreground = capture_foreground()
     try:
         for page in _iter_pages(browser):
@@ -604,16 +727,23 @@ async def _clear_order_filter(
                 continue
             if _is_detail_url(url, detail_pattern, list_pattern):
                 continue
-            field = page.locator(selector).first
-            try:
-                await field.fill("", timeout=3000)
-                key = (submit_key or "").strip()
-                if key:
-                    await field.press(key)
-            except Exception as exc:
-                logger.info("Could not clear the sales order filter on %s: %s", url, exc)
-            else:
-                logger.info("Cleared sales order filter on %s", url)
+            for selector in selectors:
+                if not selector:
+                    continue
+                try:
+                    root = page.locator(selector).first
+                    inner = root.locator("input:not([type='hidden'])")
+                    field = inner.first if await inner.count() > 0 else root
+                    await field.fill("", timeout=3000)
+                    key = (submit_key or "").strip()
+                    if key:
+                        await field.press(key)
+                except Exception as exc:
+                    logger.info(
+                        "Could not clear the order filter on %s: %s", url, exc
+                    )
+                else:
+                    logger.info("Cleared order filter on %s", url)
     finally:
         restore_foreground(*foreground)
 

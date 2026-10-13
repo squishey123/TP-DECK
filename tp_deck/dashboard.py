@@ -289,9 +289,14 @@ class ResultsWindow(QWidget):
         self.setWindowFlags(
             Qt.WindowType.Window
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
         )
+        self.setMinimumSize(420, 180)
         self.setStyleSheet(RESULTS_QSS)
+        self._unknown_rows: list[bool] = []
+        self._filling = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -321,7 +326,8 @@ class ResultsWindow(QWidget):
             QHeaderView.ResizeMode.Interactive
         )
         self._table.setVisible(False)
-        layout.addWidget(self._table)
+        self._table.itemChanged.connect(self._on_result_checked)
+        layout.addWidget(self._table, 1)
 
         self._text = QTextEdit()
         self._text.setObjectName("resultsText")
@@ -344,15 +350,8 @@ class ResultsWindow(QWidget):
         layout.addWidget(self._close)
 
     def present(self, text: str, *, note: Optional[str] = None) -> None:
-        if note is not None:
-            self._note.setText(note)
-        self._table.setVisible(False)
-        self._text.setVisible(True)
-        self._text.setPlainText(text)
-        self._fit_to_text(text)
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        lines = text.splitlines() or [""]
+        self.present_table(["Detail"], [[line] for line in lines], note=note)
 
     def present_table(
         self,
@@ -368,9 +367,7 @@ class ResultsWindow(QWidget):
         self._table.setVisible(True)
         self._fill_table(headers, rows, unknown or [])
         self._fit_to_table()
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        self._reveal()
 
     def _fill_table(
         self,
@@ -378,13 +375,27 @@ class ResultsWindow(QWidget):
         rows: list[list[str]],
         unknown: list[bool],
     ) -> None:
+        self._unknown_rows = [
+            bool(row_index < len(unknown) and unknown[row_index])
+            for row_index in range(len(rows))
+        ]
+        self._filling = True
+        self._table.blockSignals(True)
         self._table.clear()
-        self._table.setColumnCount(len(headers))
-        self._table.setHorizontalHeaderLabels(headers)
+        self._table.setColumnCount(len(headers) + 1)
+        self._table.setHorizontalHeaderLabels(["", *headers])
         self._table.setRowCount(len(rows))
         unknown_bg = QColor("#FEE2E2")
         for row_index, row in enumerate(rows):
-            flagged = row_index < len(unknown) and unknown[row_index]
+            flagged = self._unknown_rows[row_index]
+            check = QTableWidgetItem("")
+            check.setFlags(
+                Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+            )
+            check.setCheckState(Qt.CheckState.Unchecked)
+            if flagged:
+                check.setBackground(unknown_bg)
+            self._table.setItem(row_index, 0, check)
             for column, value in enumerate(row):
                 item = QTableWidgetItem(value)
                 item.setFlags(
@@ -392,7 +403,9 @@ class ResultsWindow(QWidget):
                 )
                 if flagged:
                     item.setBackground(unknown_bg)
-                self._table.setItem(row_index, column, item)
+                self._table.setItem(row_index, column + 1, item)
+        self._table.blockSignals(False)
+        self._filling = False
         self._table.horizontalHeader().setStretchLastSection(False)
         self._table.resizeColumnsToContents()
         body = QFont("Consolas")
@@ -404,14 +417,16 @@ class ResultsWindow(QWidget):
         header_metrics = QFontMetrics(header_font)
         buyer_at: Optional[int] = None
         char_w = max(body_metrics.horizontalAdvance("0"), 8)
-        for column, header in enumerate(headers):
+        self._table.setColumnWidth(0, 36)
+        for column, header in enumerate(headers, start=1):
             if header == "Buyer":
                 longest = header_metrics.horizontalAdvance(header)
+                data_at = column - 1
                 for row in rows:
-                    if column < len(row):
+                    if data_at < len(row):
                         longest = max(
                             longest,
-                            body_metrics.horizontalAdvance(str(row[column])),
+                            body_metrics.horizontalAdvance(str(row[data_at])),
                         )
                 self._table.setColumnWidth(column, longest + 28)
                 buyer_at = column
@@ -431,7 +446,7 @@ class ResultsWindow(QWidget):
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is None:
             return
-        max_w = max(420, int(screen.availableGeometry().width() * 0.9))
+        max_w = max(420, screen.availableGeometry().width())
         margins = self.layout().contentsMargins()
         budget = max_w - margins.left() - margins.right() - 28
         table = self._table
@@ -444,48 +459,40 @@ class ResultsWindow(QWidget):
         current = table.columnWidth(buyer_at)
         table.setColumnWidth(buyer_at, max(72, current - overflow))
 
-    def _fit_to_text(self, text: str) -> None:
-        metrics = QFontMetrics(self._text.font())
-        lines = text.splitlines() or [""]
-        longest = max((metrics.horizontalAdvance(line) for line in lines), default=0)
-        screen = self.screen() or QGuiApplication.primaryScreen()
-        if screen is not None:
-            avail = screen.availableGeometry()
-            max_w = max(360, int(avail.width() * 0.9))
-            max_h = max(220, int(avail.height() * 0.85))
-        else:
-            max_w, max_h = 1400, 900
-
-        margins = self.layout().contentsMargins()
-        margin_x = margins.left() + margins.right()
-        text_w = max(280, min(longest + 36, max_w - margin_x))
-        self._text.document().setTextWidth(text_w)
-        doc_h = math.ceil(self._text.document().size().height()) + 20
-
-        note_h = self._note.sizeHint().height()
-        btn_h = max(self._close.sizeHint().height(), 36)
-        spacing = self.layout().spacing()
-        chrome_h = (
-            margins.top()
-            + margins.bottom()
-            + note_h
-            + btn_h
-            + spacing * 2
-            + 8
+    def _on_result_checked(self, item: QTableWidgetItem) -> None:
+        """Grey a row while its checkbox is on. The next results clear it."""
+        if self._filling or item.column() != 0:
+            return
+        processed = item.checkState() == Qt.CheckState.Checked
+        flagged = (
+            item.row() < len(self._unknown_rows) and self._unknown_rows[item.row()]
         )
-        width = min(max_w, text_w + margin_x)
-        height = min(max_h, max(180, doc_h + chrome_h))
-        self.setFixedSize(width, height)
+        background = QColor("#4B5563") if processed else (
+            QColor("#FEE2E2") if flagged else QColor("#FFFFFF")
+        )
+        foreground = QColor("#F8FAFC") if processed else QColor("#000000")
+        self._table.blockSignals(True)
+        try:
+            for column in range(self._table.columnCount()):
+                cell = self._table.item(item.row(), column)
+                if cell is None:
+                    continue
+                cell.setBackground(background)
+                cell.setForeground(foreground)
+        finally:
+            self._table.blockSignals(False)
+        QTimer.singleShot(0, self._table.clearSelection)
+
+    def _screen_limits(self) -> tuple[int, int]:
+        """Full usable size of the screen this window is on."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return 1400, 900
+        avail = screen.availableGeometry()
+        return max(360, avail.width()), max(180, avail.height())
 
     def _fit_to_table(self) -> None:
-        screen = self.screen() or QGuiApplication.primaryScreen()
-        if screen is not None:
-            avail = screen.availableGeometry()
-            max_w = max(420, int(avail.width() * 0.9))
-            max_h = max(220, int(avail.height() * 0.85))
-        else:
-            max_w, max_h = 1400, 900
-
+        max_w, max_h = self._screen_limits()
         table = self._table
         frame = table.frameWidth() * 2
         content_w = frame + 28
@@ -510,7 +517,41 @@ class ResultsWindow(QWidget):
         )
         width = min(max_w, max(480, content_w + margin_x))
         height = min(max_h, max(220, content_h + chrome_h))
-        self.setFixedSize(width, height)
+        self.setMaximumSize(16777215, 16777215)
+        self.resize(width, height)
+
+    def _reveal(self) -> None:
+        self.show()
+        self._settle_on_screen()
+        # The title-bar size is not available until Windows maps the window.
+        QTimer.singleShot(0, self._settle_on_screen)
+        self.raise_()
+        self.activateWindow()
+
+    def _settle_on_screen(self) -> None:
+        """Center on the current screen and keep the title bar on that screen."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        frame = self.frameGeometry()
+        extra_w = max(0, frame.width() - self.width())
+        extra_h = max(0, frame.height() - self.height())
+        fitted_w = min(self.width(), max(320, avail.width() - extra_w))
+        fitted_h = min(self.height(), max(160, avail.height() - extra_h))
+        if fitted_w != self.width() or fitted_h != self.height():
+            self.resize(fitted_w, fitted_h)
+            frame = self.frameGeometry()
+        frame.moveCenter(avail.center())
+        if frame.top() < avail.top():
+            frame.moveTop(avail.top())
+        if frame.left() < avail.left():
+            frame.moveLeft(avail.left())
+        if frame.bottom() > avail.bottom():
+            frame.moveBottom(avail.bottom())
+        if frame.right() > avail.right():
+            frame.moveRight(avail.right())
+        self.move(frame.topLeft())
 
 
 class ChassisLight(QWidget):
