@@ -63,8 +63,9 @@ def is_ebay_order_number(order_number: str) -> bool:
 
 
 def is_management_order(order_number: str) -> bool:
-    """INV2 orders are custom and handled by management."""
-    return _label(order_number).upper().startswith("INV2")
+    """INV2 and INV- orders are custom and handled by management."""
+    text = _label(order_number).upper()
+    return text.startswith("INV2") or text.startswith("INV-")
 
 
 def classify_store_row(order_number: str, sku: str) -> str:
@@ -74,7 +75,7 @@ def classify_store_row(order_number: str, sku: str) -> str:
     multi: one order whose SKU cell is an item count, not a SKU. The SKUs
     are only in the order drawer.
     store: one non-eBay order with a real SKU in the grid.
-    skip: an eBay order, or an INV2 order handled by management.
+    skip: an eBay order, or an INV2 or INV- order handled by management.
     """
     if is_combined_order(order_number):
         return "combined"
@@ -809,8 +810,8 @@ async def scrape_store_orders(
     A combined shipment is one grid row labeled '(Multiple)' with a SKU
     cell of '(2 Items)'. That text is not a SKU. Child orders are their
     own rows once the group is expanded, and eBay orders among them are
-    left to the eBay scrape. Orders that begin with INV2 are custom and
-    ignored. Any other order whose SKU cell is an item count is opened
+    left to the eBay scrape. Orders that begin with INV2 or INV- are custom
+    and ignored. Any other order whose SKU cell is an item count is opened
     so the drawer can supply the SKUs.
     """
     rows = await _collect_grid(page, locators["shipstation_footer"])

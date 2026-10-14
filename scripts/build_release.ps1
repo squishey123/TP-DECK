@@ -6,11 +6,32 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$Init = Get-Content (Join-Path $Root "tp_deck\__init__.py") -Raw
-if ($Init -notmatch '__version__\s*=\s*"([^"]+)"') {
-    throw "Could not read version from tp_deck\__init__.py"
+function Resolve-ReleaseVersion {
+    # A GitHub tag push sets this. Local builds use the latest v* tag.
+    $tag = ""
+    if ($env:GITHUB_REF_NAME) {
+        $tag = $env:GITHUB_REF_NAME.Trim()
+    } else {
+        try {
+            $described = & git describe --tags --abbrev=0 --match "v*" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $described) {
+                $tag = "$described".Trim()
+            }
+        } catch {
+            $tag = ""
+        }
+    }
+    if ($tag -match '^v(.+)$') {
+        return $Matches[1]
+    }
+    $init = Get-Content (Join-Path $Root "tp_deck\__init__.py") -Raw
+    if ($init -match '__version__\s*=\s*"([^"]+)"') {
+        return $Matches[1]
+    }
+    throw "Could not resolve a release version from the git tag or tp_deck\__init__.py"
 }
-$Version = $Matches[1]
+
+$Version = Resolve-ReleaseVersion
 
 # 64-bit Windows embeddable CPython (signed python.org binaries, not PyInstaller)
 $PyVersion = "3.12.10"
@@ -86,6 +107,12 @@ New-Item -ItemType Directory -Path $Pkg | Out-Null
 Get-ChildItem (Join-Path $Root "tp_deck") -File | Where-Object {
     $_.Extension -in ".py", ".json" -and $_.Name -ne "sku_location_cache.json"
 } | ForEach-Object { Copy-Item $_.FullName $Pkg }
+
+# Stamp the tag into the packaged copy. The source file stays unchanged.
+$StampedInit = Join-Path $Pkg "__init__.py"
+$StampedText = Get-Content $StampedInit -Raw
+$StampedText = $StampedText -replace '__version__\s*=\s*"[^"]*"', ('__version__ = "{0}"' -f $Version)
+Set-Content -Path $StampedInit -Value $StampedText -NoNewline
 
 if (Test-Path $OutZip) {
     Remove-Item $OutZip -Force

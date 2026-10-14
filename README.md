@@ -46,7 +46,7 @@ Build the coworker zip:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-Publish by bumping `__version__` in `tp_deck/__init__.py`, pushing `main`, then pushing a tag that is `v` plus that version (for 0.2.8, the tag is `v0.2.8`). GitHub Actions builds the zip and attaches it to the release. Installed copies pick that zip up the next time they open.
+Publish by pushing a tag such as `v0.3.2`. GitHub Actions reads that tag, stamps it into the zip, and attaches the zip to the release. Wait until that workflow finishes before editing the release notes; the create-release step overwrites the body when the zip is attached. The window shows the latest `v*` tag in a git checkout, and the stamped version in an installed copy. Installed copies pick up the new zip the next time they open.
 
 ```
 TP-DECK/

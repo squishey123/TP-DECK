@@ -147,7 +147,7 @@ The power button shuts down for the day. The panel fades to grey for 5 seconds. 
 
 Emergency Stop and the Pause key cancel the current run.
 
-On a release install, opening TP DECK checks for a newer GitHub release. The blue buttons pulse orange for 5 seconds first. Emergency Stop cancels that update until the next launch. An update keeps the browser profile, settings, and saved SKUs.
+On a release install, opening TP DECK checks for a newer GitHub release. The action buttons pulse between yellow and grey for 5 seconds first. Emergency Stop cancels that update until the next launch. An update keeps the browser profile, settings, and saved SKUs.
 """
 
 

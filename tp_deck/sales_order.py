@@ -454,6 +454,270 @@ async def _click_order_row(row: Any, order_number: str) -> None:
     await row.locator(".ag-cell").first.click()
 
 
+_SCROLL_GRID_JS = """
+(left) => {
+    const root = document.querySelector('#ag-grid');
+    if (!root) return false;
+    const nodes = [
+        '.ag-body-horizontal-scroll-viewport',
+        '.ag-header-viewport',
+        '.ag-center-cols-viewport',
+    ].map((sel) => root.querySelector(sel)).filter(Boolean);
+    if (!nodes.length) return false;
+    for (const node of nodes) {
+        node.scrollLeft = left;
+    }
+    const bar = root.querySelector('.ag-body-horizontal-scroll-viewport');
+    if (bar) bar.dispatchEvent(new Event('scroll'));
+    return true;
+}
+"""
+
+_GRID_SCROLL_METRICS_JS = """
+() => {
+    const root = document.querySelector('#ag-grid');
+    if (!root) return { max: 0, step: 200 };
+    const node = root.querySelector('.ag-header-viewport')
+        || root.querySelector('.ag-center-cols-viewport')
+        || root.querySelector('.ag-body-horizontal-scroll-viewport');
+    if (!node) return { max: 0, step: 200 };
+    return {
+        max: Math.max(0, node.scrollWidth - node.clientWidth),
+        step: Math.max(120, Math.floor(node.clientWidth * 0.45)),
+    };
+}
+"""
+
+_FILTER_ON_SCREEN_JS = """
+(selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (rect.width < 4 || rect.height < 4) return false;
+    const view = el.closest('.ag-header-viewport')
+        || el.closest('.ag-pinned-left-header')
+        || el.closest('.ag-header');
+    if (!view) return true;
+    const viewRect = view.getBoundingClientRect();
+    return rect.right > viewRect.left + 2 && rect.left < viewRect.right - 2;
+}
+"""
+
+_FILTER_COLUMNS_JS = """
+() => {
+    const root = document.querySelector('#ag-grid');
+    if (!root) return [];
+    const cells = root.querySelectorAll(
+        '.ag-header-row-floating-filter .ag-header-cell'
+    );
+    const out = [];
+    for (const cell of cells) {
+        const colId = cell.getAttribute('col-id') || '';
+        const header = colId
+            ? root.querySelector(
+                '.ag-header-cell[col-id="' + CSS.escape(colId) + '"] .ag-header-cell-text'
+            )
+            : null;
+        const name = header
+            ? (header.textContent || '').replace(/\\s+/g, ' ').trim()
+            : '';
+        const input = cell.querySelector(
+            'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
+        );
+        if (!input) continue;
+        const type = (input.getAttribute('type') || 'text').toLowerCase();
+        if (type === 'hidden' || type === 'checkbox' || type === 'radio') continue;
+        out.push({ colId, name });
+    }
+    return out;
+}
+"""
+
+_TEXT_FILTER_JS = """
+(selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return false;
+    const input = el.matches('input, textarea')
+        ? el
+        : el.querySelector(
+            'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
+        );
+    if (!input) return false;
+    const type = (input.getAttribute('type') || 'text').toLowerCase();
+    return type !== 'hidden' && type !== 'checkbox' && type !== 'radio'
+        && type !== 'button' && type !== 'submit';
+}
+"""
+
+_SERVICE_HEADER = re.compile(
+    r"\b(?:so|s\.o\.?|service order|sales order)\b|\border\s*#|\border\s*(?:no\.?|number|num)\b",
+    re.IGNORECASE,
+)
+_SERVICE_HEADER_SKIP = re.compile(
+    r"external|ebay|e-bay|reference|marketplace|status|date|customer|sku|qty|quantity",
+    re.IGNORECASE,
+)
+_SERVICE_COL_ID = re.compile(
+    r"sono|so_number|sonumber|salesorder|serviceorder",
+    re.IGNORECASE,
+)
+
+
+def _service_column(name: str, col_id: str) -> bool:
+    """True when a floating-filter header is the service-order number."""
+    text = re.sub(r"\s+", " ", name or "").strip()
+    ident = str(col_id or "")
+    if text and not _SERVICE_HEADER_SKIP.search(text) and _SERVICE_HEADER.search(text):
+        return True
+    if ident and _SERVICE_COL_ID.search(ident) and not _SERVICE_HEADER_SKIP.search(ident):
+        return True
+    return False
+
+
+def _col_filter_selector(col_id: str) -> str:
+    return (
+        "#ag-grid .ag-header-row-floating-filter "
+        f'.ag-header-cell[col-id="{_css_attr(col_id)}"] '
+        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+    )
+
+
+async def _scroll_grid_to(page: Page, left: float) -> None:
+    try:
+        await page.evaluate(_SCROLL_GRID_JS, max(0, float(left)))
+    except Exception as exc:
+        logger.info("Could not scroll the sales order grid: %s", exc)
+
+
+async def _grid_scroll_metrics(page: Page) -> dict[str, float]:
+    try:
+        metrics = await page.evaluate(_GRID_SCROLL_METRICS_JS)
+    except Exception:
+        return {"max": 0.0, "step": 200.0}
+    data = metrics or {}
+    return {
+        "max": float(data.get("max") or 0),
+        "step": float(data.get("step") or 200),
+    }
+
+
+async def _filter_on_screen(page: Page, selector: str) -> bool:
+    if not selector:
+        return False
+    try:
+        return bool(await page.evaluate(_FILTER_ON_SCREEN_JS, selector))
+    except Exception:
+        return False
+
+
+async def _scroll_grid_home(page: Page) -> None:
+    """Bring the left edge of the sales order grid back into view."""
+    await _scroll_grid_to(page, 0)
+    await asyncio.sleep(0.08)
+
+
+async def _scroll_filter_into_view(page: Page, selector: str) -> None:
+    """Scroll sideways until a virtualized filter column is actually rendered."""
+    if not selector:
+        return
+    await _scroll_grid_to(page, 0)
+    await asyncio.sleep(0.12)
+    if await _filter_on_screen(page, selector):
+        return
+    metrics = await _grid_scroll_metrics(page)
+    max_left = metrics["max"]
+    step = metrics["step"]
+    left = 0.0
+    for _ in range(40):
+        if left >= max_left - 1:
+            break
+        left = min(max_left, left + max(step, 80))
+        await _scroll_grid_to(page, left)
+        await asyncio.sleep(0.12)
+        if await _filter_on_screen(page, selector):
+            logger.info(
+                "Scrolled sales order grid to %s to load the filter column",
+                int(left),
+            )
+            return
+        metrics = await _grid_scroll_metrics(page)
+        max_left = max(max_left, metrics["max"])
+    logger.info("Sales order filter column stayed off screen: %s", selector)
+
+
+async def _service_filter_selector(page: Page, configured: str) -> str:
+    """Pick the service-order text box, not a checkbox or a scrolled-in column."""
+    try:
+        columns = await page.evaluate(_FILTER_COLUMNS_JS)
+    except Exception as exc:
+        logger.info("Could not read sales order filter headers: %s", exc)
+        columns = []
+    for col in columns or []:
+        name = str(col.get("name") or "")
+        col_id = str(col.get("colId") or "")
+        if col_id and _service_column(name, col_id):
+            logger.info("Service order filter column %s (%s)", name or "?", col_id)
+            return _col_filter_selector(col_id)
+    try:
+        if await page.evaluate(_TEXT_FILTER_JS, configured):
+            return configured
+    except Exception:
+        return configured
+    for col in columns or []:
+        col_id = str(col.get("colId") or "")
+        if not col_id:
+            continue
+        logger.info(
+            "Service order filter using leftmost text column %s (%s)",
+            col.get("name") or "?",
+            col_id,
+        )
+        return _col_filter_selector(col_id)
+    return configured
+
+
+async def _read_filter_value(field) -> str:
+    try:
+        return str(await field.input_value(timeout=1000) or "")
+    except Exception:
+        return ""
+
+
+async def _type_filter_query(field, query: str, *, allow_bare_key: bool) -> str:
+    """Type an order number. A service-order box that rejects SO- gets the bare key."""
+    await field.click()
+    await field.fill("")
+    await field.fill(query)
+    current = await _read_filter_value(field)
+    if query.casefold() not in current.casefold():
+        await field.fill("")
+        await field.press_sequentially(query, delay=15)
+        current = await _read_filter_value(field)
+    bare = order_key(query)
+    if (
+        allow_bare_key
+        and bare
+        and bare.casefold() != query.casefold()
+        and query.casefold() not in current.casefold()
+    ):
+        logger.info(
+            "Order filter did not keep %r (value=%r); trying %r",
+            query,
+            current,
+            bare,
+        )
+        await field.fill("")
+        await field.fill(bare)
+        current = await _read_filter_value(field)
+        if bare.casefold() not in current.casefold():
+            await field.fill("")
+            await field.press_sequentially(bare, delay=15)
+        return bare
+    return query
+
+
 async def _clear_filter_if_set(page: Page, selector: str, submit_key: str) -> bool:
     """Empty one floating filter when a previous search left text in it."""
     if not selector:
@@ -499,18 +763,28 @@ async def _filter_order_list(
     )
     if external:
         logger.info("Searching the external order column for %s", order_number.strip())
+    else:
+        logger.info("Searching the service order column for %s", order_number.strip())
     overlay = page.locator("#ag-grid .ag-overlay-loading-wrapper")
-    if await _clear_filter_if_set(page, other, submit_key):
-        try:
-            await overlay.wait_for(state="visible", timeout=overlay_ms)
-            await overlay.wait_for(state="hidden", timeout=timeout_ms)
-        except Exception:
-            await asyncio.sleep(0.4)
+    if other:
+        if external:
+            await _scroll_grid_home(page)
+        else:
+            await _scroll_filter_into_view(page, other)
+        if await _clear_filter_if_set(page, other, submit_key):
+            try:
+                await overlay.wait_for(state="visible", timeout=overlay_ms)
+                await overlay.wait_for(state="hidden", timeout=timeout_ms)
+            except Exception:
+                await asyncio.sleep(0.4)
+    if external:
+        await _scroll_filter_into_view(page, primary)
+    else:
+        await _scroll_grid_home(page)
+        primary = await _service_filter_selector(page, primary)
     field = await _input_field(page, primary, timeout_ms)
     query = order_number.strip()
-    await field.click()
-    await field.fill("")
-    await field.fill(query)
+    typed = await _type_filter_query(field, query, allow_bare_key=not external)
     key = (submit_key or "").strip()
     if key:
         await field.press(key)
@@ -519,6 +793,8 @@ async def _filter_order_list(
         await overlay.wait_for(state="hidden", timeout=timeout_ms)
     except Exception:
         await asyncio.sleep(0.4)
+    if external:
+        await _scroll_grid_home(page)
     count, text, row = await _wait_for_filter_rows(
         page,
         locators["sales_order_rows"],
@@ -526,6 +802,36 @@ async def _filter_order_list(
         timeout_ms,
         accept_lone_row=external,
     )
+    bare = order_key(order_number)
+    if (
+        row is None
+        and count == 0
+        and not external
+        and bare
+        and bare.casefold() != typed.casefold()
+    ):
+        logger.info(
+            "No sales order row for %s; retrying the filter as %s",
+            order_number.strip(),
+            bare,
+        )
+        await _scroll_grid_home(page)
+        field = await _input_field(page, primary, timeout_ms)
+        await _type_filter_query(field, bare, allow_bare_key=False)
+        if key:
+            await field.press(key)
+        try:
+            await overlay.wait_for(state="visible", timeout=overlay_ms)
+            await overlay.wait_for(state="hidden", timeout=timeout_ms)
+        except Exception:
+            await asyncio.sleep(0.4)
+        count, text, row = await _wait_for_filter_rows(
+            page,
+            locators["sales_order_rows"],
+            order_number,
+            timeout_ms,
+            accept_lone_row=False,
+        )
     if row is not None:
         return row
     if count > 1:
@@ -731,6 +1037,7 @@ async def _clear_order_filter(
                 if not selector:
                     continue
                 try:
+                    await _scroll_filter_into_view(page, selector)
                     root = page.locator(selector).first
                     inner = root.locator("input:not([type='hidden'])")
                     field = inner.first if await inner.count() > 0 else root
@@ -744,6 +1051,7 @@ async def _clear_order_filter(
                     )
                 else:
                     logger.info("Cleared order filter on %s", url)
+            await _scroll_grid_home(page)
     finally:
         restore_foreground(*foreground)
 

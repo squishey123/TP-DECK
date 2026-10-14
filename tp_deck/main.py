@@ -16,7 +16,7 @@ from typing import Optional
 from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
-from tp_deck import __version__
+from tp_deck import app_version
 from tp_deck.automation_engine import (
     copy_to_clipboard,
     lookup_missing_locations,
@@ -873,8 +873,8 @@ async def _apply_update(dashboard: Dashboard) -> bool:
     if not release:
         return False
     tag = str(release.get("tag_name") or "")
-    if not is_newer(tag, __version__):
-        logger.info("No update; installed %s, latest %s", __version__, tag or "unknown")
+    if not is_newer(tag, app_version()):
+        logger.info("No update; installed %s, latest %s", app_version(), tag or "unknown")
         return False
     asset = find_windows_asset(release)
     if asset is None:
@@ -918,7 +918,7 @@ def main() -> int:
     logger = logging.getLogger("tpdeck")
     logger.info(
         "TP DECK starting (%s). Log rolls at %s MB, keeping %s archives.",
-        __version__,
+        app_version(),
         LOG_MAX_BYTES // 1_000_000,
         LOG_BACKUP_COUNT,
     )

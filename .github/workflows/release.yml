@@ -20,27 +20,22 @@ jobs:
         run: |
           powershell -ExecutionPolicy Bypass -File scripts/build_release.ps1
 
-      - name: Read version and verify tag
+      - name: Read version from the tag
         id: ver
         shell: pwsh
         run: |
-          $init = Get-Content tp_deck/__init__.py -Raw
-          if ($init -notmatch '__version__\s*=\s*"([^"]+)"') {
-            throw "Could not read version from tp_deck/__init__.py"
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v(.+)$') {
+            throw "Tag '$tag' must start with v, for example v0.3.2"
           }
           $version = $Matches[1]
-          $expectedTag = "v$version"
-          $tag = $env:GITHUB_REF_NAME
-          if ($tag -ne $expectedTag) {
-            throw "Tag '$tag' does not match package version '$expectedTag'. Bump tp_deck/__init__.py or retag."
-          }
           $zip = "dist/TP-DECK-$version-windows-x64.zip"
           if (-not (Test-Path $zip)) {
             throw "Expected zip not found: $zip"
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Release $expectedTag → $zip"
+          Write-Host "Release $tag → $zip"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3

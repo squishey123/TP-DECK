@@ -34,9 +34,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tp_deck import app_version
 from tp_deck.settings_manager import load_settings, update_settings
 
 logger = logging.getLogger("tpdeck")
+
+_DASHBOARD_HEIGHT = 372
+_DASHBOARD_HEIGHT_SLOW = 404
 
 
 def _mix_color(start: QColor, end: QColor, amount: float) -> QColor:
@@ -118,6 +122,14 @@ QLabel#titleLabel {
     color: #0EA5E9;
     font-size: 14px;
     font-weight: bold;
+}
+QLabel#versionLabel {
+    color: #22D3EE;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 0px;
+    margin: 0px;
 }
 QLabel#statusLabel {
     color: #F8FAFC;
@@ -872,7 +884,7 @@ class Dashboard(QMainWindow):
         self._arm_timer.timeout.connect(self._tick_shutdown_arm)
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._tick_update_warning)
-        self.setFixedSize(300, 356)
+        self.setFixedSize(300, _DASHBOARD_HEIGHT)
         self.setStyleSheet(THEME_QSS)
 
         self._build_ui()
@@ -894,10 +906,23 @@ class Dashboard(QMainWindow):
         title_row.addStretch()
         self._light = ChassisLight()
         title_row.addWidget(self._light)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(0)
+        title_col.setContentsMargins(0, 0, 0, 0)
         self._title = QLabel("TP DECK")
         self._title.setObjectName("titleLabel")
         self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_row.addWidget(self._title)
+        title_col.addWidget(self._title)
+        self._version = QLabel(f"// {app_version()} //")
+        self._version.setObjectName("versionLabel")
+        self._version.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        version_font = QFont("Consolas", 8)
+        version_font.setBold(True)
+        version_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.2)
+        self._version.setFont(version_font)
+        self._version.setToolTip(f"TP DECK {app_version()}")
+        title_col.addWidget(self._version)
+        title_row.addLayout(title_col)
         title_row.addStretch()
         layout.addLayout(title_row)
 
@@ -1046,7 +1071,7 @@ class Dashboard(QMainWindow):
         self._apply_fade(0.0)
 
     def begin_update_warning(self) -> None:
-        """Pulse the blue action buttons orange so an update can be cancelled."""
+        """Pulse the action buttons between yellow and grey so an update can be cancelled."""
         buttons = (self.execute_btn, self.pick_btn, self.batch_btn)
         self._update_restore_enabled = [button.isEnabled() for button in buttons]
         self._update_cancelled = False
@@ -1089,9 +1114,10 @@ class Dashboard(QMainWindow):
         self._paint_update_pulse(amount)
 
     def _paint_update_pulse(self, amount: float) -> None:
-        bg = _mix_hex("#0EA5E9", "#F97316", amount)
+        bg = _mix_hex("#FBBF24", "#64748B", amount)
+        fg = _mix_hex("#0F172A", "#F8FAFC", amount)
         rule = (
-            f"background-color: {bg}; color: #0F172A; "
+            f"background-color: {bg}; color: {fg}; "
             f"border: 1px solid {bg}; font-weight: bold;"
         )
         qss = (
@@ -1129,6 +1155,7 @@ class Dashboard(QMainWindow):
         if t <= 0:
             for widget in (
                 self._title,
+                self._version,
                 self._slow_label,
                 self.execute_btn,
                 self.pick_btn,
@@ -1143,6 +1170,9 @@ class Dashboard(QMainWindow):
         grey_text = _mix_hex("#F8FAFC", "#94A3B8", t)
         self._title.setStyleSheet(
             f"color: {_mix_hex('#0EA5E9', '#94A3B8', t)}; background: transparent; font-weight: bold;"
+        )
+        self._version.setStyleSheet(
+            f"color: {_mix_hex('#22D3EE', '#94A3B8', t)}; background: transparent; font-weight: bold;"
         )
         self._slow_label.setStyleSheet(
             f"color: {_mix_hex('#FBBF24', '#94A3B8', t)}; background: transparent; font-weight: bold;"
@@ -1214,7 +1244,9 @@ class Dashboard(QMainWindow):
     def set_slow_razor(self, enabled: bool) -> None:
         """Show the session flag. The window grows only while it is on."""
         self._slow_label.setVisible(bool(enabled))
-        self.setFixedHeight(388 if enabled else 356)
+        self.setFixedHeight(
+            _DASHBOARD_HEIGHT_SLOW if enabled else _DASHBOARD_HEIGHT
+        )
 
     def show_results(
         self,
