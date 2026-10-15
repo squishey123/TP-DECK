@@ -31,6 +31,8 @@ from tp_deck.serial_dialog import SerialDialog
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
 from tp_deck.updater import (
+    asset_size,
+    describe_release,
     download_and_spawn,
     fetch_latest,
     find_windows_asset,
@@ -825,6 +827,7 @@ def _register_emergency_hotkey(controller: AutomationController) -> None:
 async def _prepare_chromium(dashboard: Dashboard) -> None:
     """Start minimized Chromium before scrape and pick list can run."""
     logger = logging.getLogger("tpdeck")
+    dashboard.clear_progress()
     dashboard.set_active(True)
     try:
         await ensure_debug_chromium(load_settings(), dashboard.set_status)
@@ -849,6 +852,7 @@ async def _startup(dashboard: Dashboard) -> None:
     except Exception as exc:
         message = str(exc).strip() or exc.__class__.__name__
         logger.exception("Update failed: %s", exc)
+        dashboard.clear_progress()
         dashboard.set_status(f"Error — {message}")
     if updated:
         logger.info("Update helper started; closing")
@@ -881,18 +885,53 @@ async def _apply_update(dashboard: Dashboard) -> bool:
         logger.info("Release %s has no Windows zip", tag or "unknown")
         return False
     name, url = asset
-    logger.info("Update %s is ready", tag or name)
-    if await _confirm_update(dashboard):
+    version, released = describe_release(release)
+    label = f"{version} — released {released}" if released else version
+    logger.info("Update %s is ready (%s)", tag or name, label)
+    if await _confirm_update(dashboard, label):
         return False
-    dashboard.set_status("Downloading update")
+    dashboard.set_status(f"Downloading {label}")
+    dashboard.set_run_progress(0.0, None)
     logger.info("Downloading update %s", name)
-    await asyncio.to_thread(download_and_spawn, name, url, app_root())
+    loop = asyncio.get_running_loop()
+    last_pct = -1
+
+    def on_progress(read: int, total: int) -> None:
+        nonlocal last_pct
+        if total > 0:
+            pct = int(read * 100 / total)
+            if pct == last_pct:
+                return
+            last_pct = pct
+            fraction = max(0.0, min(1.0, read / total))
+        else:
+            fraction = 0.0
+
+        def paint() -> None:
+            dashboard.set_status(f"Downloading {label}")
+            if total > 0:
+                dashboard.set_run_progress(fraction, None)
+            else:
+                dashboard.set_run_progress(0.0, (0.0, 1.0))
+
+        loop.call_soon_threadsafe(paint)
+
+    await asyncio.to_thread(
+        download_and_spawn,
+        name,
+        url,
+        app_root(),
+        on_progress,
+        asset_size(release, name),
+    )
+    dashboard.set_status(f"Updating to {label}")
+    dashboard.set_run_progress(1.0, None)
     return True
 
 
-async def _confirm_update(dashboard: Dashboard) -> bool:
+async def _confirm_update(dashboard: Dashboard, label: str) -> bool:
     """Pulse the action buttons for 5 seconds. True when Emergency Stop cancelled."""
-    dashboard.set_status("Update starting — Emergency Stop to cancel")
+    dashboard.set_status(f"{label} — Emergency Stop to cancel")
     dashboard.begin_update_warning()
     try:
         deadline = time.monotonic() + 5.0

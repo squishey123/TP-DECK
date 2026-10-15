@@ -17,8 +17,9 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from tp_deck import __version__
 from tp_deck.chrome_launcher import app_root
@@ -199,15 +200,58 @@ def find_windows_asset(release: dict[str, Any]) -> Optional[tuple[str, str]]:
     return None
 
 
+def describe_release(release: dict[str, Any]) -> tuple[str, str]:
+    """Return (v1.2.3, Oct 14, 2026). The date is empty when the feed omits it."""
+    tag = str(release.get("tag_name") or "").strip()
+    if not tag:
+        shown = "the new release"
+    elif tag[0] in {"v", "V"}:
+        shown = "v" + tag[1:]
+    else:
+        shown = "v" + tag
+    published = str(release.get("published_at") or "").strip()
+    if not published:
+        return shown, ""
+    try:
+        when = datetime.fromisoformat(published.replace("Z", "+00:00"))
+    except ValueError:
+        return shown, ""
+    return shown, f"{when.strftime('%b')} {when.day}, {when.year}"
+
+
+def asset_size(release: dict[str, Any], name: str) -> int:
+    for asset in release.get("assets") or []:
+        if isinstance(asset, dict) and str(asset.get("name") or "") == name:
+            try:
+                return max(0, int(asset.get("size") or 0))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 def _download(url: str, timeout: float):
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     return urllib.request.urlopen(request, timeout=timeout)
 
 
-def download_zip(url: str, dest: Path) -> None:
+def download_zip(
+    url: str,
+    dest: Path,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    total_hint: int = 0,
+) -> None:
     deadline = time.monotonic() + _DOWNLOAD_DEADLINE_S
     dest.parent.mkdir(parents=True, exist_ok=True)
     with _download(url, _CHUNK_TIMEOUT_S) as response, dest.open("wb") as handle:
+        try:
+            total = int(response.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total <= 0:
+            total = max(0, int(total_hint or 0))
+        read = 0
+        if on_progress is not None:
+            on_progress(0, total)
         while True:
             if time.monotonic() > deadline:
                 raise TimeoutError("Update download timed out.")
@@ -215,6 +259,9 @@ def download_zip(url: str, dest: Path) -> None:
             if not chunk:
                 break
             handle.write(chunk)
+            read += len(chunk)
+            if on_progress is not None:
+                on_progress(read, total)
     if dest.stat().st_size < 1024 * 1024:
         raise RuntimeError("Update download was incomplete.")
 
@@ -267,12 +314,18 @@ def spawn_helper(source: Path, dest: Path, stage: Path) -> None:
     )
 
 
-def download_and_spawn(name: str, url: str, root: Path) -> None:
+def download_and_spawn(
+    name: str,
+    url: str,
+    root: Path,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    total_hint: int = 0,
+) -> None:
     """Download beside the install, in temp, so the copy does not recurse into itself."""
     stage = Path(tempfile.mkdtemp(prefix="tpdeck-update-"))
     zip_path = stage / name
     try:
-        download_zip(url, zip_path)
+        download_zip(url, zip_path, on_progress=on_progress, total_hint=total_hint)
         payload = extract_payload(zip_path, stage / "unpack")
         spawn_helper(payload, root, stage)
     except Exception:

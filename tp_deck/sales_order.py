@@ -48,18 +48,152 @@ def normalize_order_number(value: str) -> str:
     return "SO-" + _SO_PREFIX.sub("", text, count=1)
 
 
-def external_order_number(value: str) -> bool:
-    """True for an eBay order or a digits-only store order.
+def classify_order(value: str) -> str:
+    """Return service, ebay, or store.
 
-    Those search the external-order column. An SO-prefixed number stays on
-    the service-order column. The SO- prefix is case-insensitive.
+    service: an SO number, with or without the SO- prefix (SO-12345, SO12345).
+    ebay: a Seller Hub id such as 12-34567-89012.
+    store: digits only. A bare sales-order number looks the same, so that
+    search tries the store order column and then the sales-order column.
     """
     text = re.sub(r"\s+", "", (value or "").strip())
-    if not text or _SO_PREFIX.match(text):
-        return False
+    if not text:
+        return ""
+    if _SO_PREFIX.match(text) or re.fullmatch(r"so\d+", text, flags=re.IGNORECASE):
+        return "service"
     if _EBAY_ORDER.fullmatch(text):
-        return True
-    return _DIGITS.fullmatch(text) is not None
+        return "ebay"
+    if _DIGITS.fullmatch(text):
+        return "store"
+    return "service"
+
+
+_SOURCE_COLUMN = re.compile(r"\bsource(?:\s*type)?\b", re.IGNORECASE)
+_NOISE_COLUMN = re.compile(
+    r"\b(?:status|date|customer|sku|qty|quantity|rep|warehouse|"
+    r"ship|tracking|amount|total|price|tax|balance)\b",
+    re.IGNORECASE,
+)
+_ORDERISH = re.compile(
+    r"order|reference|\bpo\b|p\.o\.|external|ebay|e-bay|web|store|magento",
+    re.IGNORECASE,
+)
+
+
+def _column_text(name: str, col_id: str) -> tuple[str, str]:
+    text = re.sub(r"\s+", " ", name or "").strip()
+    return text, str(col_id or "")
+
+
+def _is_source_column(name: str, col_id: str) -> bool:
+    text, ident = _column_text(name, col_id)
+    return _SOURCE_COLUMN.search(f"{text} {ident}") is not None
+
+
+def _noise_column(name: str) -> bool:
+    text = re.sub(r"\s+", " ", name or "").strip()
+    if not text or _ORDERISH.search(text):
+        return False
+    return _NOISE_COLUMN.search(text) is not None
+
+
+def service_column_score(name: str, col_id: str) -> int:
+    """How strongly this header is the Razor sales-order number.
+
+    Source Type is never a match. External, eBay, reference, and PO columns
+    are not the sales-order number either.
+    """
+    if _is_source_column(name, col_id) or _noise_column(name):
+        return 0
+    text, ident = _column_text(name, col_id)
+    blob = f"{text} {ident}"
+    if re.search(
+        r"external|ebay|e-bay|reference|marketplace|\bpo\b|p\.o\.|purchase",
+        blob,
+        flags=re.IGNORECASE,
+    ):
+        return 0
+    score = 0
+    if re.fullmatch(r"(?:so|s\.o\.?)\s*#?", text, flags=re.IGNORECASE) or re.search(
+        r"\b(?:so|s\.o\.?)\s*(?:#|no\.?|number|num)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        score = max(score, 100)
+    if re.search(r"\b(?:sales|service)\s+order\b", text, flags=re.IGNORECASE):
+        score = max(score, 100)
+    if re.search(
+        r"sono|so_number|sonumber|salesorder|serviceorder|autoname",
+        ident,
+        flags=re.IGNORECASE,
+    ):
+        score = max(score, 90)
+    if score == 0 and re.search(
+        r"\border\s*(?:#|no\.?|number|num)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        score = 40
+    if score == 0 and re.fullmatch(r"order", text, flags=re.IGNORECASE):
+        score = 35
+    return score
+
+
+def marketplace_column_score(name: str, col_id: str, kind: str) -> int:
+    """How strongly this header holds an eBay or store order number.
+
+    Source Type is the channel name (eBay, store, manual) and scores 0.
+    """
+    if _is_source_column(name, col_id) or _noise_column(name):
+        return 0
+    if service_column_score(name, col_id) >= 90:
+        return 0
+    text, ident = _column_text(name, col_id)
+    low_text = text.casefold()
+    low_id = ident.casefold()
+    score = 0
+    ebayish = bool(
+        re.search(r"ebay|e-bay", low_text) or re.search(r"ebay", low_id)
+    )
+    if ebayish:
+        looks_like_number = bool(
+            re.search(r"order|number|\bno\b|#", low_text)
+            or re.search(r"order|number|id", low_id)
+        )
+        if looks_like_number:
+            score = max(score, 100 if kind == "ebay" else 60)
+        elif kind == "ebay":
+            score = max(score, 55)
+    if re.search(r"external", low_text) or re.search(r"external", low_id):
+        score = max(score, 90)
+    if re.search(
+        r"web\s*order|store\s*order|magento|e-?commerce|online\s*order|"
+        r"channel\s*order|third.party|3rd.party",
+        low_text,
+    ) or re.search(r"magento|weborder|storeorder|increment|channelorder", low_id):
+        score = max(score, 85)
+    if "reference" in low_text or "reference" in low_id or low_id in {"reference", "ref"}:
+        score = max(score, 80)
+    if re.search(r"\bext\b", low_text):
+        score = max(score, 75)
+    if re.search(r"\bpo\b|p\.o\.|purchase\s*order", low_text) or re.search(
+        r"ponumber|po_number|pono|po_no",
+        low_id,
+    ):
+        score = max(score, 70)
+    if score == 0 and re.search(
+        r"\border\s*(?:#|no\.?|number|num|id)\b",
+        low_text,
+    ):
+        score = 50
+    if (
+        kind == "store"
+        and ebayish
+        and score
+        and not re.search(r"external|reference|\bpo\b", low_text)
+    ):
+        score = max(1, score - 40)
+    return score
 
 
 def order_labels_match(typed: str, label: str) -> bool:
@@ -515,65 +649,35 @@ _FILTER_COLUMNS_JS = """
     const out = [];
     for (const cell of cells) {
         const colId = cell.getAttribute('col-id') || '';
-        const header = colId
-            ? root.querySelector(
-                '.ag-header-cell[col-id="' + CSS.escape(colId) + '"] .ag-header-cell-text'
-            )
-            : null;
-        const name = header
-            ? (header.textContent || '').replace(/\\s+/g, ' ').trim()
-            : '';
+        if (!colId) continue;
+        let name = '';
+        const headers = root.querySelectorAll(
+            '.ag-header-cell[col-id="' + CSS.escape(colId) + '"]'
+        );
+        for (const header of headers) {
+            if (header.closest('.ag-header-row-floating-filter')) continue;
+            const text = (header.innerText || header.textContent || '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            if (text) {
+                name = text;
+                break;
+            }
+        }
         const input = cell.querySelector(
             'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
         );
-        if (!input) continue;
-        const type = (input.getAttribute('type') || 'text').toLowerCase();
-        if (type === 'hidden' || type === 'checkbox' || type === 'radio') continue;
-        out.push({ colId, name });
+        let hasInput = false;
+        if (input) {
+            const type = (input.getAttribute('type') || 'text').toLowerCase();
+            hasInput = type !== 'hidden' && type !== 'checkbox' && type !== 'radio'
+                && type !== 'button' && type !== 'submit';
+        }
+        out.push({ colId, name, hasInput });
     }
     return out;
 }
 """
-
-_TEXT_FILTER_JS = """
-(selector) => {
-    const el = document.querySelector(selector);
-    if (!el) return false;
-    const input = el.matches('input, textarea')
-        ? el
-        : el.querySelector(
-            'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
-        );
-    if (!input) return false;
-    const type = (input.getAttribute('type') || 'text').toLowerCase();
-    return type !== 'hidden' && type !== 'checkbox' && type !== 'radio'
-        && type !== 'button' && type !== 'submit';
-}
-"""
-
-_SERVICE_HEADER = re.compile(
-    r"\b(?:so|s\.o\.?|service order|sales order)\b|\border\s*#|\border\s*(?:no\.?|number|num)\b",
-    re.IGNORECASE,
-)
-_SERVICE_HEADER_SKIP = re.compile(
-    r"external|ebay|e-bay|reference|marketplace|status|date|customer|sku|qty|quantity",
-    re.IGNORECASE,
-)
-_SERVICE_COL_ID = re.compile(
-    r"sono|so_number|sonumber|salesorder|serviceorder",
-    re.IGNORECASE,
-)
-
-
-def _service_column(name: str, col_id: str) -> bool:
-    """True when a floating-filter header is the service-order number."""
-    text = re.sub(r"\s+", " ", name or "").strip()
-    ident = str(col_id or "")
-    if text and not _SERVICE_HEADER_SKIP.search(text) and _SERVICE_HEADER.search(text):
-        return True
-    if ident and _SERVICE_COL_ID.search(ident) and not _SERVICE_HEADER_SKIP.search(ident):
-        return True
-    return False
 
 
 def _col_filter_selector(col_id: str) -> str:
@@ -647,35 +751,159 @@ async def _scroll_filter_into_view(page: Page, selector: str) -> None:
     logger.info("Sales order filter column stayed off screen: %s", selector)
 
 
-async def _service_filter_selector(page: Page, configured: str) -> str:
-    """Pick the service-order text box, not a checkbox or a scrolled-in column."""
-    try:
-        columns = await page.evaluate(_FILTER_COLUMNS_JS)
-    except Exception as exc:
-        logger.info("Could not read sales order filter headers: %s", exc)
-        columns = []
-    for col in columns or []:
-        name = str(col.get("name") or "")
-        col_id = str(col.get("colId") or "")
-        if col_id and _service_column(name, col_id):
-            logger.info("Service order filter column %s (%s)", name or "?", col_id)
-            return _col_filter_selector(col_id)
-    try:
-        if await page.evaluate(_TEXT_FILTER_JS, configured):
-            return configured
-    except Exception:
-        return configured
-    for col in columns or []:
-        col_id = str(col.get("colId") or "")
-        if not col_id:
-            continue
-        logger.info(
-            "Service order filter using leftmost text column %s (%s)",
-            col.get("name") or "?",
-            col_id,
+def _merge_column(found: dict[str, dict[str, Any]], col: dict[str, Any]) -> None:
+    col_id = str(col.get("colId") or "").strip()
+    if not col_id:
+        return
+    current = found.get(col_id)
+    name = str(col.get("name") or "").strip()
+    has_input = bool(col.get("hasInput"))
+    if current is None:
+        found[col_id] = {"colId": col_id, "name": name, "hasInput": has_input}
+        return
+    if name and not current.get("name"):
+        current["name"] = name
+    if has_input:
+        current["hasInput"] = True
+
+
+async def _collect_filter_columns(page: Page) -> list[dict[str, Any]]:
+    """Read every floating-filter header, including columns outside the viewport."""
+    found: dict[str, dict[str, Any]] = {}
+
+    async def absorb() -> None:
+        try:
+            columns = await page.evaluate(_FILTER_COLUMNS_JS)
+        except Exception as exc:
+            logger.info("Could not read sales order filter headers: %s", exc)
+            return
+        for col in columns or []:
+            if isinstance(col, dict):
+                _merge_column(found, col)
+
+    await _scroll_grid_to(page, 0)
+    await asyncio.sleep(0.12)
+    await absorb()
+    metrics = await _grid_scroll_metrics(page)
+    max_left = metrics["max"]
+    step = metrics["step"]
+    left = 0.0
+    for _ in range(40):
+        if left >= max_left - 1:
+            break
+        left = min(max_left, left + max(step, 80))
+        await _scroll_grid_to(page, left)
+        await asyncio.sleep(0.12)
+        await absorb()
+        metrics = await _grid_scroll_metrics(page)
+        max_left = max(max_left, metrics["max"])
+    await _scroll_grid_home(page)
+    columns = list(found.values())
+    logger.info(
+        "Sales order filter columns: %s",
+        ", ".join(
+            f"{col.get('name') or '?'} ({col.get('colId')})"
+            for col in columns
         )
-        return _col_filter_selector(col_id)
-    return configured
+        or "none",
+    )
+    return columns
+
+
+def _best_service_column(columns: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    best: Optional[dict[str, Any]] = None
+    best_score = 0
+    for col in columns:
+        if not col.get("hasInput") or not col.get("colId"):
+            continue
+        score = service_column_score(str(col.get("name") or ""), str(col.get("colId")))
+        if score > best_score:
+            best = col
+            best_score = score
+    return best
+
+
+def _marketplace_columns(columns: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    ranked: list[tuple[int, str, dict[str, Any]]] = []
+    for col in columns:
+        if not col.get("hasInput") or not col.get("colId"):
+            continue
+        score = marketplace_column_score(
+            str(col.get("name") or ""),
+            str(col.get("colId")),
+            kind,
+        )
+        if score > 0:
+            ranked.append((score, str(col.get("colId")), col))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [col for _score, _col_id, col in ranked[:3]]
+
+
+def _search_targets(
+    kind: str,
+    columns: list[dict[str, Any]],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Columns to try, in order. Source Type is never included."""
+    service = _best_service_column(columns)
+    if kind == "ebay":
+        return [("marketplace", col) for col in _marketplace_columns(columns, "ebay")]
+    if kind == "store":
+        targets = [("marketplace", col) for col in _marketplace_columns(columns, "store")]
+        if service is not None:
+            targets.append(("service", service))
+        return targets
+    if service is not None:
+        return [("service", service)]
+    return []
+
+
+def _columns_to_clear(columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Source Type plus every order-number column, so a bad search cannot stick."""
+    chosen: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for col in columns:
+        col_id = str(col.get("colId") or "")
+        if not col_id or not col.get("hasInput") or col_id in seen:
+            continue
+        name = str(col.get("name") or "")
+        if (
+            _is_source_column(name, col_id)
+            or service_column_score(name, col_id) > 0
+            or marketplace_column_score(name, col_id, "ebay") > 0
+            or marketplace_column_score(name, col_id, "store") > 0
+        ):
+            chosen.append(col)
+            seen.add(col_id)
+    return chosen
+
+
+def _column_names(columns: list[dict[str, Any]]) -> str:
+    names = [
+        str(col.get("name") or col.get("colId") or "?")
+        for col in columns
+    ]
+    return ", ".join(names) or "none"
+
+
+def _missing_column_message(kind: str, columns: list[dict[str, Any]]) -> str:
+    seen = _column_names(columns)
+    if not columns:
+        return (
+            "The sales order list has no filter columns. "
+            "Open the sales order list and wait for the grid to finish loading."
+        )
+    if kind == "ebay":
+        return (
+            "Could not find the eBay order number column. "
+            "Source Type is the channel, not the order number. "
+            f"Columns: {seen}."
+        )
+    if kind == "store":
+        return (
+            "Could not find a store-order column or the sales order number column. "
+            f"Columns: {seen}."
+        )
+    return f"Could not find the sales order number column. Columns: {seen}."
 
 
 async def _read_filter_value(field) -> str:
@@ -741,72 +969,69 @@ async def _clear_filter_if_set(page: Page, selector: str, submit_key: str) -> bo
     return True
 
 
-async def _filter_order_list(
-    page: Page,
-    order_number: str,
-    locators: dict[str, str],
-    *,
-    timeout_ms: int,
-    overlay_ms: int,
-    submit_key: str,
-) -> Any:
-    external = external_order_number(order_number)
-    primary = (
-        locators["sales_order_external_filter"]
-        if external
-        else locators["sales_order_filter"]
-    )
-    other = (
-        locators["sales_order_filter"]
-        if external
-        else locators.get("sales_order_external_filter", "")
-    )
-    if external:
-        logger.info("Searching the external order column for %s", order_number.strip())
-    else:
-        logger.info("Searching the service order column for %s", order_number.strip())
+async def _wait_grid_overlay(page: Page, overlay_ms: int, timeout_ms: int) -> None:
     overlay = page.locator("#ag-grid .ag-overlay-loading-wrapper")
-    if other:
-        if external:
-            await _scroll_grid_home(page)
-        else:
-            await _scroll_filter_into_view(page, other)
-        if await _clear_filter_if_set(page, other, submit_key):
-            try:
-                await overlay.wait_for(state="visible", timeout=overlay_ms)
-                await overlay.wait_for(state="hidden", timeout=timeout_ms)
-            except Exception:
-                await asyncio.sleep(0.4)
-    if external:
-        await _scroll_filter_into_view(page, primary)
-    else:
-        await _scroll_grid_home(page)
-        primary = await _service_filter_selector(page, primary)
-    field = await _input_field(page, primary, timeout_ms)
-    query = order_number.strip()
-    typed = await _type_filter_query(field, query, allow_bare_key=not external)
-    key = (submit_key or "").strip()
-    if key:
-        await field.press(key)
     try:
         await overlay.wait_for(state="visible", timeout=overlay_ms)
         await overlay.wait_for(state="hidden", timeout=timeout_ms)
     except Exception:
         await asyncio.sleep(0.4)
-    if external:
+
+
+async def _clear_columns(
+    page: Page,
+    columns: list[dict[str, Any]],
+    submit_key: str,
+    *,
+    overlay_ms: int,
+    timeout_ms: int,
+) -> None:
+    for col in columns:
+        col_id = str(col.get("colId") or "")
+        if not col_id:
+            continue
+        selector = _col_filter_selector(col_id)
+        await _scroll_filter_into_view(page, selector)
+        if await _clear_filter_if_set(page, selector, submit_key):
+            logger.info("Cleared filter %s (%s)", col.get("name") or "?", col_id)
+            await _wait_grid_overlay(page, overlay_ms, timeout_ms)
+
+
+async def _run_column_search(
+    page: Page,
+    order_number: str,
+    column: dict[str, Any],
+    role: str,
+    locators: dict[str, str],
+    *,
+    timeout_ms: int,
+    overlay_ms: int,
+    submit_key: str,
+) -> tuple[int, str, Optional[Any], str]:
+    """Type into one column. Returns count, text, row, and the text that was kept."""
+    selector = _col_filter_selector(str(column.get("colId") or ""))
+    await _scroll_filter_into_view(page, selector)
+    field = await _input_field(page, selector, timeout_ms)
+    query = order_number.strip()
+    typed = await _type_filter_query(field, query, allow_bare_key=role == "service")
+    key = (submit_key or "").strip()
+    if key:
+        await field.press(key)
+    await _wait_grid_overlay(page, overlay_ms, timeout_ms)
+    if role != "service":
         await _scroll_grid_home(page)
     count, text, row = await _wait_for_filter_rows(
         page,
         locators["sales_order_rows"],
         order_number,
         timeout_ms,
-        accept_lone_row=external,
+        accept_lone_row=role != "service",
     )
     bare = order_key(order_number)
     if (
         row is None
         and count == 0
-        and not external
+        and role == "service"
         and bare
         and bare.casefold() != typed.casefold()
     ):
@@ -816,15 +1041,11 @@ async def _filter_order_list(
             bare,
         )
         await _scroll_grid_home(page)
-        field = await _input_field(page, primary, timeout_ms)
-        await _type_filter_query(field, bare, allow_bare_key=False)
+        field = await _input_field(page, selector, timeout_ms)
+        typed = await _type_filter_query(field, bare, allow_bare_key=False)
         if key:
             await field.press(key)
-        try:
-            await overlay.wait_for(state="visible", timeout=overlay_ms)
-            await overlay.wait_for(state="hidden", timeout=timeout_ms)
-        except Exception:
-            await asyncio.sleep(0.4)
+        await _wait_grid_overlay(page, overlay_ms, timeout_ms)
         count, text, row = await _wait_for_filter_rows(
             page,
             locators["sales_order_rows"],
@@ -832,15 +1053,88 @@ async def _filter_order_list(
             timeout_ms,
             accept_lone_row=False,
         )
-    if row is not None:
-        return row
-    if count > 1:
-        raise RuntimeError(f"More than one sales order matched {order_number}.")
-    if count == 1 and text:
-        raise RuntimeError(
-            f"The order on screen does not match {order_number} ({text})."
+    return count, text, row, typed
+
+
+async def _filter_order_list(
+    page: Page,
+    order_number: str,
+    locators: dict[str, str],
+    *,
+    timeout_ms: int,
+    overlay_ms: int,
+    submit_key: str,
+) -> tuple[Any, str]:
+    """Filter the list and return the matching row plus service or marketplace."""
+    kind = classify_order(order_number)
+    columns = await _collect_filter_columns(page)
+    targets = _search_targets(kind, columns)
+    if not targets:
+        raise RuntimeError(_missing_column_message(kind, columns))
+    logger.info(
+        "Order %s is a %s order; trying %s",
+        order_number.strip(),
+        kind,
+        ", ".join(
+            f"{role} {col.get('name') or col.get('colId')}"
+            for role, col in targets
+        ),
+    )
+    await _clear_columns(
+        page,
+        _columns_to_clear(columns),
+        submit_key,
+        overlay_ms=overlay_ms,
+        timeout_ms=timeout_ms,
+    )
+    tried: list[str] = []
+    last_count = 0
+    last_text = ""
+    for role, column in targets:
+        label = str(column.get("name") or column.get("colId") or "?")
+        tried.append(label)
+        logger.info(
+            "Searching %s column %s (%s) for %s",
+            "sales order" if role == "service" else "order number",
+            label,
+            column.get("colId"),
+            order_number.strip(),
         )
-    raise RuntimeError(f"No sales order matched {order_number}.")
+        count, text, row, _typed = await _run_column_search(
+            page,
+            order_number,
+            column,
+            role,
+            locators,
+            timeout_ms=timeout_ms,
+            overlay_ms=overlay_ms,
+            submit_key=submit_key,
+        )
+        if row is not None:
+            return row, role
+        if count > 1:
+            raise RuntimeError(f"More than one sales order matched {order_number}.")
+        if count == 1 and text and role == "service":
+            raise RuntimeError(
+                f"The order on screen does not match {order_number} ({text})."
+            )
+        last_count = count
+        last_text = text
+        await _clear_columns(
+            page,
+            [column],
+            submit_key,
+            overlay_ms=overlay_ms,
+            timeout_ms=timeout_ms,
+        )
+    if last_count == 1 and last_text:
+        raise RuntimeError(
+            f"The order on screen does not match {order_number} ({last_text})."
+        )
+    where = ", ".join(tried)
+    raise RuntimeError(
+        f"No sales order matched {order_number}. Searched {where}."
+    )
 
 
 async def _wait_for_detail_page(
@@ -875,10 +1169,10 @@ async def _open_order_from_list(
     action_ms: int,
     overlay_ms: int,
     submit_key: str,
-) -> Page:
+) -> tuple[Page, str]:
     list_page = await _open_list_page(browser, locators, action_ms)
     list_page.set_default_timeout(action_ms)
-    row = await _filter_order_list(
+    row, role = await _filter_order_list(
         list_page,
         order_number,
         locators,
@@ -890,7 +1184,7 @@ async def _open_order_from_list(
     foreground = capture_foreground()
     try:
         await _click_order_row(row, order_number)
-        return await _wait_for_detail_page(
+        page = await _wait_for_detail_page(
             browser,
             list_page,
             known_urls,
@@ -898,6 +1192,7 @@ async def _open_order_from_list(
             locators["sales_orders_url_pattern"],
             timeout_ms,
         )
+        return page, role
     finally:
         restore_foreground(*foreground)
 
@@ -939,12 +1234,13 @@ async def prepare_sales_order(
     detail_pattern = locators["sales_order_detail_pattern"]
     list_pattern = locators["sales_orders_url_pattern"]
     typed = normalize_order_number(order_number)
-    external = external_order_number(typed)
+    kind = classify_order(typed)
     details = _detail_pages(browser, detail_pattern, list_pattern)
     keeper: Optional[Page] = None
+    role = "service"
 
     if typed:
-        if not external:
+        if kind == "service":
             for page in details:
                 label = await read_service_order(
                     page,
@@ -956,7 +1252,7 @@ async def prepare_sales_order(
                     logger.info("Reusing sales order tab %s (%s)", page.url, label)
                     break
         if keeper is None:
-            keeper = await _open_order_from_list(
+            keeper, role = await _open_order_from_list(
                 browser,
                 typed,
                 locators,
@@ -965,18 +1261,7 @@ async def prepare_sales_order(
                 overlay_ms=overlay_ms,
                 submit_key=submit_key,
             )
-        if external:
-            label = await wait_for_service_order_text(
-                keeper,
-                locators["service_order_label"],
-                timeout_ms,
-            )
-            if not label:
-                raise RuntimeError(
-                    f"Opened order for {typed} did not show a service order number."
-                )
-            logger.info("Opened %s as service order %s", typed, label)
-        else:
+        if role == "service":
             label = await wait_for_service_order_match(
                 keeper,
                 locators["service_order_label"],
@@ -988,6 +1273,17 @@ async def prepare_sales_order(
                     f"Opened order does not match {typed}"
                     + (f" ({label})." if label else ".")
                 )
+        else:
+            label = await wait_for_service_order_text(
+                keeper,
+                locators["service_order_label"],
+                timeout_ms,
+            )
+            if not label:
+                raise RuntimeError(
+                    f"Opened order for {typed} did not show a service order number."
+                )
+            logger.info("Opened %s as service order %s", typed, label)
     else:
         if not details:
             raise RuntimeError("No sales order tab is open.")
@@ -1021,10 +1317,6 @@ async def _clear_order_filter(
     """Empty the sales-order search so the restored list is not stuck on one order."""
     list_pattern = locators["sales_orders_url_pattern"]
     detail_pattern = locators["sales_order_detail_pattern"]
-    selectors = [
-        locators["sales_order_filter"],
-        locators.get("sales_order_external_filter", ""),
-    ]
     foreground = capture_foreground()
     try:
         for page in _iter_pages(browser):
@@ -1033,24 +1325,19 @@ async def _clear_order_filter(
                 continue
             if _is_detail_url(url, detail_pattern, list_pattern):
                 continue
-            for selector in selectors:
-                if not selector:
-                    continue
-                try:
-                    await _scroll_filter_into_view(page, selector)
-                    root = page.locator(selector).first
-                    inner = root.locator("input:not([type='hidden'])")
-                    field = inner.first if await inner.count() > 0 else root
-                    await field.fill("", timeout=3000)
-                    key = (submit_key or "").strip()
-                    if key:
-                        await field.press(key)
-                except Exception as exc:
-                    logger.info(
-                        "Could not clear the order filter on %s: %s", url, exc
-                    )
-                else:
-                    logger.info("Cleared order filter on %s", url)
+            try:
+                columns = await _collect_filter_columns(page)
+                await _clear_columns(
+                    page,
+                    _columns_to_clear(columns),
+                    submit_key,
+                    overlay_ms=1500,
+                    timeout_ms=8000,
+                )
+            except Exception as exc:
+                logger.info("Could not clear the order filter on %s: %s", url, exc)
+            else:
+                logger.info("Cleared order filters on %s", url)
             await _scroll_grid_home(page)
     finally:
         restore_foreground(*foreground)

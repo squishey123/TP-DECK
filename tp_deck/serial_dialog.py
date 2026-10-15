@@ -78,16 +78,18 @@ class SerialDialog(QDialog):
         layout.setSpacing(8)
 
         hint = QLabel(
-            "Paste one serial number per line. An SO number (so- or SO-), "
-            "an eBay order (12-34567-89012), or a store order (digits only) "
-            "opens that order first. Leave it blank to use the one sales "
-            "order already open."
+            "Paste one serial number per line. "
+            "SO-12345 searches the sales order number. "
+            "An eBay order (12-34567-89012) searches the eBay order number, "
+            "not Source Type. A digits-only store order searches that order "
+            "number, then the sales order number. Leave it blank to use the "
+            "one sales order already open."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         self._order = QLineEdit()
-        self._order.setPlaceholderText("SO, eBay, or store order")
+        self._order.setPlaceholderText("SO-12345, eBay order, or store order")
         layout.addWidget(self._order)
 
         self._editor = QTextEdit()

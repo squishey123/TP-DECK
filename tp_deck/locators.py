@@ -32,6 +32,8 @@ DEFAULTS: dict[str, str] = {
     "sales_orders_url": "https://techyparts.razorerp.com/Admin/SalesOrders.aspx",
     "sales_orders_url_pattern": "SalesOrders.aspx",
     "sales_order_detail_pattern": "SalesOrder.aspx?orderId=",
+    # Kept so older locators.json files still load. Batch serial chooses
+    # the column from its header and does not type into these positions.
     "sales_order_filter": (
         "#ag-grid .ag-header-row-floating-filter > div:nth-child(1) input"
     ),

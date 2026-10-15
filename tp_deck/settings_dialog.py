@@ -141,13 +141,13 @@ Scrape eBay Orders and Generate Pick List also read store orders from the open S
 
 Generate Pick List does the same lookup and copies a walk-sorted quantity list.
 
-Batch Serial types serial numbers into a Razor sales order. An SO number, an eBay order number, or a store order number opens that order first. A blank number uses the one open order tab.
+Batch Serial types serial numbers into a Razor sales order. SO-12345 searches the sales order number. An eBay order number searches the eBay order column, not Source Type. A digits-only store order searches that order number, then the sales order number. A blank number uses the one open order tab.
 
 The power button shuts down for the day. The panel fades to grey for 5 seconds. Emergency Stop during that fade cancels it. Otherwise TP DECK finishes the current task, closes extra sales-order tabs, and closes Chromium.
 
 Emergency Stop and the Pause key cancel the current run.
 
-On a release install, opening TP DECK checks for a newer GitHub release. The action buttons pulse between yellow and grey for 5 seconds first. Emergency Stop cancels that update until the next launch. An update keeps the browser profile, settings, and saved SKUs.
+On a release install, opening TP DECK checks for a newer GitHub release. The status shows the version and the day it was released, and the action buttons pulse between yellow and grey for 5 seconds. Emergency Stop cancels that update until the next launch. A bar shows download progress. An update keeps the browser profile, settings, and saved SKUs.
 """
 
 
