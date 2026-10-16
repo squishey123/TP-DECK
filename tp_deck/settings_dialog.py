@@ -1,7 +1,8 @@
-"""Settings dialog — mode, ports, URL patterns, and a short guide."""
+"""Settings dialog — mode, ports, URL patterns, and timeouts."""
 
 from __future__ import annotations
 
+import html
 import logging
 from typing import Optional
 
@@ -18,7 +19,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSpinBox,
-    QTextEdit,
+    QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -103,13 +105,26 @@ QSpinBox, QLineEdit {
     border-radius: 3px;
     padding: 3px 6px;
 }
-QTextEdit {
-    background-color: #1E293B;
-    color: #CBD5E1;
-    border: 1px solid #334155;
-    border-radius: 4px;
-    font-family: Consolas, "Courier New", monospace;
+QWidget#infoHost {
+    background: transparent;
+}
+QToolButton#infoBtn {
+    background-color: transparent;
+    color: #0EA5E9;
+    border: 1px solid #0EA5E9;
+    border-radius: 9px;
+    min-width: 18px;
+    max-width: 18px;
+    min-height: 18px;
+    max-height: 18px;
+    padding: 0px;
     font-size: 11px;
+    font-weight: bold;
+    font-style: italic;
+}
+QToolButton#infoBtn:hover {
+    background-color: #0EA5E9;
+    color: #0F172A;
 }
 QPushButton {
     background-color: #1E293B;
@@ -132,23 +147,43 @@ QPushButton#saveBtn:hover {
 }
 """
 
-FUNCTION_HELP = """\
-Scrape eBay Orders reads the open Seller Hub list, looks up each SKU, and copies the result.
+def _tip(text: str) -> str:
+    body = html.escape(text).replace("\n", "<br>")
+    return (
+        '<qt><table width="280"><tr><td style="white-space: normal;">'
+        f"{body}</td></tr></table></qt>"
+    )
 
-The cycle button repeats that lookup on a timer and only fills the location cache. ShipStation store orders sync every few of those passes. Batch Serial stays available during a pass and runs when that pass finishes.
 
-Scrape eBay Orders and Generate Pick List also read store orders from the open ShipStation awaiting-shipment tab.
+def _show_info(button: QToolButton) -> None:
+    QToolTip.showText(
+        button.mapToGlobal(button.rect().bottomLeft()),
+        button.toolTip(),
+        button,
+    )
 
-Generate Pick List does the same lookup and copies a walk-sorted quantity list.
 
-Batch Serial types serial numbers into a Razor sales order. SO-12345 searches the sales order number. An eBay order number searches the eBay order column, not Source Type. A digits-only store order searches that order number, then the sales order number. A blank number uses the one open order tab.
+def _info_button(text: str) -> QToolButton:
+    button = QToolButton()
+    button.setObjectName("infoBtn")
+    button.setText("i")
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    button.setToolTip(_tip(text))
+    button.clicked.connect(lambda _checked=False, btn=button: _show_info(btn))
+    return button
 
-The power button shuts down for the day. The panel fades to grey for 5 seconds. Emergency Stop during that fade cancels it. Otherwise TP DECK finishes the current task, closes extra sales-order tabs, and closes Chromium.
 
-Emergency Stop and the Pause key cancel the current run.
-
-On a release install, opening TP DECK checks for a newer GitHub release. The status shows the version and the day it was released, and the action buttons pulse between yellow and grey for 5 seconds. Emergency Stop cancels that update until the next launch. A bar shows download progress. An update keeps the browser profile, settings, and saved SKUs.
-"""
+def _with_info(widget: QWidget, text: str) -> QWidget:
+    host = QWidget()
+    host.setObjectName("infoHost")
+    row = QHBoxLayout(host)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    row.addWidget(widget)
+    row.addStretch(1)
+    row.addWidget(_info_button(text))
+    return host
 
 
 class SettingsDialog(QDialog):
@@ -160,7 +195,6 @@ class SettingsDialog(QDialog):
         self.setWindowFlags(
             self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setMinimumSize(480, 960)
         self.setStyleSheet(DIALOG_QSS)
 
         self._build_ui()
@@ -179,8 +213,19 @@ class SettingsDialog(QDialog):
         )
         self.mode_group.addButton(self.single_radio, 0)
         self.mode_group.addButton(self.dual_radio, 1)
-        mode_layout.addWidget(self.single_radio)
-        mode_layout.addWidget(self.dual_radio)
+        mode_layout.addWidget(
+            _with_info(
+                self.single_radio,
+                "eBay and Razor share one Chromium window on the eBay port.",
+            )
+        )
+        mode_layout.addWidget(
+            _with_info(
+                self.dual_radio,
+                "eBay stays on the eBay port. Razor uses its own Chromium "
+                "window on the ERP port.",
+            )
+        )
         self.single_radio.toggled.connect(self._on_mode_toggled)
         layout.addWidget(mode_box)
 
@@ -188,123 +233,182 @@ class SettingsDialog(QDialog):
         ports_form = QFormLayout(ports_box)
         self.ebay_port_spin = QSpinBox()
         self.ebay_port_spin.setRange(1024, 65535)
-        ports_form.addRow("eBay port:", self.ebay_port_spin)
+        ports_form.addRow(
+            "eBay port:",
+            _with_info(
+                self.ebay_port_spin,
+                "DevTools port for the eBay Chromium window.",
+            ),
+        )
         self.erp_port_spin = QSpinBox()
         self.erp_port_spin.setRange(1024, 65535)
-        ports_form.addRow("ERP port:", self.erp_port_spin)
+        ports_form.addRow(
+            "ERP port:",
+            _with_info(
+                self.erp_port_spin,
+                "DevTools port for the Razor Chromium window. Used in Dual mode.",
+            ),
+        )
         self.ebay_pattern_edit = QLineEdit()
-        ports_form.addRow("eBay URL contains:", self.ebay_pattern_edit)
+        ports_form.addRow(
+            "eBay URL contains:",
+            _with_info(
+                self.ebay_pattern_edit,
+                "Text that must appear in the Seller Hub tab address. "
+                "TP DECK uses it to pick the right tab.",
+            ),
+        )
         self.erp_pattern_edit = QLineEdit()
         self.erp_pattern_edit.setPlaceholderText("required in single mode")
-        ports_form.addRow("ERP URL contains:", self.erp_pattern_edit)
+        ports_form.addRow(
+            "ERP URL contains:",
+            _with_info(
+                self.erp_pattern_edit,
+                "Text that must appear in the Razor tab address. In Single "
+                "mode this is how the Razor tab is told apart from eBay.",
+            ),
+        )
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(1000, 120000)
         self.timeout_spin.setSingleStep(500)
         self.timeout_spin.setSuffix(" ms")
-        ports_form.addRow("Wait timeout:", self.timeout_spin)
-        self.cache_enabled_check = QCheckBox("Cache SKU → location results")
-        self.cache_enabled_check.setToolTip(
-            "Turn off when bin locations are changing often so every run "
-            "looks up live ERP data."
+        ports_form.addRow(
+            "Wait timeout:",
+            _with_info(
+                self.timeout_spin,
+                "How long to wait for a page element before that step fails.",
+            ),
         )
-        ports_form.addRow("", self.cache_enabled_check)
+        self.cache_enabled_check = QCheckBox("Cache SKU → location results")
+        ports_form.addRow(
+            "",
+            _with_info(
+                self.cache_enabled_check,
+                "Turn off when bin locations are changing often so every run "
+                "looks up live ERP data.",
+            ),
+        )
         self.cache_ttl_edit = QLineEdit()
         self.cache_ttl_edit.setPlaceholderText("12h")
-        self.cache_ttl_edit.setToolTip(
-            "How long a cached location stays valid. "
-            "m minutes, h hours, d days, w weeks, M or mo months (30 days). "
-            "Lowercase m is minutes. A bare number is hours. "
-            "Examples: 30m, 4h, 12h, 1d."
+        ports_form.addRow(
+            "Cache lifetime:",
+            _with_info(
+                self.cache_ttl_edit,
+                "How long a cached location stays valid. "
+                "m minutes, h hours, d days, w weeks, M or mo months (30 days). "
+                "Lowercase m is minutes. A bare number is hours. "
+                "Examples: 30m, 4h, 12h, 1d.",
+            ),
         )
-        ports_form.addRow("Cache lifetime:", self.cache_ttl_edit)
         self.override_btn = QPushButton("Edit alternative SKUs")
-        self.override_btn.setToolTip(
-            "Original SKUs that should use another SKU's location, "
-            "including kit quantities."
-        )
         self.override_btn.clicked.connect(self._edit_overrides)
-        ports_form.addRow("", self.override_btn)
-        self.refresh_hold_check = QCheckBox("Skip eBay refresh when recent")
-        self.refresh_hold_check.setToolTip(
-            "If Seller Hub was reloaded inside this window, Execute and "
-            "Pick List continue without waiting for another refresh."
+        ports_form.addRow(
+            "",
+            _with_info(
+                self.override_btn,
+                "Original SKUs that should use another SKU's location, "
+                "including kit quantities.",
+            ),
         )
+        self.refresh_hold_check = QCheckBox("Skip eBay refresh when recent")
         self.refresh_hold_check.toggled.connect(self._on_refresh_hold_toggled)
-        ports_form.addRow("", self.refresh_hold_check)
+        ports_form.addRow(
+            "",
+            _with_info(
+                self.refresh_hold_check,
+                "If Seller Hub was reloaded inside this window, Scrape eBay "
+                "Orders and Pick List continue without waiting for another refresh.",
+            ),
+        )
         self.refresh_hold_spin = QSpinBox()
         self.refresh_hold_spin.setRange(1, 180)
         self.refresh_hold_spin.setSuffix(" min")
-        self.refresh_hold_spin.setToolTip(
-            "How long a completed eBay refresh stays valid. "
-            "Uncheck the option above to refresh on every run."
+        ports_form.addRow(
+            "eBay refresh hold:",
+            _with_info(
+                self.refresh_hold_spin,
+                "How long a completed eBay refresh stays valid. "
+                "Uncheck the option above to refresh on every run.",
+            ),
         )
-        ports_form.addRow("eBay refresh hold:", self.refresh_hold_spin)
         self.results_popup_check = QCheckBox("Show results popup after copy")
-        self.results_popup_check.setToolTip(
-            "After Scrape eBay Orders or Generate Pick List, open a small "
-            "window with the text that was copied to the clipboard."
+        ports_form.addRow(
+            "",
+            _with_info(
+                self.results_popup_check,
+                "After Scrape eBay Orders or Generate Pick List, open a small "
+                "window with the text that was copied to the clipboard.",
+            ),
         )
-        ports_form.addRow("", self.results_popup_check)
         self.autocycle_spin = QSpinBox()
         self.autocycle_spin.setRange(1, 180)
         self.autocycle_spin.setSuffix(" min")
-        self.autocycle_spin.setToolTip(
-            "Wait between auto-cycle scrapes. The cycle button on the main "
-            "window turns this on. Those passes fill the SKU cache only."
+        ports_form.addRow(
+            "Auto-cycle wait:",
+            _with_info(
+                self.autocycle_spin,
+                "Wait between auto-cycle scrapes. The cycle button on the main "
+                "window turns this on. Those passes fill the SKU cache only.",
+            ),
         )
-        ports_form.addRow("Auto-cycle wait:", self.autocycle_spin)
         self.shipstation_every_spin = QSpinBox()
         self.shipstation_every_spin.setRange(1, 99)
         self.shipstation_every_spin.setSuffix(" auto-cycles")
-        self.shipstation_every_spin.setToolTip(
-            "How many auto-cycle passes run between ShipStation syncs. "
-            "The first pass after auto-cycle is turned on always syncs. "
-            "1 syncs on every pass."
+        ports_form.addRow(
+            "Sync ShipStation every:",
+            _with_info(
+                self.shipstation_every_spin,
+                "How many auto-cycle passes run between ShipStation syncs. "
+                "The first pass after auto-cycle is turned on always syncs. "
+                "1 syncs on every pass.",
+            ),
         )
-        ports_form.addRow("Sync ShipStation every:", self.shipstation_every_spin)
         self.serial_timeout_spin = QSpinBox()
         self.serial_timeout_spin.setRange(1000, 60000)
         self.serial_timeout_spin.setSingleStep(500)
         self.serial_timeout_spin.setSuffix(" ms")
-        self.serial_timeout_spin.setToolTip(
-            "How long to wait for the serial box to clear before skipping "
-            "that serial. Two skips in a row cancel the batch."
+        ports_form.addRow(
+            "Serial timeout:",
+            _with_info(
+                self.serial_timeout_spin,
+                "How long to wait for the serial box to clear before skipping "
+                "that serial. Two skips in a row cancel the batch.",
+            ),
         )
-        ports_form.addRow("Serial timeout:", self.serial_timeout_spin)
         self.serial_confirm_spin = QSpinBox()
         self.serial_confirm_spin.setRange(100, 5000)
         self.serial_confirm_spin.setSingleStep(100)
         self.serial_confirm_spin.setSuffix(" ms")
-        self.serial_confirm_spin.setToolTip(
-            "After the serial box looks empty, wait this long and check "
-            "again before entering the next serial."
+        ports_form.addRow(
+            "Serial clear confirm:",
+            _with_info(
+                self.serial_confirm_spin,
+                "After the serial box looks empty, wait this long and check "
+                "again before entering the next serial.",
+            ),
         )
-        ports_form.addRow("Serial clear confirm:", self.serial_confirm_spin)
         self.slow_razor_check = QCheckBox("Slow Razor mode")
-        self.slow_razor_check.setToolTip(
-            "Stretch ERP locator, grid, and serial waits by the multiplier. "
-            "This checkbox turns off every time TP DECK starts. "
-            "The multiplier is saved."
+        ports_form.addRow(
+            "",
+            _with_info(
+                self.slow_razor_check,
+                "Stretch ERP locator, grid, and serial waits by the multiplier. "
+                "This checkbox turns off every time TP DECK starts. "
+                "The multiplier is saved.",
+            ),
         )
-        ports_form.addRow("", self.slow_razor_check)
         self.slow_razor_spin = QSpinBox()
         self.slow_razor_spin.setRange(1, 20)
-        self.slow_razor_spin.setToolTip(
-            "How many times longer those ERP waits become while Slow Razor "
-            "is on. 10 turns the 30s locator into 300s, a 10s wait into 100s, "
-            "and the 0.5s serial confirm into 5s."
+        ports_form.addRow(
+            "Slow Razor multiplier:",
+            _with_info(
+                self.slow_razor_spin,
+                "How many times longer those ERP waits become while Slow Razor "
+                "is on. 10 turns the 30s locator into 300s, a 10s wait into 100s, "
+                "and the 0.5s serial confirm into 5s.",
+            ),
         )
-        ports_form.addRow("Slow Razor multiplier:", self.slow_razor_spin)
         layout.addWidget(ports_box)
-
-        help_box = QGroupBox("What the buttons do")
-        help_layout = QVBoxLayout(help_box)
-        self.help_text = QTextEdit()
-        self.help_text.setReadOnly(True)
-        self.help_text.setPlainText(FUNCTION_HELP)
-        self.help_text.setMinimumHeight(160)
-        help_layout.addWidget(self.help_text)
-        layout.addWidget(help_box)
 
         buttons = QHBoxLayout()
         buttons.addStretch()

@@ -594,15 +594,16 @@ _SCROLL_GRID_JS = """
     if (!root) return false;
     const nodes = [
         '.ag-body-horizontal-scroll-viewport',
-        '.ag-header-viewport',
         '.ag-center-cols-viewport',
+        '.ag-header-viewport',
     ].map((sel) => root.querySelector(sel)).filter(Boolean);
     if (!nodes.length) return false;
     for (const node of nodes) {
         node.scrollLeft = left;
     }
-    const bar = root.querySelector('.ag-body-horizontal-scroll-viewport');
-    if (bar) bar.dispatchEvent(new Event('scroll'));
+    for (const node of nodes) {
+        node.dispatchEvent(new Event('scroll', { bubbles: true }));
+    }
     return true;
 }
 """
@@ -611,14 +612,22 @@ _GRID_SCROLL_METRICS_JS = """
 () => {
     const root = document.querySelector('#ag-grid');
     if (!root) return { max: 0, step: 200 };
-    const node = root.querySelector('.ag-header-viewport')
-        || root.querySelector('.ag-center-cols-viewport')
-        || root.querySelector('.ag-body-horizontal-scroll-viewport');
-    if (!node) return { max: 0, step: 200 };
-    return {
-        max: Math.max(0, node.scrollWidth - node.clientWidth),
-        step: Math.max(120, Math.floor(node.clientWidth * 0.45)),
-    };
+    const nodes = [
+        '.ag-body-horizontal-scroll-viewport',
+        '.ag-center-cols-viewport',
+        '.ag-header-viewport',
+    ].map((sel) => root.querySelector(sel)).filter(Boolean);
+    if (!nodes.length) return { max: 0, step: 200 };
+    let max = 0;
+    let step = 200;
+    for (const node of nodes) {
+        max = Math.max(max, node.scrollWidth - node.clientWidth);
+        const width = node.clientWidth || 0;
+        if (width > 40) {
+            step = Math.min(step, Math.max(120, Math.floor(width * 0.45)));
+        }
+    }
+    return { max: Math.max(0, max), step };
 }
 """
 
@@ -639,53 +648,213 @@ _FILTER_ON_SCREEN_JS = """
 }
 """
 
+# Filter rows have been ag-header-row-floating-filter, ag-header-row-column-filter,
+# and ag-header-row-filter. The collector accepts all three, plus any header
+# cell that contains a text input.
+_FILTER_READY_JS = """
+() => {
+    const header = document.querySelector('#ag-grid .ag-header');
+    if (!header) return false;
+    return !!header.querySelector(
+        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
+    );
+}
+"""
+
+_HEADER_DEBUG_JS = """
+() => {
+    const root = document.querySelector('#ag-grid');
+    if (!root) return { grid: false };
+    const header = root.querySelector('.ag-header');
+    const rows = header
+        ? Array.from(header.querySelectorAll('.ag-header-row')).map((row) => row.className)
+        : [];
+    const sampleInput = header && header.querySelector(
+        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
+    );
+    const cell = sampleInput && (
+        sampleInput.closest('[col-id]') || sampleInput.closest('.ag-header-cell') || sampleInput.parentElement
+    );
+    return {
+        grid: true,
+        rows,
+        floating: root.querySelectorAll('.ag-floating-filter').length,
+        sampleClass: cell ? String(cell.className || '') : '',
+        sampleColId: cell ? (cell.getAttribute('col-id') || '') : '',
+    };
+}
+"""
+
 _FILTER_COLUMNS_JS = """
 () => {
     const root = document.querySelector('#ag-grid');
     if (!root) return [];
-    const cells = root.querySelectorAll(
-        '.ag-header-row-floating-filter .ag-header-cell'
+    const header = root.querySelector('.ag-header') || root;
+    const filterRowSelector = (
+        '.ag-header-row-floating-filter, .ag-header-row-column-filter, .ag-header-row-filter'
     );
-    const out = [];
-    for (const cell of cells) {
+    const byId = new Map();
+    const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+    const touch = (colId) => {
+        let row = byId.get(colId);
+        if (!row) {
+            row = { colId, name: '', hasInput: false, selector: '' };
+            byId.set(colId, row);
+        }
+        return row;
+    };
+    const inputOf = (cell) => cell.querySelector(
+        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
+    );
+    const usableInput = (input) => {
+        if (!input) return false;
+        const type = (input.getAttribute('type') || 'text').toLowerCase();
+        return type !== 'hidden' && type !== 'checkbox' && type !== 'radio'
+            && type !== 'button' && type !== 'submit';
+    };
+    const cellSelector = (cell) => {
+        const colId = cell.getAttribute('col-id') || '';
+        if (colId) {
+            return '#ag-grid .ag-header [col-id="' + CSS.escape(colId) + '"]';
+        }
+        const row = cell.parentElement;
+        if (!row) return '';
+        const index = Array.prototype.indexOf.call(row.children, cell) + 1;
+        if (index < 1) return '';
+        let rowClass = '';
+        if (row.classList.contains('ag-header-row-floating-filter')) {
+            rowClass = '.ag-header-row-floating-filter';
+        } else if (row.classList.contains('ag-header-row-column-filter')) {
+            rowClass = '.ag-header-row-column-filter';
+        } else if (row.classList.contains('ag-header-row-filter')) {
+            rowClass = '.ag-header-row-filter';
+        } else {
+            return '';
+        }
+        let container = '';
+        if (cell.closest('.ag-pinned-left-header')) container = '.ag-pinned-left-header ';
+        else if (cell.closest('.ag-pinned-right-header')) container = '.ag-pinned-right-header ';
+        else if (cell.closest('.ag-header-viewport')) container = '.ag-header-viewport ';
+        return '#ag-grid ' + container + rowClass + ' > :nth-child(' + index + ')';
+    };
+    const noteInput = (record, cell) => {
+        if (!usableInput(inputOf(cell))) return;
+        record.hasInput = true;
+        if (!record.selector) {
+            const sel = cellSelector(cell);
+            if (sel) {
+                record.selector = sel
+                    + ' input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])';
+            }
+        }
+    };
+
+    for (const cell of header.querySelectorAll('[col-id]')) {
         const colId = cell.getAttribute('col-id') || '';
         if (!colId) continue;
-        let name = '';
-        const headers = root.querySelectorAll(
-            '.ag-header-cell[col-id="' + CSS.escape(colId) + '"]'
-        );
-        for (const header of headers) {
-            if (header.closest('.ag-header-row-floating-filter')) continue;
-            const text = (header.innerText || header.textContent || '')
-                .replace(/\\s+/g, ' ')
-                .trim();
-            if (text) {
-                name = text;
+        const record = touch(colId);
+        const filterish = cell.classList.contains('ag-floating-filter')
+            || !!cell.closest(filterRowSelector)
+            || usableInput(inputOf(cell));
+        if (!filterish) {
+            const text = clean(cell.innerText || cell.textContent || '');
+            if (text && !record.name) record.name = text;
+            continue;
+        }
+        noteInput(record, cell);
+        if (!record.name) {
+            const label = clean(cell.getAttribute('aria-label') || '');
+            if (label) record.name = label;
+        }
+    }
+
+    const containers = header.querySelectorAll(
+        '.ag-pinned-left-header, .ag-header-viewport, .ag-pinned-right-header, .ag-header'
+    );
+    containers.forEach((container, containerIndex) => {
+        const rows = Array.from(container.querySelectorAll(':scope > .ag-header-row, :scope > .ag-header-container .ag-header-row'));
+        if (!rows.length && container.classList.contains('ag-header')) return;
+        const filterRow = rows.find((row) => usableInput(inputOf(row)));
+        if (!filterRow) return;
+        const headerRow = container.querySelector('.ag-header-row-column');
+        const filters = Array.from(filterRow.children);
+        const headers = headerRow ? Array.from(headerRow.children) : [];
+        filters.forEach((cell, index) => {
+            const headerCell = headers[index];
+            const colId = cell.getAttribute('col-id')
+                || (headerCell && headerCell.getAttribute('col-id'))
+                || ('idx-' + containerIndex + '-' + index);
+            const record = touch(colId);
+            if (!record.name && headerCell) {
+                const text = clean(headerCell.innerText || headerCell.textContent || '');
+                if (text) record.name = text;
+            }
+            noteInput(record, cell);
+        });
+    });
+
+    return Array.from(byId.values()).filter((row) => row.name || row.hasInput);
+}
+"""
+
+_ENSURE_COLUMN_JS = """
+(colId) => {
+    const root = document.querySelector('#ag-grid');
+    if (!root || !colId) return false;
+    const nodes = [root];
+    const wrap = root.querySelector('.ag-root-wrapper');
+    const agRoot = root.querySelector('.ag-root');
+    if (wrap) nodes.push(wrap);
+    if (agRoot) nodes.push(agRoot);
+    let api = null;
+    for (const node of nodes) {
+        let names = [];
+        try { names = Object.getOwnPropertyNames(node); } catch (e) { continue; }
+        for (const key of names) {
+            if (key !== 'api' && key !== 'gridApi' && key.indexOf('__ag') !== 0) continue;
+            let value;
+            try { value = node[key]; } catch (e) { continue; }
+            if (!value || typeof value !== 'object') continue;
+            if (typeof value.ensureColumnVisible === 'function') {
+                api = value;
+                break;
+            }
+            if (value.api && typeof value.api.ensureColumnVisible === 'function') {
+                api = value.api;
+                break;
+            }
+            if (value.gridApi && typeof value.gridApi.ensureColumnVisible === 'function') {
+                api = value.gridApi;
                 break;
             }
         }
-        const input = cell.querySelector(
-            'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
-        );
-        let hasInput = false;
-        if (input) {
-            const type = (input.getAttribute('type') || 'text').toLowerCase();
-            hasInput = type !== 'hidden' && type !== 'checkbox' && type !== 'radio'
-                && type !== 'button' && type !== 'submit';
-        }
-        out.push({ colId, name, hasInput });
+        if (api) break;
     }
-    return out;
+    if (!api) return false;
+    try {
+        api.ensureColumnVisible(colId);
+        return true;
+    } catch (e) {
+        return false;
+    }
 }
 """
 
 
 def _col_filter_selector(col_id: str) -> str:
+    safe = _css_attr(col_id)
     return (
-        "#ag-grid .ag-header-row-floating-filter "
-        f'.ag-header-cell[col-id="{_css_attr(col_id)}"] '
+        "#ag-grid .ag-header "
+        f'[col-id="{safe}"] '
         'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
     )
+
+
+def _filter_selector(column: dict[str, Any]) -> str:
+    custom = str(column.get("selector") or "").strip()
+    if custom:
+        return custom
+    return _col_filter_selector(str(column.get("colId") or ""))
 
 
 async def _scroll_grid_to(page: Page, left: float) -> None:
@@ -722,9 +891,25 @@ async def _scroll_grid_home(page: Page) -> None:
     await asyncio.sleep(0.08)
 
 
-async def _scroll_filter_into_view(page: Page, selector: str) -> None:
+async def _ensure_column_visible(page: Page, col_id: str) -> None:
+    """Ask AG Grid to render a column that is outside the current viewport."""
+    if not col_id or col_id.startswith("idx-"):
+        return
+    try:
+        shown = await page.evaluate(_ENSURE_COLUMN_JS, col_id)
+    except Exception as exc:
+        logger.info("Could not show sales order column %s: %s", col_id, exc)
+        return
+    if shown:
+        await asyncio.sleep(0.12)
+
+
+async def _scroll_filter_into_view(page: Page, selector: str, col_id: str = "") -> None:
     """Scroll sideways until a virtualized filter column is actually rendered."""
     if not selector:
+        return
+    await _ensure_column_visible(page, col_id)
+    if await _filter_on_screen(page, selector):
         return
     await _scroll_grid_to(page, 0)
     await asyncio.sleep(0.12)
@@ -758,18 +943,44 @@ def _merge_column(found: dict[str, dict[str, Any]], col: dict[str, Any]) -> None
     current = found.get(col_id)
     name = str(col.get("name") or "").strip()
     has_input = bool(col.get("hasInput"))
+    selector = str(col.get("selector") or "").strip()
     if current is None:
-        found[col_id] = {"colId": col_id, "name": name, "hasInput": has_input}
+        found[col_id] = {
+            "colId": col_id,
+            "name": name,
+            "hasInput": has_input,
+            "selector": selector,
+        }
         return
     if name and not current.get("name"):
         current["name"] = name
     if has_input:
         current["hasInput"] = True
+    if selector and not current.get("selector"):
+        current["selector"] = selector
+
+
+async def _wait_for_header_filters(page: Page, timeout_s: float = 8.0) -> bool:
+    """Wait until the sales order header has a filter box, not just column titles."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            ready = bool(await page.evaluate(_FILTER_READY_JS))
+        except Exception:
+            ready = False
+        if ready:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.2)
 
 
 async def _collect_filter_columns(page: Page) -> list[dict[str, Any]]:
     """Read every floating-filter header, including columns outside the viewport."""
     found: dict[str, dict[str, Any]] = {}
+    ready = await _wait_for_header_filters(page)
+    if not ready:
+        logger.info("Sales order header had no filter boxes before the scan")
 
     async def absorb() -> None:
         try:
@@ -807,6 +1018,12 @@ async def _collect_filter_columns(page: Page) -> list[dict[str, Any]]:
         )
         or "none",
     )
+    if not columns:
+        try:
+            detail = await page.evaluate(_HEADER_DEBUG_JS)
+        except Exception as exc:
+            detail = str(exc)
+        logger.info("Sales order filter scan details: %s", detail)
     return columns
 
 
@@ -990,8 +1207,8 @@ async def _clear_columns(
         col_id = str(col.get("colId") or "")
         if not col_id:
             continue
-        selector = _col_filter_selector(col_id)
-        await _scroll_filter_into_view(page, selector)
+        selector = _filter_selector(col)
+        await _scroll_filter_into_view(page, selector, col_id)
         if await _clear_filter_if_set(page, selector, submit_key):
             logger.info("Cleared filter %s (%s)", col.get("name") or "?", col_id)
             await _wait_grid_overlay(page, overlay_ms, timeout_ms)
@@ -1009,8 +1226,8 @@ async def _run_column_search(
     submit_key: str,
 ) -> tuple[int, str, Optional[Any], str]:
     """Type into one column. Returns count, text, row, and the text that was kept."""
-    selector = _col_filter_selector(str(column.get("colId") or ""))
-    await _scroll_filter_into_view(page, selector)
+    selector = _filter_selector(column)
+    await _scroll_filter_into_view(page, selector, str(column.get("colId") or ""))
     field = await _input_field(page, selector, timeout_ms)
     query = order_number.strip()
     typed = await _type_filter_query(field, query, allow_bare_key=role == "service")
