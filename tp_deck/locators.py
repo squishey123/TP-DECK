@@ -32,14 +32,16 @@ DEFAULTS: dict[str, str] = {
     "sales_orders_url": "https://techyparts.razorerp.com/Admin/SalesOrders.aspx",
     "sales_orders_url_pattern": "SalesOrders.aspx",
     "sales_order_detail_pattern": "SalesOrder.aspx?orderId=",
-    # Kept so older locators.json files still load. Batch serial chooses
-    # the column from its header and does not type into these positions.
+    # SO # is the first floating filter. PO (eBay or store order) is the eighth.
     "sales_order_filter": (
-        "#ag-grid .ag-header-row-floating-filter > div:nth-child(1) input"
+        "#ag-grid .ag-header-viewport "
+        ".ag-header-row-floating-filter > div:nth-child(1) "
+        ".ag-floating-filter-body"
     ),
     "sales_order_external_filter": (
         "#ag-grid .ag-header-viewport "
-        ".ag-header-row-floating-filter > div:nth-child(11)"
+        ".ag-header-row-floating-filter > div:nth-child(8) "
+        ".ag-floating-filter-body"
     ),
     "sales_order_rows": "#ag-grid .ag-center-cols-container .ag-row",
     "service_order_label": (

@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime
@@ -172,6 +174,35 @@ def _open(url: str, timeout: float):
         },
     )
     return urllib.request.urlopen(request, timeout=timeout)
+
+
+def fetch_by_tag(repo: str, tag: str) -> Optional[dict[str, Any]]:
+    """Release payload for one tag, such as v0.3.4. None when the lookup fails."""
+    slug = repo.strip().strip("/")
+    wanted = tag.strip()
+    if wanted[:1] not in {"v", "V"}:
+        wanted = "v" + wanted
+    if not slug or wanted == "v":
+        return None
+    safe = urllib.parse.quote(wanted, safe="")
+    url = f"https://api.github.com/repos/{slug}/releases/tags/{safe}"
+    try:
+        with _open(url, _API_TIMEOUT_S) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        logger.info("Release notes lookup failed: %s", exc)
+        return None
+    if not isinstance(payload, dict):
+        logger.info("Release notes lookup returned an unexpected response")
+        return None
+    return payload
+
+
+def release_notes_markdown(release: dict[str, Any]) -> str:
+    """The release body with GitHub's HTML comments removed."""
+    body = str(release.get("body") or "").replace("\r\n", "\n").replace("\r", "\n")
+    body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    return body.strip()
 
 
 def fetch_latest(repo: str) -> Optional[dict[str, Any]]:

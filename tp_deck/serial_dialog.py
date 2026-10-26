@@ -79,11 +79,11 @@ class SerialDialog(QDialog):
 
         hint = QLabel(
             "Paste one serial number per line. "
-            "SO-12345 searches the sales order number. "
-            "An eBay order (12-34567-89012) searches the eBay order number, "
-            "not Source Type. A digits-only store order searches that order "
-            "number, then the sales order number. Leave it blank to use the "
-            "one sales order already open."
+            "SO-12345 searches the SO # column. "
+            "An eBay order (12-34567-89012) or a digits-only store order "
+            "searches the PO column. A digits-only number also tries SO # "
+            "when PO has no match. Leave it blank to use the one sales "
+            "order already open."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)

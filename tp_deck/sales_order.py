@@ -176,7 +176,9 @@ def marketplace_column_score(name: str, col_id: str, kind: str) -> int:
         score = max(score, 80)
     if re.search(r"\bext\b", low_text):
         score = max(score, 75)
-    if re.search(r"\bpo\b|p\.o\.|purchase\s*order", low_text) or re.search(
+    if re.fullmatch(r"p\.?o\.?\s*#?", text, flags=re.IGNORECASE):
+        score = max(score, 110)
+    elif re.search(r"\bpo\b|p\.o\.|purchase\s*order", low_text) or re.search(
         r"ponumber|po_number|pono|po_no",
         low_id,
     ):
@@ -233,6 +235,32 @@ def _detail_pages(
     ]
 
 
+_EDITOR_SELECTOR = (
+    "input:not([type='hidden']):not([type='checkbox']):not([type='radio']):"
+    "not([type='button']):not([type='submit']), textarea, "
+    "[contenteditable='true'], [role='textbox']"
+)
+
+
+async def _editable_inside(root):
+    """The text box inside a floating-filter body, when the grid has drawn one."""
+    inner = root.locator(_EDITOR_SELECTOR)
+    try:
+        count = await inner.count()
+    except Exception:
+        return None
+    if count <= 0:
+        return None
+    for index in range(count):
+        candidate = inner.nth(index)
+        try:
+            if await candidate.is_visible():
+                return candidate
+        except Exception:
+            continue
+    return inner.first
+
+
 async def _input_field(page: Page, selector: str, timeout_ms: int):
     root = page.locator(selector).first
     try:
@@ -242,11 +270,22 @@ async def _input_field(page: Page, selector: str, timeout_ms: int):
             f"Timed out waiting for the sales order filter ({selector}). "
             "Open the sales order list and check locators.json."
         ) from exc
-    inner = root.locator("input:not([type='hidden'])")
-    if await inner.count() > 0:
-        field = inner.first
-        await field.wait_for(state="visible", timeout=timeout_ms)
+    try:
+        await root.click(timeout=min(timeout_ms, 3000))
+    except Exception as exc:
+        logger.info("Could not click sales order filter %s: %s", selector, exc)
+    await asyncio.sleep(0.05)
+    field = await _editable_inside(root)
+    if field is not None:
         return field
+    focused = page.locator(
+        "input:focus, textarea:focus, [role='textbox']:focus"
+    )
+    try:
+        if await focused.count() > 0:
+            return focused.first
+    except Exception:
+        pass
     return root
 
 
@@ -648,13 +687,15 @@ _FILTER_ON_SCREEN_JS = """
 }
 """
 
-# Filter rows have been ag-header-row-floating-filter, ag-header-row-column-filter,
-# and ag-header-row-filter. The collector accepts all three, plus any header
-# cell that contains a text input.
+# The sales order grid keeps the filter boxes in ag-header-row-floating-filter.
+# SO # is the first box and PO is the eighth. Each box is an ag-floating-filter-body.
 _FILTER_READY_JS = """
 () => {
     const header = document.querySelector('#ag-grid .ag-header');
     if (!header) return false;
+    if (header.querySelector('.ag-header-row-floating-filter .ag-floating-filter-body')) {
+        return true;
+    }
     return !!header.querySelector(
         'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
     );
@@ -666,21 +707,21 @@ _HEADER_DEBUG_JS = """
     const root = document.querySelector('#ag-grid');
     if (!root) return { grid: false };
     const header = root.querySelector('.ag-header');
+    const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
     const rows = header
         ? Array.from(header.querySelectorAll('.ag-header-row')).map((row) => row.className)
         : [];
-    const sampleInput = header && header.querySelector(
-        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
-    );
-    const cell = sampleInput && (
-        sampleInput.closest('[col-id]') || sampleInput.closest('.ag-header-cell') || sampleInput.parentElement
-    );
+    const labels = header
+        ? Array.from(header.querySelectorAll('.ag-header-row-column .ag-header-cell-text'))
+            .map((el) => clean(el.textContent))
+            .filter(Boolean)
+        : [];
     return {
         grid: true,
         rows,
+        labels: labels.slice(0, 16),
         floating: root.querySelectorAll('.ag-floating-filter').length,
-        sampleClass: cell ? String(cell.className || '') : '',
-        sampleColId: cell ? (cell.getAttribute('col-id') || '') : '',
+        bodies: root.querySelectorAll('.ag-floating-filter-body').length,
     };
 }
 """
@@ -690,110 +731,59 @@ _FILTER_COLUMNS_JS = """
     const root = document.querySelector('#ag-grid');
     if (!root) return [];
     const header = root.querySelector('.ag-header') || root;
-    const filterRowSelector = (
-        '.ag-header-row-floating-filter, .ag-header-row-column-filter, .ag-header-row-filter'
-    );
-    const byId = new Map();
     const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-    const touch = (colId) => {
-        let row = byId.get(colId);
-        if (!row) {
-            row = { colId, name: '', hasInput: false, selector: '' };
-            byId.set(colId, row);
-        }
-        return row;
+    const cssEscape = (value) => {
+        if (window.CSS && CSS.escape) return CSS.escape(value);
+        return String(value).replace(/"/g, '\\\\"');
     };
     const inputOf = (cell) => cell.querySelector(
-        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea'
+        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, [role="textbox"]'
     );
-    const usableInput = (input) => {
-        if (!input) return false;
-        const type = (input.getAttribute('type') || 'text').toLowerCase();
-        return type !== 'hidden' && type !== 'checkbox' && type !== 'radio'
-            && type !== 'button' && type !== 'submit';
-    };
-    const cellSelector = (cell) => {
-        const colId = cell.getAttribute('col-id') || '';
-        if (colId) {
-            return '#ag-grid .ag-header [col-id="' + CSS.escape(colId) + '"]';
-        }
-        const row = cell.parentElement;
-        if (!row) return '';
-        const index = Array.prototype.indexOf.call(row.children, cell) + 1;
-        if (index < 1) return '';
-        let rowClass = '';
-        if (row.classList.contains('ag-header-row-floating-filter')) {
-            rowClass = '.ag-header-row-floating-filter';
-        } else if (row.classList.contains('ag-header-row-column-filter')) {
-            rowClass = '.ag-header-row-column-filter';
-        } else if (row.classList.contains('ag-header-row-filter')) {
-            rowClass = '.ag-header-row-filter';
-        } else {
-            return '';
-        }
-        let container = '';
-        if (cell.closest('.ag-pinned-left-header')) container = '.ag-pinned-left-header ';
-        else if (cell.closest('.ag-pinned-right-header')) container = '.ag-pinned-right-header ';
-        else if (cell.closest('.ag-header-viewport')) container = '.ag-header-viewport ';
-        return '#ag-grid ' + container + rowClass + ' > :nth-child(' + index + ')';
-    };
-    const noteInput = (record, cell) => {
-        if (!usableInput(inputOf(cell))) return;
-        record.hasInput = true;
-        if (!record.selector) {
-            const sel = cellSelector(cell);
-            if (sel) {
-                record.selector = sel
-                    + ' input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])';
-            }
-        }
-    };
-
-    for (const cell of header.querySelectorAll('[col-id]')) {
-        const colId = cell.getAttribute('col-id') || '';
-        if (!colId) continue;
-        const record = touch(colId);
-        const filterish = cell.classList.contains('ag-floating-filter')
-            || !!cell.closest(filterRowSelector)
-            || usableInput(inputOf(cell));
-        if (!filterish) {
-            const text = clean(cell.innerText || cell.textContent || '');
-            if (text && !record.name) record.name = text;
-            continue;
-        }
-        noteInput(record, cell);
-        if (!record.name) {
-            const label = clean(cell.getAttribute('aria-label') || '');
-            if (label) record.name = label;
-        }
-    }
-
-    const containers = header.querySelectorAll(
-        '.ag-pinned-left-header, .ag-header-viewport, .ag-pinned-right-header, .ag-header'
-    );
-    containers.forEach((container, containerIndex) => {
-        const rows = Array.from(container.querySelectorAll(':scope > .ag-header-row, :scope > .ag-header-container .ag-header-row'));
-        if (!rows.length && container.classList.contains('ag-header')) return;
-        const filterRow = rows.find((row) => usableInput(inputOf(row)));
-        if (!filterRow) return;
-        const headerRow = container.querySelector('.ag-header-row-column');
-        const filters = Array.from(filterRow.children);
+    const found = [];
+    const rows = Array.from(header.querySelectorAll('.ag-header-row-floating-filter'));
+    rows.forEach((filterRow, rowIndex) => {
+        const parent = filterRow.parentElement;
+        const headerRow = parent
+            ? (parent.querySelector(':scope > .ag-header-row-column')
+                || parent.querySelector('.ag-header-row-column'))
+            : null;
         const headers = headerRow ? Array.from(headerRow.children) : [];
-        filters.forEach((cell, index) => {
-            const headerCell = headers[index];
-            const colId = cell.getAttribute('col-id')
-                || (headerCell && headerCell.getAttribute('col-id'))
-                || ('idx-' + containerIndex + '-' + index);
-            const record = touch(colId);
-            if (!record.name && headerCell) {
-                const text = clean(headerCell.innerText || headerCell.textContent || '');
-                if (text) record.name = text;
+        let container = '';
+        if (filterRow.closest('.ag-pinned-left-header')) container = '.ag-pinned-left-header ';
+        else if (filterRow.closest('.ag-pinned-right-header')) container = '.ag-pinned-right-header ';
+        else if (filterRow.closest('.ag-header-viewport')) container = '.ag-header-viewport ';
+        Array.from(filterRow.children).forEach((cell, index) => {
+            const headerCell = headers[index] || null;
+            const labelEl = headerCell && headerCell.querySelector(
+                '.ag-header-cell-text, .ag-header-cell-label'
+            );
+            const name = clean(
+                (labelEl && labelEl.textContent)
+                || (headerCell && (headerCell.innerText || headerCell.textContent))
+                || cell.getAttribute('aria-label')
+                || ''
+            );
+            const body = cell.querySelector('.ag-floating-filter-body');
+            const input = inputOf(cell);
+            if (!body && !input) return;
+            const ownId = cell.getAttribute('col-id') || '';
+            const headerId = headerCell ? (headerCell.getAttribute('col-id') || '') : '';
+            const colId = ownId || headerId || ('idx-' + rowIndex + '-' + index);
+            const suffix = body ? ' .ag-floating-filter-body' : '';
+            let selector = '';
+            if (ownId) {
+                selector = '#ag-grid ' + container
+                    + '.ag-header-row-floating-filter [col-id="' + cssEscape(ownId) + '"]'
+                    + suffix;
+            } else {
+                selector = '#ag-grid ' + container
+                    + '.ag-header-row-floating-filter > :nth-child(' + (index + 1) + ')'
+                    + suffix;
             }
-            noteInput(record, cell);
+            found.push({ colId: colId, name: name, hasInput: true, selector: selector });
         });
     });
-
-    return Array.from(byId.values()).filter((row) => row.name || row.hasInput);
+    return found;
 }
 """
 
@@ -844,9 +834,8 @@ _ENSURE_COLUMN_JS = """
 def _col_filter_selector(col_id: str) -> str:
     safe = _css_attr(col_id)
     return (
-        "#ag-grid .ag-header "
-        f'[col-id="{safe}"] '
-        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+        "#ag-grid .ag-header-row-floating-filter "
+        f'[col-id="{safe}"] .ag-floating-filter-body'
     )
 
 
@@ -907,6 +896,11 @@ async def _ensure_column_visible(page: Page, col_id: str) -> None:
 async def _scroll_filter_into_view(page: Page, selector: str, col_id: str = "") -> None:
     """Scroll sideways until a virtualized filter column is actually rendered."""
     if not selector:
+        return
+    # nth-child follows whatever cells are rendered. Scrolling the grid
+    # changes which column is the 8th child, so stay at the left edge.
+    if "nth-child" in selector:
+        await _scroll_grid_home(page)
         return
     await _ensure_column_visible(page, col_id)
     if await _filter_on_screen(page, selector):
@@ -1130,16 +1124,33 @@ async def _read_filter_value(field) -> str:
         return ""
 
 
+async def _replace_filter_text(field, text: str) -> str:
+    """Put text in the filter. Falls back to keystrokes when fill is ignored."""
+    try:
+        await field.fill("")
+        if text:
+            await field.fill(text)
+    except Exception as exc:
+        logger.info("Could not fill sales order filter (%s); typing instead", exc)
+    current = await _read_filter_value(field)
+    wanted = text.casefold()
+    if wanted and wanted not in current.casefold():
+        try:
+            await field.fill("")
+        except Exception:
+            pass
+        await field.press("Control+A")
+        await field.press("Backspace")
+        if text:
+            await field.press_sequentially(text, delay=15)
+        current = await _read_filter_value(field)
+    return current
+
+
 async def _type_filter_query(field, query: str, *, allow_bare_key: bool) -> str:
     """Type an order number. A service-order box that rejects SO- gets the bare key."""
     await field.click()
-    await field.fill("")
-    await field.fill(query)
-    current = await _read_filter_value(field)
-    if query.casefold() not in current.casefold():
-        await field.fill("")
-        await field.press_sequentially(query, delay=15)
-        current = await _read_filter_value(field)
+    current = await _replace_filter_text(field, query)
     bare = order_key(query)
     if (
         allow_bare_key
@@ -1153,12 +1164,7 @@ async def _type_filter_query(field, query: str, *, allow_bare_key: bool) -> str:
             current,
             bare,
         )
-        await field.fill("")
-        await field.fill(bare)
-        current = await _read_filter_value(field)
-        if bare.casefold() not in current.casefold():
-            await field.fill("")
-            await field.press_sequentially(bare, delay=15)
+        await _replace_filter_text(field, bare)
         return bare
     return query
 
@@ -1171,8 +1177,15 @@ async def _clear_filter_if_set(page: Page, selector: str, submit_key: str) -> bo
     try:
         if await root.count() == 0:
             return False
-        inner = root.locator("input:not([type='hidden'])")
-        field = inner.first if await inner.count() > 0 else root
+        field = await _editable_inside(root)
+        if field is None:
+            try:
+                await root.click(timeout=1000)
+            except Exception:
+                return False
+            field = await _editable_inside(root)
+        if field is None:
+            return False
         current = await field.input_value(timeout=1000)
         if not str(current or "").strip():
             return False
@@ -1273,6 +1286,70 @@ async def _run_column_search(
     return count, text, row, typed
 
 
+def _configured_column(selector: str, name: str, col_id: str) -> Optional[dict[str, Any]]:
+    text = str(selector or "").strip()
+    if not text:
+        return None
+    return {
+        "colId": col_id,
+        "name": name,
+        "hasInput": True,
+        "selector": text,
+    }
+
+
+def _configured_targets(
+    kind: str,
+    locators: dict[str, str],
+) -> list[tuple[str, dict[str, Any]]]:
+    """SO # and PO boxes at the positions on the Razor sales-order grid.
+
+    SO- numbers go in the first floating filter (SO #). eBay and store
+    order numbers go in the eighth (PO). A digits-only number can also be
+    a sales order, so that search tries PO and then SO #.
+    """
+    so = _configured_column(
+        locators.get("sales_order_filter", ""),
+        "SO #",
+        "idx-so",
+    )
+    po = _configured_column(
+        locators.get("sales_order_external_filter", ""),
+        "PO",
+        "idx-po",
+    )
+    if kind == "ebay":
+        return [("marketplace", po)] if po else []
+    if kind == "store":
+        targets: list[tuple[str, dict[str, Any]]] = []
+        if po:
+            targets.append(("marketplace", po))
+        if so:
+            targets.append(("service", so))
+        return targets
+    if so:
+        return [("service", so)]
+    return []
+
+
+def _merge_targets(
+    primary: list[tuple[str, dict[str, Any]]],
+    extra: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Keep the known SO # and PO boxes first, then any other header match."""
+    merged: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for role, column in primary + extra:
+        selector = _filter_selector(column)
+        name = str(column.get("name") or "").strip().casefold()
+        key = selector or f"{role}:{name}:{column.get('colId')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append((role, column))
+    return merged
+
+
 async def _filter_order_list(
     page: Page,
     order_number: str,
@@ -1285,7 +1362,10 @@ async def _filter_order_list(
     """Filter the list and return the matching row plus service or marketplace."""
     kind = classify_order(order_number)
     columns = await _collect_filter_columns(page)
-    targets = _search_targets(kind, columns)
+    targets = _merge_targets(
+        _configured_targets(kind, locators),
+        _search_targets(kind, columns),
+    )
     if not targets:
         raise RuntimeError(_missing_column_message(kind, columns))
     logger.info(
@@ -1297,9 +1377,16 @@ async def _filter_order_list(
             for role, col in targets
         ),
     )
+    clear_columns = list(_columns_to_clear(columns))
+    seen_clear = {str(col.get("colId") or "") for col in clear_columns}
+    for _role, column in targets:
+        col_id = str(column.get("colId") or "")
+        if col_id and col_id not in seen_clear:
+            clear_columns.append(column)
+            seen_clear.add(col_id)
     await _clear_columns(
         page,
-        _columns_to_clear(columns),
+        clear_columns,
         submit_key,
         overlay_ms=overlay_ms,
         timeout_ms=timeout_ms,
@@ -1307,26 +1394,35 @@ async def _filter_order_list(
     tried: list[str] = []
     last_count = 0
     last_text = ""
+    found_box = False
     for role, column in targets:
         label = str(column.get("name") or column.get("colId") or "?")
         tried.append(label)
         logger.info(
-            "Searching %s column %s (%s) for %s",
+            "Searching %s column %s (%s) for %s via %s",
             "sales order" if role == "service" else "order number",
             label,
             column.get("colId"),
             order_number.strip(),
+            _filter_selector(column),
         )
-        count, text, row, _typed = await _run_column_search(
-            page,
-            order_number,
-            column,
-            role,
-            locators,
-            timeout_ms=timeout_ms,
-            overlay_ms=overlay_ms,
-            submit_key=submit_key,
-        )
+        try:
+            count, text, row, _typed = await _run_column_search(
+                page,
+                order_number,
+                column,
+                role,
+                locators,
+                timeout_ms=timeout_ms,
+                overlay_ms=overlay_ms,
+                submit_key=submit_key,
+            )
+        except RuntimeError as exc:
+            if "Timed out waiting for the sales order filter" not in str(exc):
+                raise
+            logger.info("%s", exc)
+            continue
+        found_box = True
         if row is not None:
             return row, role
         if count > 1:
@@ -1343,6 +1439,11 @@ async def _filter_order_list(
             submit_key,
             overlay_ms=overlay_ms,
             timeout_ms=timeout_ms,
+        )
+    if not found_box:
+        raise RuntimeError(
+            "Could not find the SO # or PO filter boxes. "
+            "Open the sales order list and wait for the grid to finish loading."
         )
     if last_count == 1 and last_text:
         raise RuntimeError(

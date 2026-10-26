@@ -340,6 +340,15 @@ class SettingsDialog(QDialog):
                 "window with the text that was copied to the clipboard.",
             ),
         )
+        self.release_notes_check = QCheckBox("Show release notes after an update")
+        ports_form.addRow(
+            "",
+            _with_info(
+                self.release_notes_check,
+                "After TP DECK installs an update and opens again, show that "
+                "version's GitHub release notes.",
+            ),
+        )
         self.autocycle_spin = QSpinBox()
         self.autocycle_spin.setRange(1, 180)
         self.autocycle_spin.setSuffix(" min")
@@ -457,6 +466,9 @@ class SettingsDialog(QDialog):
         self.results_popup_check.setChecked(
             bool(settings.get("show_results_popup", True))
         )
+        self.release_notes_check.setChecked(
+            bool(settings.get("show_release_notes", True))
+        )
         try:
             cycle_minutes = int(settings.get("ebay_autocycle_minutes", 10))
         except (TypeError, ValueError):
@@ -508,6 +520,7 @@ class SettingsDialog(QDialog):
             ebay_refresh_hold_minutes=self.refresh_hold_spin.value(),
             show_results_popup=self.results_popup_check.isChecked(),
             show_results_popup_user_set=True,
+            show_release_notes=self.release_notes_check.isChecked(),
             ebay_autocycle_minutes=self.autocycle_spin.value(),
             shipstation_sync_every_cycles=self.shipstation_every_spin.value(),
             serial_timeout_ms=self.serial_timeout_spin.value(),

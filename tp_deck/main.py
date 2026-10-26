@@ -26,6 +26,7 @@ from tp_deck.automation_engine import (
 from tp_deck.chrome_launcher import app_root, ensure_debug_chromium
 from tp_deck.dashboard import Dashboard
 from tp_deck.job_results import AutomationResult, render_job
+from tp_deck.release_notes import present_release_notes_after_update
 from tp_deck.sales_order import close_detail_tab, shutdown_workday
 from tp_deck.serial_dialog import SerialDialog
 from tp_deck.settings_dialog import SettingsDialog
@@ -858,7 +859,15 @@ async def _startup(dashboard: Dashboard) -> None:
         logger.info("Update helper started; closing")
         dashboard.close()
         return
-    await _prepare_chromium(dashboard)
+    notes = asyncio.create_task(
+        present_release_notes_after_update(dashboard),
+        name="tpdeck-release-notes",
+    )
+    try:
+        await _prepare_chromium(dashboard)
+    finally:
+        if not notes.done():
+            await notes
 
 
 async def _apply_update(dashboard: Dashboard) -> bool:
