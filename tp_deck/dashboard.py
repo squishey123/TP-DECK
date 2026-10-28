@@ -207,7 +207,7 @@ QPushButton#stopBtn:hover {
     background-color: #991B1B;
     color: #FEE2E2;
 }
-QPushButton#settingsBtn, QPushButton#powerBtn {
+QPushButton#settingsBtn, QPushButton#powerBtn, QPushButton#toolsBtn {
     border-color: #64748B;
     padding: 0px;
     min-width: 34px;
@@ -704,6 +704,36 @@ class PowerButton(QPushButton):
         painter.end()
 
 
+class ToolboxButton(QPushButton):
+    """Tools launcher. A toolbox drawn in the same line style as the power glyph."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._fade = 0.0
+        self.setFixedSize(36, 36)
+
+    def set_fade(self, amount: float) -> None:
+        self._fade = max(0.0, min(1.0, amount))
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 — Qt override
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = _mix_color(QColor("#F8FAFC"), QColor("#94A3B8"), self._fade)
+        pen = QPen(color)
+        pen.setWidthF(1.6)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRectF(9, 15, 18, 12), 2, 2)
+        painter.drawLine(QPointF(9, 20), QPointF(27, 20))
+        painter.drawRoundedRect(QRectF(14, 10, 8, 5), 1.5, 1.5)
+        painter.drawRoundedRect(QRectF(16, 18, 4, 4), 1, 1)
+        painter.end()
+
+
 class StatusWell(QWidget):
     """Recessed status readout with an optional eased progress track."""
 
@@ -844,6 +874,7 @@ class Dashboard(QMainWindow):
         on_cycle: Optional[Callable[[], None]] = None,
         on_stop: Optional[Callable[[], None]] = None,
         on_open_settings: Optional[Callable[[], None]] = None,
+        on_open_tools: Optional[Callable[[], None]] = None,
         on_shutdown: Optional[Callable[[], None]] = None,
         on_arm_shutdown: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
@@ -855,6 +886,7 @@ class Dashboard(QMainWindow):
         self._on_cycle = on_cycle
         self._on_stop = on_stop
         self._on_open_settings = on_open_settings
+        self._on_open_tools = on_open_tools
         self._on_shutdown = on_shutdown
         self._on_arm_shutdown = on_arm_shutdown
         self._persist_enabled = False
@@ -983,6 +1015,12 @@ class Dashboard(QMainWindow):
         self.power_btn.setToolTip("Safe Shutdown")
         self.power_btn.clicked.connect(self._handle_power)
         row.addWidget(self.power_btn)
+
+        self.tools_btn = ToolboxButton()
+        self.tools_btn.setObjectName("toolsBtn")
+        self.tools_btn.setToolTip("Tools")
+        self.tools_btn.clicked.connect(self._handle_tools)
+        row.addWidget(self.tools_btn)
 
         self.settings_btn = QPushButton("⚙")
         self.settings_btn.setObjectName("settingsBtn")
@@ -1152,6 +1190,7 @@ class Dashboard(QMainWindow):
         self._well.set_fade(t)
         self.cycle_btn.set_fade(t)
         self.power_btn.set_fade(t)
+        self.tools_btn.set_fade(t)
         if t <= 0:
             for widget in (
                 self._title,
@@ -1162,6 +1201,7 @@ class Dashboard(QMainWindow):
                 self.batch_btn,
                 self.settings_btn,
                 self.power_btn,
+                self.tools_btn,
                 self.cycle_btn,
             ):
                 widget.setStyleSheet("")
@@ -1188,6 +1228,10 @@ class Dashboard(QMainWindow):
         self.settings_btn.setStyleSheet(
             f"background-color: {_mix_hex('#1E293B', '#334155', t)}; "
             f"color: {grey_text}; border: 1px solid {_mix_hex('#64748B', '#94A3B8', t)};"
+        )
+        self.tools_btn.setStyleSheet(
+            f"background-color: {_mix_hex('#1E293B', '#334155', t)}; "
+            f"border: 1px solid {_mix_hex('#64748B', '#94A3B8', t)};"
         )
         self.power_btn.setStyleSheet(
             f"background-color: {_mix_hex('#1E293B', '#334155', t)}; "
@@ -1361,6 +1405,12 @@ class Dashboard(QMainWindow):
             self._on_arm_shutdown()
             return
         self.begin_shutdown_arm()
+
+    def _handle_tools(self) -> None:
+        if self.input_blocked():
+            return
+        if self._on_open_tools:
+            self._on_open_tools()
 
     def _handle_settings(self) -> None:
         if self.input_blocked():

@@ -2,9 +2,9 @@
   "mode": "single",
   "ebay_port": 9222,
   "erp_port": 9223,
-  "chrome_version": "",
-  "window_x": 23,
-  "window_y": 146,
+  "chrome_version": "1243",
+  "window_x": 211,
+  "window_y": 440,
   "emergency_hotkey": "pause",
   "ebay_url_pattern": "ebay.com/sh/ord",
   "erp_url_pattern": "InventoryDetail.aspx",
@@ -25,12 +25,12 @@
     "HQ"
   ],
   "cache_ttl_hours": 12,
-  "cache_ttl": "12h",
   "cache_enabled": true,
   "slow_razor_multiplier": 10,
   "ebay_refresh_hold_enabled": true,
   "ebay_refresh_hold_minutes": 5,
   "show_results_popup": true,
+  "show_release_notes": true,
   "ebay_autocycle_minutes": 10,
   "shipstation_url_pattern": "shipstation.com/orders/awaiting-shipment",
   "shipstation_sync_every_cycles": 3,
@@ -45,5 +45,10 @@
     "PR"
   ],
   "pick_list_exclude_misc": true,
-  "update_repo": "squishey123/TP-DECK"
+  "update_repo": "squishey123/TP-DECK",
+  "uline_port": 9222,
+  "uline_url_pattern": "uline.com",
+  "uline_lookup_timeout_ms": 20000,
+  "uline_export_dir": "",
+  "cache_ttl": "12h"
 }

@@ -9,6 +9,18 @@ Emergency stop: the red button, or the Pause/Break key. That cancels immediately
 
 Safe shutdown: the power button. The panel fades to grey for 5 seconds. Press Emergency Stop during that fade to cancel. Otherwise TP DECK finishes the current task, closes extra order tabs, and closes Chromium.
 
+Tools: the toolbox button next to Settings opens the tools menu. Uline Order Builder
+is the tool: type a Uline item number (S-11633) or an alias you saved, set the units
+you need, and TP DECK works out how many packs to buy from the units per set. When
+Uline prices a smaller item (a box, a roll), TP DECK converts to the pack it sells in
+(a Bundle of 25 boxes, a Case of 36 rolls), so the price shown is the price per pack,
+and packs are never below Uline's minimum. Typing a price in the Price column overrides
+the tier price; type 0 to clear it. Export saves CSV (and optional PDF) in the export
+folder you pick in Settings; the default is the "Uline Exports" folder beside
+TP-DECK.bat. Items and aliases are remembered. Open the Uline site in the TP DECK
+Chromium window so lookups reuse your login and that tab; lookups put the window back
+to minimized if it was minimized.
+
 This package uses official Python from python.org plus the TP DECK scripts.
 It is not a packed .exe (those often get blocked by Windows Defender).
 

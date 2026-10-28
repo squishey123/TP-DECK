@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -29,6 +30,7 @@ import tp_deck.runtime_state as runtime_state
 from tp_deck.duration import cache_ttl_label, parse_duration
 from tp_deck.settings_manager import load_settings, update_settings
 from tp_deck.sku_override_dialog import SkuOverrideEditor
+from tp_deck.uline_order import export_dir
 
 logger = logging.getLogger("tpdeck")
 
@@ -152,6 +154,15 @@ def _tip(text: str) -> str:
     return (
         '<qt><table width="280"><tr><td style="white-space: normal;">'
         f"{body}</td></tr></table></qt>"
+    )
+
+
+def _export_dir_tip() -> str:
+    return (
+        "Folder that holds exported Uline orders. Leave it blank for "
+        "“Uline Exports” beside TP-DECK.bat. Browse picks any folder, "
+        "including a network share. Exported CSV and PDF files are written "
+        "there, and the order draft stays inside TP DECK."
     )
 
 
@@ -419,6 +430,56 @@ class SettingsDialog(QDialog):
         )
         layout.addWidget(ports_box)
 
+        uline_box = QGroupBox("Uline Order Builder")
+        uline_form = QFormLayout(uline_box)
+        self.uline_port_spin = QSpinBox()
+        self.uline_port_spin.setRange(1024, 65535)
+        uline_form.addRow(
+            "Uline port:",
+            _with_info(
+                self.uline_port_spin,
+                "DevTools port of the Chromium window that has Uline open. "
+                "Single mode uses the eBay port, so leave this the same.",
+            ),
+        )
+        self.uline_pattern_edit = QLineEdit()
+        uline_form.addRow(
+            "Uline URL contains:",
+            _with_info(
+                self.uline_pattern_edit,
+                "Text that must appear in the Uline tab address. TP DECK uses "
+                "it to pick that tab; uline.com is the US site.",
+            ),
+        )
+        self.uline_timeout_spin = QSpinBox()
+        self.uline_timeout_spin.setRange(1000, 120000)
+        self.uline_timeout_spin.setSingleStep(500)
+        self.uline_timeout_spin.setSuffix(" ms")
+        uline_form.addRow(
+            "Uline lookup timeout:",
+            _with_info(
+                self.uline_timeout_spin,
+                "How long to wait for a Uline page to load when an Item # is "
+                "not in the cache.",
+            ),
+        )
+        self.uline_export_edit = QLineEdit()
+        self.uline_export_edit.setPlaceholderText("Uline Exports")
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._pick_export_dir)
+        export_host = QWidget()
+        export_host.setObjectName("infoHost")
+        export_row = QHBoxLayout(export_host)
+        export_row.setContentsMargins(0, 0, 0, 0)
+        export_row.setSpacing(6)
+        export_row.addWidget(self.uline_export_edit)
+        export_row.addWidget(browse_btn)
+        uline_form.addRow(
+            "Export folder:",
+            _with_info(export_host, _export_dir_tip()),
+        )
+        layout.addWidget(uline_box)
+
         buttons = QHBoxLayout()
         buttons.addStretch()
         cancel_btn = QPushButton("Cancel")
@@ -483,6 +544,18 @@ class SettingsDialog(QDialog):
         self.serial_confirm_spin.setValue(
             _clamp_int(settings.get("serial_clear_confirm_ms", 500), 100, 5000)
         )
+        try:
+            uline_port = int(settings.get("uline_port", settings.get("ebay_port", 9222)))
+        except (TypeError, ValueError):
+            uline_port = 9222
+        self.uline_port_spin.setValue(_clamp_int(uline_port, 1024, 65535))
+        self.uline_pattern_edit.setText(
+            str(settings.get("uline_url_pattern", "uline.com"))
+        )
+        self.uline_timeout_spin.setValue(
+            _clamp_int(settings.get("uline_lookup_timeout_ms", 20000), 1000, 120000)
+        )
+        self.uline_export_edit.setText(str(settings.get("uline_export_dir", "")))
         self._on_mode_toggled()
         self._on_refresh_hold_toggled()
 
@@ -495,6 +568,14 @@ class SettingsDialog(QDialog):
 
     def _edit_overrides(self) -> None:
         SkuOverrideEditor(self).exec()
+
+    def _pick_export_dir(self) -> None:
+        start = self.uline_export_edit.text().strip()
+        if not start:
+            start = str(export_dir(load_settings()))
+        chosen = QFileDialog.getExistingDirectory(self, "Uline export folder", start)
+        if chosen:
+            self.uline_export_edit.setText(chosen)
 
     def _save(self) -> None:
         ttl_text = self.cache_ttl_edit.text().strip()
@@ -525,6 +606,10 @@ class SettingsDialog(QDialog):
             shipstation_sync_every_cycles=self.shipstation_every_spin.value(),
             serial_timeout_ms=self.serial_timeout_spin.value(),
             serial_clear_confirm_ms=self.serial_confirm_spin.value(),
+            uline_port=self.uline_port_spin.value(),
+            uline_url_pattern=self.uline_pattern_edit.text().strip() or "uline.com",
+            uline_lookup_timeout_ms=self.uline_timeout_spin.value(),
+            uline_export_dir=self.uline_export_edit.text().strip(),
         )
         runtime_state.slow_razor_enabled = self.slow_razor_check.isChecked()
         parent = self.parent()

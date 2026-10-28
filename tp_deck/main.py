@@ -31,6 +31,8 @@ from tp_deck.sales_order import close_detail_tab, shutdown_workday
 from tp_deck.serial_dialog import SerialDialog
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
+from tp_deck.tools_menu import popup_tools_menu
+from tp_deck.uline_dialog import UlineDialog
 from tp_deck.updater import (
     asset_size,
     describe_release,
@@ -1005,6 +1007,15 @@ def main() -> int:
     def _shutdown() -> None:
         controller.begin_shutdown()
 
+    def _tools() -> None:
+        _open_tools(dashboard, tool_entries)
+
+    def _uline() -> None:
+        _open_uline(dashboard, uline_holder)
+
+    uline_holder: dict = {}
+    tool_entries: list[tuple[str, object]] = [("Uline Order Builder", _uline)]
+
     dashboard = Dashboard(
         on_execute=_execute,
         on_pick_list=_pick_list,
@@ -1012,6 +1023,7 @@ def main() -> int:
         on_cycle=_cycle,
         on_stop=_stop,
         on_open_settings=_settings,
+        on_open_tools=_tools,
         on_shutdown=_shutdown,
         on_arm_shutdown=_arm_shutdown,
     )
@@ -1040,6 +1052,47 @@ def main() -> int:
 def _open_settings(dashboard: Dashboard) -> None:
     dialog = SettingsDialog(parent=dashboard)
     dialog.exec()
+
+
+def _run_async(coro, on_done) -> None:
+    """Start a coroutine on the qasync loop and hand the result back to Qt."""
+    task = asyncio.create_task(coro)
+
+    def _finish(completed: asyncio.Task) -> None:
+        if completed.cancelled():
+            on_done(False, None, "cancelled")
+            return
+        exc = completed.exception()
+        if exc is not None:
+            on_done(False, None, str(exc))
+            return
+        on_done(True, completed.result(), "")
+
+    task.add_done_callback(_finish)
+
+
+def _open_tools(dashboard: Dashboard, entries: list) -> None:
+    popup_tools_menu(dashboard.tools_btn, entries)
+
+
+def _open_uline(dashboard: Dashboard, holder: dict) -> None:
+    """Show the Uline builder without blocking the dashboard."""
+    existing = holder.get("dialog")
+    if existing is not None:
+        existing.raise_()
+        existing.activateWindow()
+        return
+    dialog = UlineDialog(
+        parent=dashboard,
+        runner=_run_async,
+        settings=load_settings(),
+    )
+    dialog.setModal(False)
+    holder["dialog"] = dialog
+    dialog.finished.connect(lambda _code: holder.__setitem__("dialog", None))
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
 
 
 if __name__ == "__main__":

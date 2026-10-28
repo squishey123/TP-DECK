@@ -13,6 +13,9 @@ ENV/
 tp_deck/tpdeck.log
 tp_deck/sku_location_cache.json
 tp_deck/sku_overrides.json
+tp_deck/uline_cache.json
+tp_deck/uline_draft.json
+Uline Exports/
 *.log
 
 # IDE / OS

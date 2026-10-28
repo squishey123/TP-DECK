@@ -105,7 +105,12 @@ Copy-Item (Join-Path $Root "scripts\README-FOR-USERS.txt") (Join-Path $Stage "RE
 $Pkg = Join-Path $Stage "tp_deck"
 New-Item -ItemType Directory -Path $Pkg | Out-Null
 Get-ChildItem (Join-Path $Root "tp_deck") -File | Where-Object {
-    $_.Extension -in ".py", ".json" -and $_.Name -ne "sku_location_cache.json"
+    $_.Extension -in ".py", ".json" -and $_.Name -notin @(
+        "sku_location_cache.json",
+        "sku_overrides.json",
+        "uline_cache.json",
+        "uline_draft.json"
+    )
 } | ForEach-Object { Copy-Item $_.FullName $Pkg }
 
 # Stamp the tag into the packaged copy. The source file stays unchanged.
