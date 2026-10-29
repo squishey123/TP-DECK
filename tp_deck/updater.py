@@ -74,7 +74,7 @@ try { Wait-Process -Id $WaitPid -ErrorAction Stop } catch { Note ("wait ended: "
 Start-Sleep -Seconds 2
 
 $destRoot = [System.IO.Path]::GetFullPath($Dest).TrimEnd('\')
-$keepNames = @('settings.json', 'sku_overrides.json', 'sku_location_cache.json')
+$keepNames = @('settings.json', 'sku_overrides.json', 'sku_location_cache.json', 'uline_cache.json', 'uline_draft.json')
 $keep = Join-Path $env:TEMP ("tpdeck-keep-" + $WaitPid)
 $code = 16
 try {
@@ -94,7 +94,7 @@ try {
   $attempt = 0
   do {
     $attempt++
-    & robocopy $Source $destRoot /E /NFL /NDL /NJH /NJS /R:2 /W:1 /XD browser /XF settings.json sku_overrides.json sku_location_cache.json tpdeck.log tpdeck.log.1 tpdeck.log.2 tpdeck.log.3 tpdeck.log.4 tpdeck.log.5
+    & robocopy $Source $destRoot /E /NFL /NDL /NJH /NJS /R:2 /W:1 /XD browser /XF settings.json sku_overrides.json sku_location_cache.json uline_cache.json uline_draft.json tpdeck.log tpdeck.log.1 tpdeck.log.2 tpdeck.log.3 tpdeck.log.4 tpdeck.log.5
     if ($null -ne $LASTEXITCODE) { $code = $LASTEXITCODE } else { $code = 0 }
     if ($code -lt 8) { break }
     Note ("robocopy attempt " + $attempt + " code " + $code)

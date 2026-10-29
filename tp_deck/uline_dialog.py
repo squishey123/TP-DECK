@@ -74,7 +74,17 @@ ORDER_COLUMNS = (
     "Price / Unit",
     "Line Total",
 )
-CACHE_COLUMNS = ("Item", "Name", "Unit", "Units / Set", "Min Packs", "Price", "Aliases", "Checked")
+CACHE_COLUMNS = (
+    "Item",
+    "Name",
+    "Unit",
+    "Units / Set",
+    "Min Packs",
+    "Price",
+    "In Stock",
+    "Aliases",
+    "Checked",
+)
 COL_NEEDED = ORDER_COLUMNS.index("Needed Units")
 COL_SETS = ORDER_COLUMNS.index("Sets To Buy")
 COL_PRICE = ORDER_COLUMNS.index("Price / Unit")
@@ -225,6 +235,13 @@ class UlineDialog(QDialog):
         self._pending_key = ""
         self._pending_alias = ""
         self._updating = False
+        # The task the runner started (a lookup, a PDF print), kept so closeEvent
+        # can cancel it, and _closing so a late result is dropped on the floor.
+        self._task: Optional[Any] = None
+        self._closing = False
+        # The message from the last cache/draft write that hit a disk failure.
+        # The caller shows it on the red label; _set_status does not wipe it.
+        self._disk_failure = ""
 
         self.setWindowTitle("TP DECK — Uline Order Builder")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
@@ -353,12 +370,14 @@ class UlineDialog(QDialog):
                 self._refresh_order_table()
                 return
             line.price_override = value if value > 0 else None
-            self._save_draft()
+            saved = self._save_draft()
             self._refresh_order_table()
             self._set_status(
                 f"{line.item}: price {'overridden at' if value > 0 else 'cleared to the tier price'} "
                 f"${line.price_at(max(1, line.sets)):.2f} x {max(1, line.sets)} = ${line.total():.2f}"
             )
+            if not saved:
+                self._show_disk_failure()
             return
         value = _int_text(cell.text())
         if value is None:
@@ -372,8 +391,10 @@ class UlineDialog(QDialog):
             line.needed_units = line.sets * line.units_per_set
         else:
             return
-        self._save_draft()
+        saved = self._save_draft()
         self._refresh_order_table()
+        if not saved:
+            self._show_disk_failure()
 
     def _selected_rows(self) -> list[int]:
         return sorted({i.row() for i in self._order_table.selectedItems()}, reverse=True)
@@ -386,14 +407,18 @@ class UlineDialog(QDialog):
         for row in rows:
             if 0 <= row < len(self._lines):
                 self._lines.pop(row)
-        self._save_draft()
+        saved = self._save_draft()
         self._refresh_order_table()
+        if not saved:
+            self._show_disk_failure()
 
     def _clear_order(self) -> None:
         self._lines = []
-        self._save_draft()
+        saved = self._save_draft()
         self._refresh_order_table()
         self._set_status("Order cleared")
+        if not saved:
+            self._show_disk_failure()
 
     def _refresh_settings(self) -> dict[str, Any]:
         """Reload Settings so a Settings change is used by the next export/lookup.
@@ -432,6 +457,9 @@ class UlineDialog(QDialog):
         if self._runner is None:
             self._set_error("PDF export is not available")
             return
+        if self._busy:
+            self._set_error("A Uline action is already running")
+            return
         settings = self._refresh_settings()
         default = export_path(settings, ".pdf")
         target, _ = QFileDialog.getSaveFileName(
@@ -444,28 +472,39 @@ class UlineDialog(QDialog):
             return
         created = stamp()
         html = order_html(self._lines, created, safe_name("Uline Order"))
+        # The path and Settings are closed over, so a second export does not
+        # overwrite them while the first print is running.
+        target_path = Path(target)
+        self._busy = True
+        self._add_btn.setEnabled(False)
         self._set_status("Writing PDF…")
-        self._pending_pdf_target = Path(target)
-        self._pending_pdf_settings = settings
-        self._runner(pdf_bytes(html, settings), self._on_pdf)
 
-    def _on_pdf(self, ok: bool, data, _err: str) -> None:
-        if not ok:
-            self._set_error(f"PDF export failed: {_err}")
-            return
-        target = getattr(self, "_pending_pdf_target", None)
-        settings = getattr(self, "_pending_pdf_settings", self._settings)
-        try:
-            archive = write_pdf(data, settings, target)
-        except OSError as exc:
-            self._set_error(f"PDF export failed: {exc}")
-            return
-        self._set_status(f"Archived in {archive.parent}: {archive.name}")
+        def _finish(ok: bool, data, err: str) -> None:
+            self._busy = False
+            self._add_btn.setEnabled(True)
+            if self._closing:
+                # The window is closing: a late print result must not write a
+                # file, change widgets, or touch the draft.
+                return
+            if not ok:
+                self._set_error(f"PDF export failed: {err}")
+                return
+            try:
+                archive = write_pdf(data, settings, target_path)
+            except OSError as exc:
+                self._set_error(f"PDF export failed: {exc}")
+                return
+            self._set_status(f"Archived in {archive.parent}: {archive.name}")
+
+        self._task = self._runner(pdf_bytes(html, settings), _finish)
 
     def _open_folder(self) -> None:
         folder = export_dir(self._refresh_settings())
-        folder.mkdir(parents=True, exist_ok=True)
+        # mkdir is inside the same try, so a bad export folder (network path,
+        # drive not ready) is reported on the red label instead of escaping the
+        # button as an unhandled exception.
         try:
+            folder.mkdir(parents=True, exist_ok=True)
             os.startfile(str(folder))
         except OSError as exc:
             self._set_error(f"Cannot open {folder}: {exc}")
@@ -493,15 +532,21 @@ class UlineDialog(QDialog):
         self._add_btn.setEnabled(False)
         settings = self._refresh_settings()
         self._set_status(f"Looking up {key} on Uline…")
-        self._runner(lookup_item(key, settings), self._on_lookup)
+        # The task is kept so closing the dialog can cancel a lookup that is
+        # still navigating.
+        self._task = self._runner(lookup_item(key, settings), self._on_lookup)
 
     def _on_lookup(self, ok: bool, item, err: str) -> None:
+        if self._closing:
+            return
         self._busy = False
         self._add_btn.setEnabled(True)
         if not ok:
             self._set_error(f"Uline lookup failed: {err}")
             return
         put_item(self._cache, item)
+        # The flag is recorded in _disk_failure; the last display call puts it
+        # on the red label after the pack sentence, where it stays.
         self._save_cache()
         self._refresh_cache_table()
         canonical = normalize_item(item.item)
@@ -512,6 +557,10 @@ class UlineDialog(QDialog):
                 f"Added as {canonical}."
             )
         self._commit(canonical, item, self._pending_alias)
+        # _commit shows the pack sentence first, then any alias-ownership text
+        # and any disk failure, so the last thing on screen is what the user
+        # needs to see. _show_disk_failure is a no-op when nothing failed.
+        self._show_disk_failure()
 
     def _sync_line(self, line: OrderLine) -> bool:
         """Refresh one order line from the cached item, keeping the typed quantity.
@@ -532,15 +581,20 @@ class UlineDialog(QDialog):
         line.sets = sets_for(line.needed_units, line.units_per_set, line.min_sets)
         return True
 
-    def _sync_lines(self, note: str = "") -> None:
-        """Pull the order lines from the cache and redraw the totals."""
+    def _sync_lines(self, note: str = "") -> bool:
+        """Pull the order lines from the cache and redraw the totals.
+
+        Returns the draft-save flag, so the caller can put the disk failure on
+        the red label after the status sentence is written.
+        """
         updated = sum(1 for line in self._lines if self._sync_line(line))
-        self._save_draft()
+        saved = self._save_draft()
         self._refresh_order_table()
         if note:
             self._set_status(note)
         if updated:
             logger.info("Uline order lines synced from cache (%s line(s))", updated)
+        return saved
 
     def _commit(self, canonical: str, item: UlineItem, alias_text: str) -> None:
         qty = max(1, self._qty_spin.value())
@@ -565,13 +619,18 @@ class UlineDialog(QDialog):
             needed_units=needed,
             sets=sets,
         )
+        alias_note = ""
         if alias_text:
             owner = add_alias(self._cache, canonical, alias_text)
             self._save_cache()
             self._refresh_cache_table()
-            line.alias = alias_text
-            if owner != canonical:
-                self._set_status(
+            if owner == canonical:
+                # The alias is this item's, so the line may carry it.
+                line.alias = alias_text
+            else:
+                # An alias owned by another item stays with that item, and the
+                # line is left without an alias.
+                alias_note = (
                     f"{alias_text} already belongs to {owner}, so it was not "
                     f"saved for {canonical}. The line was added."
                 )
@@ -586,11 +645,16 @@ class UlineDialog(QDialog):
         note = ""
         if self._mode_combo.currentText() == MODE_UNITS and added.needed_units < units * min_sets:
             note = f" (raised to the {min_sets} {pack} minimum)"
+        if not item.in_stock:
+            note += " (out of stock)"
         self._set_status(
             f"{canonical}: {added.sets} {pack}(s) {joiner} {units:,} {base}(s) "
             f"= {added.needed_units:,} {base}(s) at ${added.price_at(added.sets):.2f}/{pack} "
             f"= ${added.total():.2f}{note}"
         )
+        # _set_status clears the red label, so ownership text and any disk
+        # failure are applied after it; they are the last thing on screen.
+        self._show_disk_failure(alias_note)
 
     # ------------------------------------------------------------------ cache tab
 
@@ -639,6 +703,7 @@ class UlineDialog(QDialog):
                 str(item.units_per_set),
                 str(max(1, item.min_sets)),
                 f"{item.price:.2f}",
+                "Yes" if item.in_stock else "No",
                 ", ".join(item.aliases),
                 item.checked,
             )
@@ -667,13 +732,14 @@ class UlineDialog(QDialog):
         self._save_cache()
         self._refresh_cache_table()
         if owner != normalize_item(key):
-            self._set_error(
+            self._show_disk_failure(
                 f"{alias} already belongs to {owner}. Remove it from {owner} "
                 "before using it here."
             )
             return
         self._alias_input.clear()
         self._set_status(f"{alias} → {key}")
+        self._show_disk_failure()
 
     def _remove_alias(self) -> None:
         key = self._selected_item()
@@ -689,18 +755,31 @@ class UlineDialog(QDialog):
         self._save_cache()
         self._refresh_cache_table()
         self._alias_input.clear()
+        self._show_disk_failure()
 
     def _edit_item(self) -> None:
         key = self._selected_item()
         if not key:
             return
-        editor = UlineItemEditor(self._cache[normalize_item(key)], self)
+        current = self._cache[normalize_item(key)]
+        editor = UlineItemEditor(current, self)
         if editor.exec() != QDialog.DialogCode.Accepted:
             return
-        updated = edit_item(self._cache, key, **editor.values())
+        values = editor.values()
+        typed_price = _float_text(values["price"])
+        if typed_price is not None and abs(typed_price - current.price) > 0.01:
+            # A hand-edited price must be what the order charges. With Uline's
+            # tiers kept, OrderLine.price_at runs tier_price and holds the lower
+            # tier, so raising the price never reaches the order line. An empty
+            # tier list makes tier_price return the edited price for every pack
+            # count. Re-Lookup brings Uline's own tiers back, and editing the
+            # name, unit, or pack size leaves the tiers in place.
+            values["tiers"] = ()
+        updated = edit_item(self._cache, key, **values)
         self._save_cache()
         self._refresh_cache_table()
         self._sync_lines(f"{updated.item} updated in {len(self._lines)} order line(s)")
+        self._show_disk_failure()
 
     def _re_lookup(self) -> None:
         key = self._selected_item()
@@ -713,9 +792,11 @@ class UlineDialog(QDialog):
         self._add_btn.setEnabled(False)
         self._settings = load_settings()
         self._set_status(f"Re-checking {key} on Uline…")
-        self._runner(lookup_item(key, self._settings), self._on_re_lookup)
+        self._task = self._runner(lookup_item(key, self._settings), self._on_re_lookup)
 
     def _on_re_lookup(self, ok: bool, item, err: str) -> None:
+        if self._closing:
+            return
         self._busy = False
         self._add_btn.setEnabled(True)
         if not ok:
@@ -725,6 +806,9 @@ class UlineDialog(QDialog):
         self._save_cache()
         self._refresh_cache_table()
         self._sync_lines(f"{item.item} re-checked from Uline")
+        # The status sentence from the sync is written first, so a cache-draft
+        # disk failure lands on the red label after it and stays visible.
+        self._show_disk_failure()
 
     def _delete_item(self) -> None:
         key = self._selected_item()
@@ -741,6 +825,7 @@ class UlineDialog(QDialog):
         remove_item(self._cache, key)
         self._save_cache()
         self._refresh_cache_table()
+        self._show_disk_failure()
 
     # ------------------------------------------------------------------ status
 
@@ -753,21 +838,49 @@ class UlineDialog(QDialog):
         self._error.setText(text)
         logger.warning("Uline dialog: %s", text)
 
-    def _save_cache(self) -> None:
-        """Write the cache, and show a disk failure instead of raising."""
+    def _save_cache(self) -> bool:
+        """Write the cache. True on success, False on a disk failure.
+
+        The message is recorded in `_disk_failure`; the caller decides what
+        stays on screen, so a status write in the same action does not wipe the
+        red label. `save_cache` itself shows nothing.
+        """
         try:
             write_cache(self._cache)
         except OSError as exc:
-            self._set_error(f"Cache not saved to disk: {exc}")
+            self._disk_failure = f"Cache not saved to disk: {exc}"
+            logger.error("Uline cache write failed: %s", exc)
+            return False
+        return True
 
-    def _save_draft(self) -> None:
-        """Write the draft, and show a disk failure instead of raising."""
+    def _save_draft(self) -> bool:
+        """Write the draft. True on success, False on a disk failure. See `_save_cache`."""
         try:
             write_draft(self._lines)
         except OSError as exc:
-            self._set_error(f"Order not saved to disk: {exc}")
+            self._disk_failure = f"Order not saved to disk: {exc}"
+            logger.error("Uline draft write failed: %s", exc)
+            return False
+        return True
+
+    def _show_disk_failure(self, extra: str = "") -> None:
+        """Put the disk failure (and any extra text) on the red label.
+
+        No-op when the last save succeeded. `extra` is put first, so the
+        alias-ownership sentence and the disk message both stay readable.
+        """
+        parts = [p for p in (extra, self._disk_failure) if p]
+        self._disk_failure = ""
+        if parts:
+            self._set_error(" ".join(parts))
 
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt override
+        self._closing = True
+        task = self._task
+        if task is not None and not task.done():
+            # The lookup is still navigating. Cancel it so a late result cannot
+            # write to the cache, the draft, or the widgets after the close.
+            task.cancel()
         self._save_draft()
         self._save_cache()
         super().closeEvent(event)

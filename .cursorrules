@@ -78,7 +78,7 @@ git push origin v0.3.2
 6. `.github/workflows/release.yml` runs on the tag. `scripts/build_release.ps1` reads the tag, builds `dist/TP-DECK-<version>-windows-x64.zip`, and stamps that version into the packaged `tp_deck/__init__.py`.
 7. The workflow publishes a GitHub Release named `TP DECK <version>` and attaches that zip. The asset name must stay `TP-DECK-<version>-windows-x64.zip`; the updater only accepts that pattern.
 8. **Release notes come last.** Wait until the Release workflow succeeds and the zip is on the release. Do not edit the release body while Actions is still running. The create-release step overwrites the body when it finishes, so notes written earlier are lost. After the workflow is green, update the notes with `gh release edit <tag> --notes "..."` (or the Notes editor). Summarize what changed in this version.
-9. A release install checks `update_repo` (`squishey123/TP-DECK`) against the latest GitHub release the next time it opens. A newer tag downloads and replaces the app. `settings.json`, `sku_overrides.json`, `sku_location_cache.json`, and the browser profile are kept.
+9. A release install checks `update_repo` (`squishey123/TP-DECK`) against the latest GitHub release the next time it opens. A newer tag downloads and replaces the app. `settings.json`, `sku_overrides.json`, `sku_location_cache.json`, `uline_cache.json`, `uline_draft.json`, and the browser profile are kept. `Uline Exports/` sits outside the package, so an update leaves it in place.
 
 A request that says only **commit** (no push) stays a local commit. A request that says push without Commit & Push wording is a normal branch push and does not create a release tag.
 </GitHubReleases>

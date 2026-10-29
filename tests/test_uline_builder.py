@@ -5,6 +5,7 @@ The committed page samples in uline_samples/ are the parser fixtures.
 """
 
 import asyncio
+import json
 import pathlib
 import sys
 import tempfile
@@ -397,14 +398,39 @@ class _FakeSession:
         self.events.append("detached")
 
 
+class _PrintSession:
+    """CDP session for the PDF print. Page.printToPDF raises, as a real
+    Chromium print failure does, so the `finally` path is exercised."""
+
+    def __init__(self, events: list[str], *, boom: bool = True):
+        self.events = events
+        self.boom = boom
+
+    async def send(self, name: str, payload: dict) -> dict:
+        self.events.append(name)
+        if name == "Page.printToPDF" and self.boom:
+            raise RuntimeError("printToPDF failed")
+        if name == "Page.printToPDF":
+            return {"data": "YQ=="}  # base64 of b"a", as Chromium sends it
+        return {"windowId": 1, "bounds": {"windowState": "minimized"}}
+
+    async def detach(self) -> None:
+        self.events.append("detached")
+
+
 class _FakePage:
     def __init__(self, html: str, events: list[str], url: str = "about:blank"):
         self.url = url
         self._html = html
         self.events = events
+        self.context = None
 
     async def content(self) -> str:
         return self._html
+
+    async def set_content(self, html: str) -> None:
+        self._html = html
+        self.events.append("content")
 
     async def goto(self, url: str, **_kw) -> None:
         self.events.append(f"goto:{url}")
@@ -418,9 +444,14 @@ class _FakeContext:
     def __init__(self, page):
         self.pages = [page]
         self._page = page
+        page.context = self
 
     async def new_page(self):
+        self._page.context = self
         return self._page
+
+    async def new_cdp_session(self, page):
+        return _FakeSession(self.events)
 
 
 class _FakeBrowser:
@@ -431,15 +462,60 @@ class _FakeBrowser:
         pass
 
 
+class _FakeChromium:
+    def __init__(self, browser):
+        self._browser = browser
+
+    async def connect_over_cdp(self, _url: str):
+        return self._browser
+
+
 class _FakePlaywright:
-    def __init__(self, events: list[str]):
+    def __init__(self, events: list[str], browser=None):
         self.events = events
+        if browser is not None:
+            self.chromium = _FakeChromium(browser)
 
     async def start(self):
         return self
 
     async def stop(self) -> None:
         self.events.append("playwright-stop")
+
+    # pdf_bytes uses `async with async_playwright() as pw`, so the fake needs
+    # the async context-manager protocol.
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        await self.stop()
+
+
+class _FakeTask:
+    """Stand-in for the asyncio.Task the dialog is told to keep."""
+
+    def __init__(self):
+        self.canceled = False
+
+    def done(self) -> bool:
+        return False
+
+    def cancel(self) -> None:
+        self.canceled = True
+
+
+class _AcceptedEditor:
+    """The dialog test fills the item editor; exec() accepts without a window."""
+
+    def __init__(self, values: dict):
+        self._values = values
+
+    def exec(self):
+        return 1  # QDialog.DialogCode.Accepted
+
+    def values(self) -> dict:
+        return dict(self._values)
+
 
 
 class IdentityCheck(unittest.TestCase):
@@ -594,19 +670,306 @@ class DialogLogic(unittest.TestCase):
         finally:
             dmod.load_settings = original
 
-    def test_disk_failure_shows_the_error_label(self):
+    def test_disk_failure_uses_the_returned_flag(self):
         from tp_deck import uline_dialog as dmod
 
         dialog = self.dialog()
         original = dmod.write_cache
+
         def boom(_cache):
             raise OSError("disk full")
+
         dmod.write_cache = boom
         try:
-            dialog._save_cache()
+            # The save reports the failure as a flag, and the caller decides
+            # what stays on screen.
+            self.assertFalse(dialog._save_cache())
+            self.assertIn("disk full", dialog._disk_failure)
+            dialog._show_disk_failure()
             self.assertIn("disk full", dialog._error.text())
         finally:
             dmod.write_cache = original
+
+    def _fill_editor(self, values: dict):
+        """Drive the item editor without opening a modal dialog."""
+        from tp_deck import uline_dialog as dmod
+
+        original = dmod.UlineItemEditor
+        dmod.UlineItemEditor = lambda *_a, **_kw: _AcceptedEditor(values)
+        return original
+
+    def test_price_edit_makes_the_order_pay_the_edited_price(self):
+        from tp_deck import uline_dialog as dmod
+
+        dialog = self.dialog()
+        first = UlineItem(item="S-4307", name="Foam", price=20.0, units_per_set=10,
+                          unit="Pack", min_sets=1, base_unit="Pack",
+                          tiers=((1, 20.0), (10, 14.0)), aliases=(), url="",
+                          in_stock=True, note="chart", added="", checked="")
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        self.calls[0](True, first, "")
+        self.assertEqual(dialog._lines[0].total(), 20.0)  # 1 pack at $20
+
+        original = self._fill_editor({
+            "name": "Foam", "price": "25", "unit": "Pack", "units_per_set": 10,
+            "min_sets": 1, "base_unit": "Pack", "aliases": [], "note": "",
+        })
+        try:
+            dialog._cache_table.setCurrentCell(0, 0)
+            dialog._edit_item()
+        finally:
+            dmod.UlineItemEditor = original
+
+        line = dialog._lines[0]
+        self.assertEqual(line.price, 25.0)
+        self.assertEqual(line.tiers, ())  # the tiers are cleared
+        self.assertEqual(line.price_at(1), 25.0)
+        self.assertEqual(line.price_at(10), 25.0)  # no tier wins on a big order
+        self.assertEqual(line.total(), 25.0)
+
+        # A typed grid price still overrides the cache price, and 0 clears it.
+        line.price_override = 7.0
+        dialog._sync_lines("")
+        self.assertEqual(line.price_at(1), 7.0)
+        line.price_override = None
+        dialog._sync_lines("")
+        self.assertEqual(line.price_at(1), 25.0)
+
+        # Re-Lookup brings Uline's own volume prices back.
+        recheck = UlineItem(item="S-4307", name="Foam", price=22.0, units_per_set=10,
+                            unit="Pack", min_sets=1, base_unit="Pack",
+                            tiers=((1, 22.0),), aliases=(), url="",
+                            in_stock=True, note="steps", added="", checked="")
+        dialog._on_re_lookup(True, recheck, "")
+        self.assertEqual(dialog._lines[0].price, 22.0)
+        self.assertEqual(dialog._lines[0].total(), 22.0)
+
+    def test_name_edit_leaves_the_tiers_in_place(self):
+        from tp_deck import uline_dialog as dmod
+
+        dialog = self.dialog()
+        first = UlineItem(item="S-4307", name="Foam", price=20.0, units_per_set=10,
+                          unit="Pack", min_sets=1, base_unit="Pack",
+                          tiers=((1, 20.0), (10, 14.0)), aliases=(), url="",
+                          in_stock=True, note="chart", added="", checked="")
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        self.calls[0](True, first, "")
+
+        original = self._fill_editor({
+            "name": "New foam name", "price": "20", "unit": "Case",
+            "units_per_set": 10, "min_sets": 1, "base_unit": "Pack",
+            "aliases": [], "note": "",
+        })
+        try:
+            dialog._cache_table.setCurrentCell(0, 0)
+            dialog._edit_item()
+        finally:
+            dmod.UlineItemEditor = original
+
+        self.assertEqual(dialog._cache["S-4307"].tiers, ((1, 20.0), (10, 14.0)))
+        self.assertEqual(dialog._lines[0].name, "New foam name")
+
+    def test_foreign_alias_stays_off_the_line_and_on_the_error(self):
+        dialog = self.dialog()
+        first = UlineItem(item="S-4307", name="Foam", price=12.0, units_per_set=10,
+                          unit="Pack", min_sets=1, base_unit="Pack", tiers=((1, 12.0),),
+                          aliases=("foam",), url="", in_stock=True, note="chart",
+                          added="", checked="")
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        self.calls[0](True, first, "")
+
+        second = UlineItem(item="H-999", name="Other item", price=5.0, units_per_set=1,
+                           unit="Each", min_sets=1, base_unit="Each", tiers=((1, 5.0),),
+                           aliases=(), url="", in_stock=True, note="chart",
+                           added="", checked="")
+        dialog._key_edit.setText("H-999")
+        dialog._alias_edit.setText("foam")  # the alias belongs to S-4307
+        dialog._add()
+        self.calls[1](True, second, "")
+
+        self.assertEqual(len(dialog._lines), 2)
+        self.assertEqual(dialog._lines[1].item, "H-999")
+        self.assertEqual(dialog._lines[1].alias, "")  # not carried on the line
+        # the alias stays with its first owner, in the cache
+        self.assertEqual(dialog._cache["H-999"].aliases, ())
+        self.assertIn("foam", dialog._cache["S-4307"].aliases)
+        self.assertEqual(resolve_key(dialog._cache, "foam")[0], "S-4307")
+        # the red label says who owns it
+        self.assertIn("foam", dialog._error.text())
+        self.assertIn("S-4307", dialog._error.text())
+
+    def test_cache_disk_failure_stays_on_the_error_after_add(self):
+        from tp_deck import uline_dialog as dmod
+
+        dialog = self.dialog()
+        found = UlineItem(item="S-4307", name="Foam", price=12.0, units_per_set=10,
+                          unit="Pack", min_sets=1, base_unit="Pack", tiers=((1, 12.0),),
+                          aliases=(), url="", in_stock=True, note="chart",
+                          added="", checked="")
+        original = dmod.write_cache
+
+        def boom(_cache):
+            raise OSError("disk full")
+
+        dmod.write_cache = boom
+        try:
+            dialog._key_edit.setText("S-4307")
+            dialog._add()
+            self.calls[0](True, found, "")
+            self.assertEqual(len(dialog._lines), 1)  # the line was still added
+            self.assertIn("disk full", dialog._error.text())  # disk message survives
+        finally:
+            dmod.write_cache = original
+
+    def test_closing_the_builder_cancels_the_browser_task(self):
+        from PySide6.QtGui import QCloseEvent
+
+        dialog = self.dialog()
+        task = _FakeTask()
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        # the stub runner returns None; the dialog stores whatever it is told to
+        dialog._task = task
+        dialog.closeEvent(QCloseEvent())
+
+        self.assertTrue(task.canceled)  # closeEvent cancelled the running task
+        self.calls[0](True, UlineItem(item="S-4307", name="Foam", price=12.0,
+                                      units_per_set=10, unit="Pack", min_sets=1,
+                                      base_unit="Pack", tiers=((1, 12.0),), aliases=(),
+                                      url="", in_stock=True, note="chart", added="",
+                                      checked=""), "")
+        # the late success was dropped: no line, no cache write, no status change
+        self.assertEqual(dialog._lines, [])
+        self.assertEqual(uline_cache.load_cache(), {})
+
+    def test_export_pdf_is_busy_once_and_the_first_path_is_kept(self):
+        import tempfile
+        from tp_deck import uline_dialog as dmod
+
+        workdir = pathlib.Path(tempfile.mkdtemp())
+        dialog = self.dialog({"uline_export_dir": str(workdir)})
+        first = UlineItem(item="S-4307", name="Foam", price=12.0, units_per_set=10,
+                          unit="Pack", min_sets=1, base_unit="Pack", tiers=((1, 12.0),),
+                          aliases=(), url="", in_stock=True, note="chart",
+                          added="", checked="")
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        self.calls[0](True, first, "")
+
+        target = workdir / "chosen.pdf"
+        with mock.patch.object(dmod.QFileDialog, "getSaveFileName",
+                               return_value=(str(target), "PDF files (*.pdf)")):
+            dialog._export_pdf()
+            self.assertEqual(len(self.calls), 2)  # lookup, then one print
+            self.assertTrue(dialog._busy)
+            self.assertFalse(dialog._add_btn.isEnabled())  # Add is disabled for the print
+            dialog._export_pdf()  # second click while the first is running
+            self.assertIn("already running", dialog._error.text())
+            self.assertEqual(len(self.calls), 2)  # no second print started
+            # the first print's path is its own, not overwritten by the second
+            self.calls[1](True, b"aA", "")
+            self.assertTrue(target.exists())
+            self.assertIn("Archived", dialog._status.text())
+            self.assertFalse(dialog._busy)
+            self.assertTrue(dialog._add_btn.isEnabled())
+
+    def test_out_of_stock_is_shown_and_the_line_is_still_added(self):
+        from tp_deck import uline_dialog as dmod
+
+        dialog = self.dialog()
+        found = UlineItem(item="S-4307", name="Foam", price=12.0, units_per_set=10,
+                          unit="Pack", min_sets=1, base_unit="Pack", tiers=((1, 12.0),),
+                          aliases=(), url="", in_stock=False, note="chart",
+                          added="", checked="")
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        self.calls[0](True, found, "")
+
+        self.assertEqual(len(dialog._lines), 1)  # the line is added anyway
+        self.assertIn("out of stock", dialog._status.text())
+        column = dmod.CACHE_COLUMNS.index("In Stock")
+        cell = dialog._cache_table.item(0, column)
+        self.assertEqual(cell.text(), "No")
+
+
+class PdfPrintTab(unittest.TestCase):
+    """PDF export closes the page it opened, on success and on a print failure."""
+
+    def setUp(self):
+        workdir = pathlib.Path(tempfile.mkdtemp())
+        uline_cache.CACHE_PATH = workdir / "uline_cache.json"
+        uline_order.DRAFT_PATH = workdir / "uline_draft.json"
+        self.events: list[str] = []
+
+    def _print(self, session, settings=None):
+        from tp_deck import uline_scraper as scraper
+
+        page = _FakePage("", self.events)
+        context = _FakeContext(page)
+        browser = _FakeBrowser(context)
+        playwright = _FakePlaywright(self.events, browser)
+
+        async def fake_window_state(_page):
+            return 1, "minimized", session
+
+        async def fake_reassert(_window_id, _state, _session):
+            self.events.append("re-minimized")
+
+        def fake_playwright():
+            return playwright
+
+        with mock.patch.object(scraper, "_window_state", fake_window_state), \
+             mock.patch.object(scraper, "_reassert_minimized", fake_reassert), \
+             mock.patch("playwright.async_api.async_playwright", new=fake_playwright):
+            return asyncio.run(
+                uline_order.pdf_bytes("<html><body>x</body></html>",
+                                      settings or {"uline_port": 9222})
+            )
+
+    def test_failed_print_closes_the_page_and_detaches_the_session(self):
+        session = _PrintSession(self.events)
+        with self.assertRaises(RuntimeError):
+            self._print(session)
+        self.assertIn("content", self.events)  # the page this print opened
+        self.assertIn("closed", self.events)
+        self.assertIn("re-minimized", self.events)  # minimized window stays minimized
+        self.assertIn("detached", self.events)
+
+    def test_successful_print_closes_the_page_too(self):
+        session = _PrintSession(self.events, boom=False)
+        data = self._print(session)
+        self.assertEqual(data, b"a")  # the print payload is returned whole
+        self.assertIn("closed", self.events)
+        self.assertIn("detached", self.events)
+
+
+class DraftLoading(unittest.TestCase):
+    """A bad draft field must not stop the builder from opening."""
+
+    def setUp(self):
+        workdir = pathlib.Path(tempfile.mkdtemp())
+        uline_order.DRAFT_PATH = workdir / "uline_draft.json"
+
+    def test_one_bad_line_does_not_kill_the_draft(self):
+        good = {"item": "S-4307", "name": "Foam", "unit": "Pack", "units_per_set": 10,
+                "min_sets": 1, "base_unit": "Pack", "price": 12.0, "tiers": [[1, 12.0]],
+                "needed_units": 10, "sets": 1, "price_override": None}
+        bad = {"item": "H-999", "name": "Bad", "unit": "Each", "units_per_set": "nope",
+              "min_sets": 1, "base_unit": "Each", "price": 1.0, "tiers": [],
+              "needed_units": 1, "sets": 1, "price_override": None}
+        uline_order.DRAFT_PATH.write_text(
+            "[" + json.dumps(good) + "," + json.dumps(bad) + "]", encoding="utf-8"
+        )
+        lines = uline_order.load_draft()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].item, "S-4307")
+
+    def test_unreadable_file_is_an_empty_order(self):
+        uline_order.DRAFT_PATH.write_text("not json", encoding="utf-8")
+        self.assertEqual(uline_order.load_draft(), [])
 
 
 if __name__ == "__main__":

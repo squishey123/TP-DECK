@@ -8,6 +8,7 @@ debug Chromium TP DECK attaches to, so no extra packages are needed.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 import json
@@ -213,33 +214,65 @@ def _esc(text: str) -> str:
     return out
 
 
+async def _close_pdf_page(page: Any, session: Any, window_id: Any, state: str) -> None:
+    """Close the page this print opened, re-minimize, and detach the session.
+
+    The awaits are shielded so Emergency Stop during a print still closes the
+    tab that print opened. The re-minimize runs on the failure path as well.
+    """
+    from tp_deck.uline_scraper import _reassert_minimized
+
+    try:
+        await asyncio.shield(page.close())
+    except (Exception, asyncio.CancelledError) as exc:
+        logger.debug("Uline PDF page close: %s", exc)
+    try:
+        await asyncio.shield(_reassert_minimized(window_id, state, session))
+    except (Exception, asyncio.CancelledError) as exc:
+        logger.debug("Uline PDF re-minimize: %s", exc)
+    try:
+        await asyncio.shield(session.detach())
+    except (Exception, asyncio.CancelledError) as exc:
+        logger.debug("Uline PDF session detach: %s", exc)
+
+
 async def pdf_bytes(html: str, settings: dict[str, Any]) -> bytes:
-    """Print HTML to PDF using the debug Chromium TP DECK already runs."""
+    """Print HTML to PDF using the debug Chromium TP DECK already runs.
+
+    The window state is read with the same helpers the Uline lookup uses, and
+    the page this print opens is closed with its CDP session detached in the
+    `finally`, so a failed print, and a cancelled print, do not leave a tab in
+    the operator's browser.
+    """
     from playwright.async_api import async_playwright
+
+    from tp_deck.uline_scraper import _window_state
 
     port = int(settings.get("uline_port", settings.get("ebay_port", 9222)))
     async with async_playwright() as pw:
         browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         context = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = await context.new_page()
-        await page.set_content(html)
-        session = await context.new_cdp_session(page)
-        result = await session.send(
-            "Page.printToPDF",
-            {
-                "landscape": False,
-                "printBackground": True,
-                "paperWidth": 8.5,
-                "paperHeight": 11.0,
-                "marginTop": 0.4,
-                "marginBottom": 0.4,
-                "marginLeft": 0.4,
-                "marginRight": 0.4,
-                "preferCSSPageSize": True,
-            },
-        )
-        data = base64.b64decode(result.get("data", ""))
-        await page.close()
+        window_id, state, session = await _window_state(page)
+        try:
+            await page.set_content(html)
+            result = await session.send(
+                "Page.printToPDF",
+                {
+                    "landscape": False,
+                    "printBackground": True,
+                    "paperWidth": 8.5,
+                    "paperHeight": 11.0,
+                    "marginTop": 0.4,
+                    "marginBottom": 0.4,
+                    "marginLeft": 0.4,
+                    "marginRight": 0.4,
+                    "preferCSSPageSize": True,
+                },
+            )
+            data = base64.b64decode(result.get("data", ""))
+        finally:
+            await _close_pdf_page(page, session, window_id, state)
         return data
 
 
@@ -268,14 +301,14 @@ def load_draft() -> list[OrderLine]:
     for entry in data if isinstance(data, list) else []:
         if not isinstance(entry, dict) or not str(entry.get("item") or ""):
             continue
-        tiers = tuple(
-            (int(row[0]), float(row[1]))
-            for row in entry.get("tiers") or []
-            if isinstance(row, (list, tuple)) and len(row) >= 2
-        )
-        raw_override = entry.get("price_override")
-        lines.append(
-            OrderLine(
+        try:
+            tiers = tuple(
+                (int(row[0]), float(row[1]))
+                for row in entry.get("tiers") or []
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            )
+            raw_override = entry.get("price_override")
+            line = OrderLine(
                 item=str(entry.get("item") or ""),
                 name=str(entry.get("name") or ""),
                 alias=str(entry.get("alias") or ""),
@@ -289,7 +322,14 @@ def load_draft() -> list[OrderLine]:
                 sets=max(1, int(entry.get("sets") or 1)),
                 price_override=float(raw_override) if raw_override not in (None, "") else None,
             )
-        )
+        except (TypeError, ValueError) as exc:
+            # One bad field must not keep the whole builder from opening; the
+            # rest of the draft is kept, like load_cache does with bad rows.
+            logger.warning(
+                "Uline draft line %r skipped (%s)", entry.get("item"), exc
+            )
+            continue
+        lines.append(line)
     return lines
 
 

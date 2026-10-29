@@ -1076,11 +1076,13 @@ def _open_settings(dashboard: Dashboard) -> None:
     dialog.exec()
 
 
-def _run_async(coro, on_done, controller: Optional["AutomationController"] = None) -> None:
+def _run_async(coro, on_done, controller: Optional["AutomationController"] = None) -> Optional[asyncio.Task]:
     """Start a coroutine on the qasync loop and hand the result back to Qt.
 
     The task is registered with the controller so the red Emergency Stop button
-    and the global Pause key cancel it, as `.cursorrules` §4 requires.
+    and the global Pause key cancel it, as `.cursorrules` §4 requires. The task
+    is returned so the caller (the Uline dialog) can cancel it when its window
+    closes, and so a lookup that is still running can be reported as stopped.
     """
     task = asyncio.create_task(coro)
     if controller is not None:
@@ -1091,12 +1093,13 @@ def _run_async(coro, on_done, controller: Optional["AutomationController"] = Non
             on_done(False, None, "cancelled")
             return
         exc = completed.exception()
-        if exc is not None:
-            on_done(False, None, str(exc))
+        if exc is None:
+            on_done(True, completed.result(), "")
             return
-        on_done(True, completed.result(), "")
+        on_done(False, None, str(exc))
 
     task.add_done_callback(_finish)
+    return task
 
 
 def _open_tools(dashboard: Dashboard, entries: list) -> None:
