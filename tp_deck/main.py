@@ -135,6 +135,7 @@ class AutomationController:
         self._draining = False
         self._shutdown_task: Optional[asyncio.Task] = None
         self._shutdown_abort = False
+        self._side_tasks: list[asyncio.Task] = []
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -225,6 +226,23 @@ class AutomationController:
         )
         logging.getLogger("tpdeck").info("Auto-cycle enabled")
 
+    def register_side_task(self, task: asyncio.Task) -> asyncio.Task:
+        """Track a tool-window task (Uline lookup, PDF print) for Emergency Stop.
+
+        `.cursorrules` §4 requires every Playwright operation to run inside an
+        asyncio.Task that both the red button and the Pause key can cancel.
+        """
+        self._side_tasks.append(task)
+        task.add_done_callback(self._forget_side_task)
+        return task
+
+    def _forget_side_task(self, task: asyncio.Task) -> None:
+        if task in self._side_tasks:
+            self._side_tasks.remove(task)
+
+    def _side_running(self) -> bool:
+        return any(t is not None and not t.done() for t in self._side_tasks)
+
     def stop(self) -> None:
         logger = logging.getLogger("tpdeck")
         self.hold_autocycle(False)
@@ -250,8 +268,9 @@ class AutomationController:
         drain_running = (
             self._drain_task is not None and not self._drain_task.done()
         )
+        side_running = self._side_running()
         update_cancelled = self._dashboard.cancel_update_warning()
-        if not manual_running and not cycle_running and not drain_running:
+        if not manual_running and not cycle_running and not drain_running and not side_running:
             if update_cancelled:
                 logger.info("Update cancelled — will try again next launch")
             elif shutdown_running:
@@ -276,6 +295,9 @@ class AutomationController:
         if drain_running:
             assert self._drain_task is not None
             self._drain_task.cancel()
+        for side in list(self._side_tasks):
+            if side is not None and not side.done():
+                side.cancel()
 
     def stop_from_other_thread(self) -> None:
         """Marshal Pause-key cancels onto the asyncio/Qt loop."""
@@ -1011,7 +1033,7 @@ def main() -> int:
         _open_tools(dashboard, tool_entries)
 
     def _uline() -> None:
-        _open_uline(dashboard, uline_holder)
+        _open_uline(dashboard, uline_holder, controller)
 
     uline_holder: dict = {}
     tool_entries: list[tuple[str, object]] = [("Uline Order Builder", _uline)]
@@ -1054,9 +1076,15 @@ def _open_settings(dashboard: Dashboard) -> None:
     dialog.exec()
 
 
-def _run_async(coro, on_done) -> None:
-    """Start a coroutine on the qasync loop and hand the result back to Qt."""
+def _run_async(coro, on_done, controller: Optional["AutomationController"] = None) -> None:
+    """Start a coroutine on the qasync loop and hand the result back to Qt.
+
+    The task is registered with the controller so the red Emergency Stop button
+    and the global Pause key cancel it, as `.cursorrules` §4 requires.
+    """
     task = asyncio.create_task(coro)
+    if controller is not None:
+        controller.register_side_task(task)
 
     def _finish(completed: asyncio.Task) -> None:
         if completed.cancelled():
@@ -1075,16 +1103,17 @@ def _open_tools(dashboard: Dashboard, entries: list) -> None:
     popup_tools_menu(dashboard.tools_btn, entries)
 
 
-def _open_uline(dashboard: Dashboard, holder: dict) -> None:
+def _open_uline(dashboard: Dashboard, holder: dict, controller: "AutomationController") -> None:
     """Show the Uline builder without blocking the dashboard."""
     existing = holder.get("dialog")
     if existing is not None:
         existing.raise_()
         existing.activateWindow()
         return
+    runner = lambda coro, on_done: _run_async(coro, on_done, controller)
     dialog = UlineDialog(
         parent=dashboard,
-        runner=_run_async,
+        runner=runner,
         settings=load_settings(),
     )
     dialog.setModal(False)

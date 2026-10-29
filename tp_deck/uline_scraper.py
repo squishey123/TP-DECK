@@ -20,9 +20,9 @@ from urllib.parse import quote_plus
 from tp_deck.automation_engine import connect_over_cdp, find_page_by_url
 from tp_deck.uline_cache import (
     UlineItem,
+    is_item_shape,
     normalize_item,
     parse_price,
-    parse_units,
     today,
 )
 
@@ -31,15 +31,21 @@ logger = logging.getLogger("tpdeck")
 ULINE_BASE = "https://www.uline.com"
 _NOT_FOUND = re.compile(r"not\s+found|no\s+(products|items)", re.IGNORECASE)
 _PRICE_LABEL = re.compile(r"PRICE\s*(?:PER)?\s+([A-Za-z]+)", re.IGNORECASE)
-_QTY_LABEL = re.compile(r"QTY\.\s*/\s*([A-Za-z]+)", re.IGNORECASE)
-_QTY_SPECS = re.compile(r"QTY\.\s*/\s*([A-Za-z]+)\s*:?\s*(\d+)", re.IGNORECASE)
-_PACKS_PER = re.compile(r"(\d+)\s+[A-Za-z]+\s+per\s+([A-Za-z]+)", re.IGNORECASE)
-_TIER_LABEL = re.compile(r"^\d+\+?$")
 _STEPS = re.compile(
     r"(?is)<li[^>]*class=[\"'][^\"']*card[^\"']*[\"'][^>]*>(.*?)</li>"
 )
 _NUMBER = re.compile(r"(?is)<span[^>]*class=[\"'][^\"']*number[^\"']*[\"'][^>]*>\s*(\d+)\s*<")
 _NUMBER_PRICE = re.compile(r"(?is)numberPrice[^>]*>\s*(\d+(?:\.\d{1,2})?)\s*<")
+_DETAIL_LINK = re.compile(r"(?is)href=[\"'](/Product/Detail/[^\"']+)\"")
+# Pages Uline serves instead of the product: consent screen, bot check, login
+# wall. The markers are checked against the committed page samples, where none
+# of them appear, so a normal product page never trips this.
+_BLOCKED = re.compile(
+    r"(recaptcha|captcha|access denied|not a robot|permitted characters"
+    r"|enable cookies|unusual traffic|security check|attention!|"
+    r"verify you are a|access to this page is|sign in to continue)",
+    re.IGNORECASE,
+)
 
 _UNIT_CODES = {
     "EA": "Each",
@@ -53,7 +59,6 @@ _UNIT_CODES = {
     "C62": "Each",
 }
 
-_ITEM_IN_TABLE = re.compile(r"^[A-Z]{1,3}-?\d{1,6}(-[A-Z0-9]+)?$", re.IGNORECASE)
 _ENTITIES = {
     "&reg;": "\u00ae",
     "&trade;": "\u2122",
@@ -178,6 +183,12 @@ def _tier_row_cells(row: list[str]) -> Optional[list[tuple[float, str]]]:
     return [item for item in parsed if item is not None]
 
 
+def _item_cell(text: str) -> str:
+    """Canonical Item # when a table cell is one, else ""."""
+    canonical = normalize_item(text)
+    return canonical if is_item_shape(canonical) else ""
+
+
 def _chart_table(tables: list[list[list[tuple[str, int]]]]) -> tuple[list[tuple[str, int]], list[tuple[float, str]], list[str]]:
     """Header cells (with spans), tier quantities, and the item row of the chart table."""
     for rows in tables:
@@ -192,7 +203,7 @@ def _chart_table(tables: list[list[list[tuple[str, int]]]]) -> tuple[list[tuple[
                 texts = [cell for cell, _span in row]
                 if not texts:
                     continue
-                if not item_row and texts[0] and _ITEM_IN_TABLE.match(texts[0].strip()):
+                if not item_row and _item_cell(texts[0]):
                     item_row = texts
                 elif not tier_cells:
                     parsed = _tier_row_cells(texts)
@@ -203,16 +214,19 @@ def _chart_table(tables: list[list[list[tuple[str, int]]]]) -> tuple[list[tuple[
     return [], [], []
 
 
-def _price_cell(header: list[tuple[str, int]]) -> tuple[int, str, int]:
-    """Column the price starts at, the unit word Uline prices in, and its span."""
+def _price_cell(header: list[tuple[str, int]]) -> tuple[int, str, int, str]:
+    """Column the price starts at, the unit word Uline prices in, its span, and the label.
+
+    The label is returned too, so the caller does not scan the header again.
+    """
     for index, (label, span) in enumerate(header):
         match = _PRICE_LABEL.search(label)
         if match:
-            return index, match.group(1).capitalize(), span
+            return index, match.group(1).capitalize(), span, label
     for index, (label, span) in enumerate(header):
         if "PRICE" in label.upper():
-            return index, "Each", span
-    return -1, "Each", 1
+            return index, "Each", span, label
+    return -1, "Each", 1, ""
 
 
 def _extra_before(header: list[tuple[str, int]], index: int) -> int:
@@ -362,8 +376,24 @@ def _availability(html: str, jsonld: Optional[dict[str, Any]]) -> bool:
     return True
 
 
-def parse_product(html: str, page_url: str, wanted: str) -> Optional[UlineItem]:
-    """Name, item #, price, tiers, and units per set out of a Uline product page."""
+def _blocked_message(html: str) -> str:
+    """Explicit message when Uline served a consent, bot-check, or login page."""
+    match = _BLOCKED.search(_clean_text(html))
+    if not match:
+        return ""
+    return (
+        "Uline asked for a verification step (login, bot check, or cookie "
+        f"consent — page says {match.group(0)!r}). Open the Uline tab in the "
+        "TP DECK browser, complete the prompt, then look the item up again."
+    )
+
+
+def parse_product(html: str, page_url: str) -> Optional[UlineItem]:
+    """Name, item #, price, tiers, and units per set out of a Uline product page.
+
+    The item number Uline's own page reports is the one returned; the caller
+    compares it with the key typed.
+    """
     if not html:
         return None
     jsonld = _jsonld_product(html)
@@ -396,12 +426,7 @@ def parse_product(html: str, page_url: str, wanted: str) -> Optional[UlineItem]:
         if title:
             name = re.sub(r"(?i)\s*[-|]\s*ULINE.*$", "", _strip_tags(title.group(1)))
 
-    price_index, price_word, _span = _price_cell(header) if header else (-1, "", 1)
-    price_label = ""
-    for label, _span in header:
-        if _PRICE_LABEL.search(label):
-            price_label = label
-            break
+    price_index, price_word, _span, price_label = _price_cell(header) if header else (-1, "", 1, "")
     if not price_label:
         text = _strip_tags(html)
         label_match = re.search(r"Price\s+Per\s+[A-Za-z]+(?:\s*\(\d+\s*/\s*[A-Za-z]+\))?", text, re.IGNORECASE)
@@ -432,8 +457,10 @@ def parse_product(html: str, page_url: str, wanted: str) -> Optional[UlineItem]:
             _norm_unit(price_word),
         )
     if not tiers:
-        tiers = _step_tiers(html)
-        factor = 1
+        # Step cards show per-pack prices, so the chart pack rule is kept: a
+        # price stated in base units (per roll, per box) scales by the pack
+        # factor, and the step counts stay in packs.
+        tiers = [(max(1, qty), round(price * factor, 2)) for qty, price in _step_tiers(html)]
 
     min_sets = min((minimum for minimum, _price in tiers), default=1)
 
@@ -479,7 +506,8 @@ def _first_detail_link(html: str) -> str:
 
 
 def looks_like_item(text: str) -> bool:
-    return bool(re.match(r"^[A-Z]{1,3}-?\d{1,6}(-[A-Z0-9]+)?$", normalize_item(text)))
+    """True when the typed text is a Uline Item #, not a keyword search."""
+    return is_item_shape(normalize_item(text))
 
 
 async def _window_state(page: Any) -> tuple[Any, str, Any]:
@@ -509,15 +537,24 @@ async def _reassert_minimized(window_id: Any, state: str, session: Any) -> None:
 
 
 async def lookup_item(key: str, settings: dict[str, Any]) -> UlineItem:
-    """Resolve an Item #, or a keyword search, into cache-ready data."""
+    """Resolve an Item #, or a keyword search, into cache-ready data.
+
+    The page Uline served is checked against the typed Item #: Uline redirects
+    an Item # to its canonical page, so a page that reports a different item
+    number is reported as a mismatch, not cached under the typed key.
+    """
     from playwright.async_api import async_playwright
 
     timeout_ms = int(settings.get("uline_lookup_timeout_ms", 20000))
     port = int(settings.get("uline_port", settings.get("ebay_port", 9222)))
     pattern = str(settings.get("uline_url_pattern", "uline.com"))
     typed = normalize_item(key)
+    searched_item = looks_like_item(typed)
 
     playwright = await async_playwright().start()
+    page: Optional[Any] = None
+    created = False
+    session: Optional[Any] = None
     try:
         browser = await connect_over_cdp(playwright, port)
         page = await find_page_by_url(browser, pattern, label="Uline tab")
@@ -527,7 +564,7 @@ async def lookup_item(key: str, settings: dict[str, Any]) -> UlineItem:
             page = await context.new_page()
         window_id, state, session = await _window_state(page)
 
-        if looks_like_item(typed):
+        if searched_item:
             url = f"{ULINE_BASE}/Product/Detail/{typed}"
         else:
             await page.goto(
@@ -547,11 +584,28 @@ async def lookup_item(key: str, settings: dict[str, Any]) -> UlineItem:
         await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
         html = await page.content()
         await _reassert_minimized(window_id, state, session)
+
+        blocked = _blocked_message(html)
+        if blocked:
+            raise RuntimeError(blocked)
         if _NOT_FOUND.search(html) and "/Product/Detail/" not in (page.url or ""):
             raise RuntimeError(f"Uline has no item {key!r}")
-        item = parse_product(html, page.url, typed)
+
+        item = parse_product(html, page.url)
         if item is None:
-            raise RuntimeError(f"Uline page for {key!r} has no price table")
+            raise RuntimeError(
+                f"Uline page for {key!r} is not a single product page "
+                f"(address {page.url}). Open the product page, and type its "
+                "Item #."
+            )
+        if searched_item and item.item != typed:
+            raise RuntimeError(
+                f"Uline returned {item.item} ({item.name}) for {typed!r}, "
+                f"not {typed}. The page Uline served is a different item. "
+                f"Type {item.item} to add that one, or fix the Item # so it "
+                f"opens {item.item}."
+            )
+
         logger.info(
             "Uline lookup %s → %s (%s per %s, min %s, $%s)",
             key,
@@ -561,13 +615,22 @@ async def lookup_item(key: str, settings: dict[str, Any]) -> UlineItem:
             item.min_sets,
             item.price,
         )
+        return item
+    finally:
+        # The tab opened for this lookup is closed, and the CDP session
+        # detached, on success, failure, and cancel alike, so a failed lookup
+        # does not leave a tab open in the operator's browser.
         if session is not None:
             try:
                 await session.detach()
             except Exception as exc:
                 logger.debug("Uline CDP session detach failed: %s", exc)
-        if created:
-            await page.close()
-        return item
-    finally:
-        await playwright.stop()
+        if created and page is not None:
+            try:
+                await page.close()
+            except Exception as exc:
+                logger.debug("Uline tab close failed: %s", exc)
+        try:
+            await playwright.stop()
+        except Exception as exc:
+            logger.debug("Uline playwright stop failed: %s", exc)

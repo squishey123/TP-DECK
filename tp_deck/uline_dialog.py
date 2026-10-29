@@ -39,7 +39,7 @@ from tp_deck.uline_cache import (
     remove_alias,
     remove_item,
     resolve_key,
-    save_cache,
+    save_cache as write_cache,
 )
 from tp_deck.uline_order import (
     OrderLine,
@@ -52,7 +52,7 @@ from tp_deck.uline_order import (
     order_total,
     pdf_bytes,
     safe_name,
-    save_draft,
+    save_draft as write_draft,
     sets_for,
     stamp,
     write_csv,
@@ -353,7 +353,7 @@ class UlineDialog(QDialog):
                 self._refresh_order_table()
                 return
             line.price_override = value if value > 0 else None
-            save_draft(self._lines)
+            self._save_draft()
             self._refresh_order_table()
             self._set_status(
                 f"{line.item}: price {'overridden at' if value > 0 else 'cleared to the tier price'} "
@@ -372,7 +372,7 @@ class UlineDialog(QDialog):
             line.needed_units = line.sets * line.units_per_set
         else:
             return
-        save_draft(self._lines)
+        self._save_draft()
         self._refresh_order_table()
 
     def _selected_rows(self) -> list[int]:
@@ -386,20 +386,30 @@ class UlineDialog(QDialog):
         for row in rows:
             if 0 <= row < len(self._lines):
                 self._lines.pop(row)
-        save_draft(self._lines)
+        self._save_draft()
         self._refresh_order_table()
 
     def _clear_order(self) -> None:
         self._lines = []
-        save_draft(self._lines)
+        self._save_draft()
         self._refresh_order_table()
         self._set_status("Order cleared")
+
+    def _refresh_settings(self) -> dict[str, Any]:
+        """Reload Settings so a Settings change is used by the next export/lookup.
+
+        The dialog is not modal, so Settings can be edited while it is open; the
+        snapshot from __init__ is replaced here on each action.
+        """
+        self._settings = load_settings()
+        return self._settings
 
     def _export_csv(self) -> None:
         if not self._lines:
             self._set_error("The order is empty")
             return
-        default = export_path(self._settings, ".csv")
+        settings = self._refresh_settings()
+        default = export_path(settings, ".csv")
         target, _ = QFileDialog.getSaveFileName(
             self,
             "Export Uline order CSV",
@@ -409,7 +419,7 @@ class UlineDialog(QDialog):
         if not target:
             return
         try:
-            archive = write_csv(self._lines, self._settings, Path(target))
+            archive = write_csv(self._lines, settings, Path(target))
         except OSError as exc:
             self._set_error(f"Export failed: {exc}")
             return
@@ -422,7 +432,8 @@ class UlineDialog(QDialog):
         if self._runner is None:
             self._set_error("PDF export is not available")
             return
-        default = export_path(self._settings, ".pdf")
+        settings = self._refresh_settings()
+        default = export_path(settings, ".pdf")
         target, _ = QFileDialog.getSaveFileName(
             self,
             "Export Uline order PDF",
@@ -435,18 +446,24 @@ class UlineDialog(QDialog):
         html = order_html(self._lines, created, safe_name("Uline Order"))
         self._set_status("Writing PDF…")
         self._pending_pdf_target = Path(target)
-        self._runner(pdf_bytes(html, self._settings), self._on_pdf)
+        self._pending_pdf_settings = settings
+        self._runner(pdf_bytes(html, settings), self._on_pdf)
 
     def _on_pdf(self, ok: bool, data, _err: str) -> None:
         if not ok:
             self._set_error(f"PDF export failed: {_err}")
             return
         target = getattr(self, "_pending_pdf_target", None)
-        archive = write_pdf(data, self._settings, target)
+        settings = getattr(self, "_pending_pdf_settings", self._settings)
+        try:
+            archive = write_pdf(data, settings, target)
+        except OSError as exc:
+            self._set_error(f"PDF export failed: {exc}")
+            return
         self._set_status(f"Archived in {archive.parent}: {archive.name}")
 
     def _open_folder(self) -> None:
-        folder = export_dir(self._settings)
+        folder = export_dir(self._refresh_settings())
         folder.mkdir(parents=True, exist_ok=True)
         try:
             os.startfile(str(folder))
@@ -474,8 +491,9 @@ class UlineDialog(QDialog):
         self._pending_key = key
         self._pending_alias = self._alias_edit.text().strip()
         self._add_btn.setEnabled(False)
+        settings = self._refresh_settings()
         self._set_status(f"Looking up {key} on Uline…")
-        self._runner(lookup_item(key, self._settings), self._on_lookup)
+        self._runner(lookup_item(key, settings), self._on_lookup)
 
     def _on_lookup(self, ok: bool, item, err: str) -> None:
         self._busy = False
@@ -484,13 +502,45 @@ class UlineDialog(QDialog):
             self._set_error(f"Uline lookup failed: {err}")
             return
         put_item(self._cache, item)
-        save_cache(self._cache)
+        self._save_cache()
         self._refresh_cache_table()
-        canonical, cached = resolve_key(self._cache, self._pending_key)
+        canonical = normalize_item(item.item)
+        typed = normalize_item(self._pending_key)
+        if canonical != typed:
+            self._set_status(
+                f"Uline gave {item.item} for {self._pending_key!r}: {item.name}. "
+                f"Added as {canonical}."
+            )
+        self._commit(canonical, item, self._pending_alias)
+
+    def _sync_line(self, line: OrderLine) -> bool:
+        """Refresh one order line from the cached item, keeping the typed quantity.
+
+        Cached edits, re-checks, and pack-size changes update the line, then
+        the packs are recomputed so Needed Units stays covered.
+        """
+        cached = self._cache.get(normalize_item(line.item))
         if cached is None:
-            self._set_error(f"{self._pending_key} did not resolve")
-            return
-        self._commit(canonical, cached, self._pending_alias)
+            return False
+        line.name = cached.name
+        line.unit = cached.unit
+        line.units_per_set = max(1, cached.units_per_set)
+        line.min_sets = max(1, cached.min_sets)
+        line.base_unit = cached.base_unit or cached.unit
+        line.price = cached.price
+        line.tiers = cached.tiers
+        line.sets = sets_for(line.needed_units, line.units_per_set, line.min_sets)
+        return True
+
+    def _sync_lines(self, note: str = "") -> None:
+        """Pull the order lines from the cache and redraw the totals."""
+        updated = sum(1 for line in self._lines if self._sync_line(line))
+        self._save_draft()
+        self._refresh_order_table()
+        if note:
+            self._set_status(note)
+        if updated:
+            logger.info("Uline order lines synced from cache (%s line(s))", updated)
 
     def _commit(self, canonical: str, item: UlineItem, alias_text: str) -> None:
         qty = max(1, self._qty_spin.value())
@@ -517,7 +567,7 @@ class UlineDialog(QDialog):
         )
         if alias_text:
             owner = add_alias(self._cache, canonical, alias_text)
-            save_cache(self._cache)
+            self._save_cache()
             self._refresh_cache_table()
             line.alias = alias_text
             if owner != canonical:
@@ -526,20 +576,20 @@ class UlineDialog(QDialog):
                     f"saved for {canonical}. The line was added."
                 )
         add_line(self._lines, line)
-        save_draft(self._lines)
-        self._refresh_order_table()
+        self._sync_lines()
         self._key_edit.clear()
         self._alias_edit.clear()
-        pack = item.unit
-        base = (item.base_unit or item.unit).lower()
+        added = next((l for l in self._lines if l.item == canonical), line)
+        pack = added.unit
+        base = (added.base_unit or added.unit).lower()
         joiner = "of" if base == pack.lower() else "×"
         note = ""
-        if self._mode_combo.currentText() == MODE_UNITS and needed < units * min_sets:
+        if self._mode_combo.currentText() == MODE_UNITS and added.needed_units < units * min_sets:
             note = f" (raised to the {min_sets} {pack} minimum)"
         self._set_status(
-            f"{canonical}: {sets} {pack}(s) {joiner} {units:,} {base}(s) "
-            f"= {sets * units:,} {base}(s) at ${line.price_at(sets):.2f}/{pack} "
-            f"= ${line.total():.2f}{note}"
+            f"{canonical}: {added.sets} {pack}(s) {joiner} {units:,} {base}(s) "
+            f"= {added.needed_units:,} {base}(s) at ${added.price_at(added.sets):.2f}/{pack} "
+            f"= ${added.total():.2f}{note}"
         )
 
     # ------------------------------------------------------------------ cache tab
@@ -614,7 +664,7 @@ class UlineDialog(QDialog):
         except ValueError as exc:
             self._set_error(str(exc))
             return
-        save_cache(self._cache)
+        self._save_cache()
         self._refresh_cache_table()
         if owner != normalize_item(key):
             self._set_error(
@@ -636,7 +686,7 @@ class UlineDialog(QDialog):
         except ValueError as exc:
             self._set_error(str(exc))
             return
-        save_cache(self._cache)
+        self._save_cache()
         self._refresh_cache_table()
         self._alias_input.clear()
 
@@ -647,9 +697,10 @@ class UlineDialog(QDialog):
         editor = UlineItemEditor(self._cache[normalize_item(key)], self)
         if editor.exec() != QDialog.DialogCode.Accepted:
             return
-        edit_item(self._cache, key, **editor.values())
-        save_cache(self._cache)
+        updated = edit_item(self._cache, key, **editor.values())
+        self._save_cache()
         self._refresh_cache_table()
+        self._sync_lines(f"{updated.item} updated in {len(self._lines)} order line(s)")
 
     def _re_lookup(self) -> None:
         key = self._selected_item()
@@ -660,6 +711,7 @@ class UlineDialog(QDialog):
             return
         self._busy = True
         self._add_btn.setEnabled(False)
+        self._settings = load_settings()
         self._set_status(f"Re-checking {key} on Uline…")
         self._runner(lookup_item(key, self._settings), self._on_re_lookup)
 
@@ -670,8 +722,9 @@ class UlineDialog(QDialog):
             self._set_error(f"Re-lookup failed: {err}")
             return
         put_item(self._cache, item)
-        save_cache(self._cache)
+        self._save_cache()
         self._refresh_cache_table()
+        self._sync_lines(f"{item.item} re-checked from Uline")
 
     def _delete_item(self) -> None:
         key = self._selected_item()
@@ -686,7 +739,7 @@ class UlineDialog(QDialog):
         if answer != QMessageBox.StandardButton.Yes:
             return
         remove_item(self._cache, key)
-        save_cache(self._cache)
+        self._save_cache()
         self._refresh_cache_table()
 
     # ------------------------------------------------------------------ status
@@ -700,7 +753,21 @@ class UlineDialog(QDialog):
         self._error.setText(text)
         logger.warning("Uline dialog: %s", text)
 
+    def _save_cache(self) -> None:
+        """Write the cache, and show a disk failure instead of raising."""
+        try:
+            write_cache(self._cache)
+        except OSError as exc:
+            self._set_error(f"Cache not saved to disk: {exc}")
+
+    def _save_draft(self) -> None:
+        """Write the draft, and show a disk failure instead of raising."""
+        try:
+            write_draft(self._lines)
+        except OSError as exc:
+            self._set_error(f"Order not saved to disk: {exc}")
+
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt override
-        save_draft(self._lines)
-        save_cache(self._cache)
+        self._save_draft()
+        self._save_cache()
         super().closeEvent(event)

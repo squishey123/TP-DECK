@@ -20,6 +20,8 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from tp_deck.uline_cache import tier_price
+
 logger = logging.getLogger("tpdeck")
 
 DRAFT_PATH = Path(__file__).resolve().parent / "uline_draft.json"
@@ -58,11 +60,7 @@ class OrderLine:
         """Price per unit: the override if typed, else the tier this pack count reaches."""
         if self.price_override is not None:
             return float(self.price_override)
-        best = float(self.price)
-        for minimum, price in sorted(self.tiers, key=lambda row: int(row[0])):
-            if int(sets) >= int(minimum):
-                best = float(price)
-        return best
+        return tier_price(self.tiers, self.price, sets)
 
     def total(self) -> float:
         sets = max(1, int(self.sets))

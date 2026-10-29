@@ -19,9 +19,16 @@ _ITEM_SHAPE = re.compile(r"^[A-Z]{1,3}-\d{1,6}(-[A-Z0-9]+)?$")
 
 
 def normalize_item(text: str) -> str:
-    """Uline item number in canonical form, uppercase, no spaces around dashes."""
+    """Uline item number in canonical form, uppercase, no spaces around dashes.
+
+    Uline prints item numbers with thousands commas in its tables and on its
+    labels (11,633), so commas are stripped before the shape check. Without
+    that, "s-11,633" matched only the first digits and returned "S-11", which
+    is a real Uline page for a different item.
+    """
     raw = unicodedata.normalize("NFKC", str(text or ""))
-    raw = _WSPACE.sub("", raw).strip().upper()
+    raw = raw.replace(",", "").strip()
+    raw = _WSPACE.sub("", raw).upper()
     raw = re.sub(r"/", "-", raw)
     if _ITEM_SHAPE.match(raw):
         return raw
@@ -29,6 +36,11 @@ def normalize_item(text: str) -> str:
     if match:
         return f"{match.group(1)}-{match.group(2)}"
     return raw
+
+
+def is_item_shape(text: str) -> bool:
+    """True when the text is already in canonical Uline item-number form."""
+    return bool(_ITEM_SHAPE.match(str(text or "")))
 
 
 def normalize_alias(text: str) -> str:
@@ -63,11 +75,17 @@ def today() -> str:
 
 
 def tier_price(tiers: Iterable[tuple[int, float]], base: float, qty: int) -> float:
-    """Price per unit at the highest tier the pack count reaches."""
+    """Price per unit at the highest tier the pack count reaches.
+
+    Uline's tier prices go down as the quantity goes up, so the best price is
+    the lowest one the quantity reaches. Ties pick the lowest price, not the
+    last row on the page: a half-pack tier (1/2 CASE) and a full-pack tier
+    (1 CASE) both round up to one pack, and the cheaper one applies.
+    """
     best = float(base)
     for minimum, price in sorted(tiers, key=lambda row: int(row[0])):
         if int(qty) >= int(minimum):
-            best = float(price)
+            best = min(best, float(price))
     return best
 
 
@@ -81,13 +99,6 @@ def parse_price(text: str) -> Optional[float]:
         return float(match.group(1))
     except ValueError:
         return None
-
-
-def parse_units(text: str) -> Optional[int]:
-    """1,750 → 1750. None when no whole number in the text."""
-    cleaned = unicodedata.normalize("NFKC", str(text or "")).replace(",", "")
-    match = re.search(r"\d+", cleaned)
-    return int(match.group(0)) if match else None
 
 
 def _as_str(value: Any) -> str:
@@ -325,8 +336,3 @@ def remove_item(cache: dict[str, UlineItem], key: str) -> UlineItem:
         raise ValueError(f"{key} is not in the cache")
     cache.pop(canonical)
     return found
-
-
-def merge_items(cache: dict[str, UlineItem], items: Iterable[UlineItem]) -> None:
-    for item in items:
-        put_item(cache, item)
