@@ -86,6 +86,7 @@ def render_job(
     )
 
     if not copy_clipboard:
+        stored_lines, stored_queried = _carry([], lines, queried)
         if not cache_enabled:
             status = (
                 f"Cycling — {len(ebay_skus)} SKU(s), "
@@ -96,7 +97,12 @@ def render_job(
                 f"Cycling — {len(ebay_skus)} SKU(s) cached, "
                 f"{misses} lookup(s), {hits} cache hit(s){unknown_bit}{alt_bit}"
             )
-        return AutomationResult(status=status, job=job_name)
+        return AutomationResult(
+            status=status,
+            job=job_name,
+            lines=stored_lines,
+            queried=stored_queried,
+        )
 
     if job_name == "picklist":
         return _render_pick(
@@ -138,8 +144,11 @@ def _carry(
     lines: list[tuple[str, str, str, int]] | tuple[tuple[str, str, str, int], ...],
     queried: dict[str, str],
 ) -> tuple[tuple[tuple[str, str, str, int], ...], tuple[tuple[str, str], ...]]:
-    if not pending:
-        return (), ()
+    """Keep the scraped lines for the Batch Serial Current Orders window.
+
+    They are stored on every result, not only when unknowns are pending, so the
+    window sees the orders from the last scrape even when the copy completed.
+    """
     stored_lines = tuple(
         (str(order_id), str(buyer), str(sku), int(qty))
         for order_id, buyer, sku, qty in lines

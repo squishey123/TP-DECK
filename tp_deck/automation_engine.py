@@ -1141,11 +1141,21 @@ async def run_automation(
             _REFRESH_WEIGHT + _SCRAPE_WEIGHT,
             "Scraping orders",
         )
-        lines_in = await scrape_ebay_orders(
-            ebay_page,
-            selectors,
-            timeout_ms=timeout_ms,
-        )
+        # An eBay scrape failure (no rows, no SKUs) is not fatal when
+        # ShipStation can supply store orders, so the failure is held and the
+        # store scrape runs. When both sides come up empty, the eBay failure
+        # is raised as the job's error.
+        ebay_failure: Optional[RuntimeError] = None
+        lines_in: list[tuple[str, str, str, int]] = []
+        try:
+            lines_in = await scrape_ebay_orders(
+                ebay_page,
+                selectors,
+                timeout_ms=timeout_ms,
+            )
+        except Exception as exc:
+            ebay_failure = exc
+            logger.warning("eBay scrape failed: %s", exc)
         if scrape_shipstation and not ship_note:
             progress.phase(
                 _REFRESH_WEIGHT,
@@ -1169,6 +1179,10 @@ async def run_automation(
                     on_status=on_store_status,
                 )
             )
+        if ebay_failure is not None and not lines_in:
+            raise ebay_failure
+        if ebay_failure is not None:
+            ship_note = f"{ship_note} — eBay scrape failed, store orders kept"
         dropped = [line for line in lines_in if not is_usable_sku(line[2])]
         if dropped:
             logger.info(

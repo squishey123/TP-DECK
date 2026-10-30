@@ -892,6 +892,7 @@ class Dashboard(QMainWindow):
         self._persist_enabled = False
         self._results: Optional[ResultsWindow] = None
         self._failures: Optional[ResultsWindow] = None
+        self._failure_lines: list[str] = []
         self._active = False
         self._error = False
         self._serial_queued = False
@@ -1314,23 +1315,43 @@ class Dashboard(QMainWindow):
             note=note,
         )
 
-    def show_serial_failures(self, failures: list[tuple[int, str]]) -> None:
-        """Report serials the batch did not accept, by scan order."""
+    def show_serial_failures(
+        self,
+        failures: list[tuple[int, str]],
+        order: str = "",
+    ) -> None:
+        """Report serials the batch did not accept, by scan order.
+
+        A later order appends to the window already on screen, so a queue does
+        not replace the notice for the order that just failed. Index 0 is a
+        batch error (the run itself stopped) and is shown as a plain line.
+        """
         if not failures:
             return
+        prefix = f"{order}: " if str(order or "").strip() else ""
+        lines = []
+        for index, serial in failures:
+            if int(index) <= 0:
+                lines.append(f"{prefix}{serial}")
+            else:
+                lines.append(f"{prefix}{_ordinal(index)} scanned: {serial}")
+        visible = self._failures is not None and self._failures.isVisible()
+        if visible and self._failure_lines:
+            self._failure_lines.extend(lines)
+        else:
+            self._failure_lines = lines
         if self._failures is None:
             self._failures = ResultsWindow(
                 self,
                 title="TP DECK — Failed Serials",
                 note="Serial numbers that failed",
             )
-        count = len(failures)
+        count = len(self._failure_lines)
         noun = "serial number" if count == 1 else "serial numbers"
-        lines = [
-            f"{_ordinal(index)} scanned: {serial}"
-            for index, serial in failures
-        ]
-        self._failures.present("\n".join(lines), note=f"{count} {noun} failed")
+        self._failures.present(
+            "\n".join(self._failure_lines),
+            note=f"{count} {noun} failed",
+        )
 
     def set_actions_enabled(self, enabled: bool) -> None:
         """Enable or disable scrape, pick list, batch, and cycle without changing labels."""

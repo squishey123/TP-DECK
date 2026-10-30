@@ -56,6 +56,17 @@ class OrderLine:
     needed_units: int = 1
     sets: int = 1
     price_override: Optional[float] = None
+    # A lazy line is an entry added without a Uline lookup. The Uline site is
+    # opened for it when lazy mode is toggled off, so the line carries the
+    # typed key, alias, and quantity until the page read fills in the rest.
+    lazy_pending: bool = False
+    # The text to look up when lazy mode is turned off. Item numbers are
+    # canonical; a keyword or alias is kept exactly as typed so the search
+    # still has its spaces.
+    lazy_key: str = ""
+    # Sets mode has no pack size until Uline is read, so the typed pack count
+    # stays in sets and needed units are filled in when the line is synced.
+    qty_as_sets: bool = False
 
     def price_at(self, sets: int) -> float:
         """Price per unit: the override if typed, else the tier this pack count reaches."""
@@ -321,6 +332,9 @@ def load_draft() -> list[OrderLine]:
                 needed_units=max(0, int(entry.get("needed_units") or 0)),
                 sets=max(1, int(entry.get("sets") or 1)),
                 price_override=float(raw_override) if raw_override not in (None, "") else None,
+                lazy_pending=bool(entry.get("lazy_pending", False)),
+                lazy_key=str(entry.get("lazy_key") or ""),
+                qty_as_sets=bool(entry.get("qty_as_sets", False)),
             )
         except (TypeError, ValueError) as exc:
             # One bad field must not keep the whole builder from opening; the

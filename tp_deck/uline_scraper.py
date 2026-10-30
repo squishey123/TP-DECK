@@ -536,6 +536,132 @@ async def _reassert_minimized(window_id: Any, state: str, session: Any) -> None:
         logger.debug("Uline window could not be re-minimized: %s", exc)
 
 
+async def _lookup_url(key: str, page: Any, timeout_ms: int, window: tuple) -> str:
+    """Open the right Uline page for one key on one tab, and return its url."""
+    window_id, state, session = window
+    typed = normalize_item(key)
+    if looks_like_item(typed):
+        return f"{ULINE_BASE}/Product/Detail/{typed}"
+    await page.goto(
+        f"{ULINE_BASE}/Product/AdvSearchResult?keywords={quote_plus(key)}",
+        timeout=timeout_ms,
+        wait_until="domcontentloaded",
+    )
+    await _reassert_minimized(window_id, state, session)
+    search_html = await page.content()
+    url = _first_detail_link(search_html)
+    if not url:
+        raise RuntimeError(
+            f"Uline search for {key!r} did not list an item link. "
+            "Open the page, pick the item, and type its Item #."
+        )
+    return url
+
+
+async def _read_product(key: str, page: Any, url: str, timeout_ms: int, window: tuple) -> UlineItem:
+    """Navigate one tab to the product page and read the cached data."""
+    window_id, state, session = window
+    await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+    html = await page.content()
+    await _reassert_minimized(window_id, state, session)
+    blocked = _blocked_message(html)
+    if blocked:
+        raise RuntimeError(blocked)
+    if _NOT_FOUND.search(html) and "/Product/Detail/" not in (page.url or ""):
+        raise RuntimeError(f"Uline has no item {key!r}")
+    item = parse_product(html, page.url)
+    if item is None:
+        raise RuntimeError(
+            f"Uline page for {key!r} is not a single product page "
+            f"(address {page.url}). Open the product page, and type its "
+            "Item #."
+        )
+    if looks_like_item(normalize_item(key)) and item.item != normalize_item(key):
+        raise RuntimeError(
+            f"Uline returned {item.item} ({item.name}) for {normalize_item(key)!r}, "
+            f"not {normalize_item(key)}. The page Uline served is a different item. "
+            f"Type {item.item} to add that one, or fix the Item # so it "
+            f"opens {item.item}."
+        )
+    return item
+
+
+async def lookup_items_parallel(keys: list[str], settings: dict[str, Any]) -> list[tuple[str, Optional[UlineItem], str]]:
+    """Read several items at once, one tab per key, with a 5x timeout.
+
+    The lazy batch opens a tab per key, so every Uline page loads at the same
+    time. Each result is (key, item, note); note is "" on success, and the
+    failure text when that key never read. Returns one entry per key, in the
+    order the keys were given.
+    """
+    import asyncio
+
+    timeout_ms = int(settings.get("uline_lookup_timeout_ms", 20000)) * 5
+    port = int(settings.get("uline_port", settings.get("ebay_port", 9222)))
+    from playwright.async_api import async_playwright
+
+    playwright = await async_playwright().start()
+    browser = None
+    pages: list[Any] = []
+    windows: list[tuple] = []
+    try:
+        browser = await connect_over_cdp(playwright, port)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        for key in keys:
+            page = await context.new_page()
+            pages.append(page)
+            windows.append(await _window_state(page))
+
+        async def fetch(index: int) -> tuple[str, Optional[UlineItem], str]:
+            key = keys[index]
+            page = pages[index]
+            window_id, state, session = windows[index]
+            try:
+                url = await _lookup_url(key, page, timeout_ms, (window_id, state, session))
+                item = await _read_product(key, page, url, timeout_ms, (window_id, state, session))
+                logger.info(
+                    "Uline lazy lookup %s → %s (%s per %s, min %s, $%s)",
+                    key,
+                    item.item,
+                    item.units_per_set,
+                    item.unit,
+                    item.min_sets,
+                    item.price,
+                )
+                return key, item, ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Uline lazy lookup %s failed: %s", key, exc)
+                return key, None, str(exc)
+
+        tasks = [fetch(index) for index in range(len(keys))]
+        results = list(await asyncio.gather(*tasks))
+        return results
+    finally:
+        for window in windows:
+            session = window[2]
+            if session is not None:
+                try:
+                    await session.detach()
+                except Exception as exc:
+                    logger.debug("Uline lazy CDP session detach failed: %s", exc)
+        for page in pages:
+            try:
+                await page.close()
+            except Exception as exc:
+                logger.debug("Uline lazy tab close failed: %s", exc)
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception as exc:
+                logger.debug("Uline lazy browser disconnect failed: %s", exc)
+        try:
+            await playwright.stop()
+        except Exception as exc:
+            logger.debug("Uline lazy playwright stop failed: %s", exc)
+
+
 async def lookup_item(key: str, settings: dict[str, Any]) -> UlineItem:
     """Resolve an Item #, or a keyword search, into cache-ready data.
 
@@ -548,13 +674,11 @@ async def lookup_item(key: str, settings: dict[str, Any]) -> UlineItem:
     timeout_ms = int(settings.get("uline_lookup_timeout_ms", 20000))
     port = int(settings.get("uline_port", settings.get("ebay_port", 9222)))
     pattern = str(settings.get("uline_url_pattern", "uline.com"))
-    typed = normalize_item(key)
-    searched_item = looks_like_item(typed)
 
     playwright = await async_playwright().start()
     page: Optional[Any] = None
     created = False
-    session: Optional[Any] = None
+    window: tuple = (None, "", None)
     try:
         browser = await connect_over_cdp(playwright, port)
         page = await find_page_by_url(browser, pattern, label="Uline tab")
@@ -562,49 +686,10 @@ async def lookup_item(key: str, settings: dict[str, Any]) -> UlineItem:
         if page is None:
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = await context.new_page()
-        window_id, state, session = await _window_state(page)
+        window = await _window_state(page)
 
-        if searched_item:
-            url = f"{ULINE_BASE}/Product/Detail/{typed}"
-        else:
-            await page.goto(
-                f"{ULINE_BASE}/Product/AdvSearchResult?keywords={quote_plus(key)}",
-                timeout=timeout_ms,
-                wait_until="domcontentloaded",
-            )
-            await _reassert_minimized(window_id, state, session)
-            search_html = await page.content()
-            url = _first_detail_link(search_html)
-            if not url:
-                raise RuntimeError(
-                    f"Uline search for {key!r} did not list an item link. "
-                    "Open the page, pick the item, and type its Item #."
-                )
-
-        await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-        html = await page.content()
-        await _reassert_minimized(window_id, state, session)
-
-        blocked = _blocked_message(html)
-        if blocked:
-            raise RuntimeError(blocked)
-        if _NOT_FOUND.search(html) and "/Product/Detail/" not in (page.url or ""):
-            raise RuntimeError(f"Uline has no item {key!r}")
-
-        item = parse_product(html, page.url)
-        if item is None:
-            raise RuntimeError(
-                f"Uline page for {key!r} is not a single product page "
-                f"(address {page.url}). Open the product page, and type its "
-                "Item #."
-            )
-        if searched_item and item.item != typed:
-            raise RuntimeError(
-                f"Uline returned {item.item} ({item.name}) for {typed!r}, "
-                f"not {typed}. The page Uline served is a different item. "
-                f"Type {item.item} to add that one, or fix the Item # so it "
-                f"opens {item.item}."
-            )
+        url = await _lookup_url(key, page, timeout_ms, window)
+        item = await _read_product(key, page, url, timeout_ms, window)
 
         logger.info(
             "Uline lookup %s → %s (%s per %s, min %s, $%s)",
@@ -620,6 +705,7 @@ async def lookup_item(key: str, settings: dict[str, Any]) -> UlineItem:
         # The tab opened for this lookup is closed, and the CDP session
         # detached, on success, failure, and cancel alike, so a failed lookup
         # does not leave a tab open in the operator's browser.
+        session = window[2]
         if session is not None:
             try:
                 await session.detach()

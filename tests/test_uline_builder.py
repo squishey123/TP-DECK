@@ -267,6 +267,8 @@ class CacheLogic(unittest.TestCase):
         self.assertEqual(updated.aliases, ("labels",))
         self.assertEqual(updated.item, "S-11633")
         self.assertEqual(resolve_key(cache, "labels")[0], "S-11633")
+        self.assertEqual(resolve_key(cache, "LABELS")[0], "S-11633")
+        self.assertEqual(resolve_key(cache, "Labels")[0], "S-11633")
 
     def test_cache_round_trip(self):
         cache = self.cache(self.base())
@@ -970,6 +972,266 @@ class DraftLoading(unittest.TestCase):
     def test_unreadable_file_is_an_empty_order(self):
         uline_order.DRAFT_PATH.write_text("not json", encoding="utf-8")
         self.assertEqual(uline_order.load_draft(), [])
+
+
+class LazyMode(unittest.TestCase):
+    """Lazy mode stores the entry typed, and the parallel batch fills it in."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        workdir = pathlib.Path(tempfile.mkdtemp())
+        uline_cache.CACHE_PATH = workdir / "uline_cache.json"
+        uline_order.DRAFT_PATH = workdir / "uline_draft.json"
+        self.calls: list = []
+
+    def dialog(self, settings=None):
+        from tp_deck import uline_dialog as dmod
+
+        def stub_runner(coro, on_done):
+            coro.close()
+            self.calls.append(on_done)
+
+        return dmod.UlineDialog(parent=None, runner=stub_runner,
+                                settings=settings or {"uline_export_dir": "Original"})
+
+    def test_lazy_add_stores_the_entry_without_a_lookup(self):
+        dialog = self.dialog()
+        dialog._lazy_btn.setChecked(True)
+        dialog._key_edit.setText("S-4307")
+        dialog._alias_edit.setText("foam")
+        dialog._qty_spin.setValue(4)
+        dialog._add()
+        self.assertEqual(len(self.calls), 0)  # no Uline tab opened
+        line = dialog._lines[0]
+        self.assertTrue(line.lazy_pending)
+        self.assertEqual(line.item, "S-4307")
+        self.assertEqual(line.alias, "foam")
+        self.assertEqual(line.needed_units, 4)
+        self.assertIn("lazy", dialog._status.text())
+        self.assertEqual(uline_order.load_draft()[0].lazy_pending, True)
+
+    def test_lazy_off_opens_every_lazy_entry_in_parallel(self):
+        dialog = self.dialog()
+        dialog._lazy_btn.setChecked(True)
+        dialog._key_edit.setText("S-4307")
+        dialog._alias_edit.setText("foam")
+        dialog._add()
+        dialog._key_edit.setText("H-7945")
+        dialog._add()
+        self.assertEqual(len(self.calls), 0)
+        dialog._lazy_btn.setChecked(False)
+        self.assertEqual(len(self.calls), 1)
+        fetched = UlineItem(item="S-4307", name="Foam", price=12.0, units_per_set=10,
+                            unit="Pack", min_sets=2, base_unit="Pack", tiers=((1, 12.0),),
+                            aliases=(), url="", in_stock=True, note="", added="", checked="")
+        second = UlineItem(item="H-7945", name="Tape", price=5.0, units_per_set=1,
+                           unit="Each", min_sets=1, base_unit="Each", tiers=((1, 5.0),),
+                           aliases=(), url="", in_stock=True, note="", added="", checked="")
+        results = [("S-4307", fetched, ""), ("H-7945", second, "")]
+        self.calls[0](True, results, "")
+        for line in dialog._lines:
+            self.assertFalse(line.lazy_pending)
+        self.assertEqual(dialog._lines[0].unit, "Pack")
+        self.assertEqual(dialog._lines[1].unit, "Each")
+        # The lazy alias is added to the cache when the fetch lands
+        self.assertIn("foam", dialog._cache["S-4307"].aliases)
+        self.assertIn("S-4307", uline_cache.load_cache())
+
+    def test_lazy_keyword_is_kept_and_then_filled_from_the_fetch(self):
+        dialog = self.dialog()
+        dialog._lazy_btn.setChecked(True)
+        dialog._key_edit.setText("foam pads")
+        dialog._alias_edit.setText("Foam")
+        dialog._add()
+        self.assertEqual(len(self.calls), 0)
+        line = dialog._lines[0]
+        self.assertEqual(line.item, "foam pads")
+        self.assertEqual(line.lazy_key, "foam pads")
+        self.assertEqual(line.alias, "Foam")
+        dialog._lazy_btn.setChecked(False)
+        self.assertEqual(dialog._lazy_keys, ["foam pads"])
+        fetched = UlineItem(item="S-4307", name="Conductive Foam", price=12.0,
+                            units_per_set=10, unit="Pack", min_sets=2,
+                            base_unit="Pack", tiers=((1, 12.0),), aliases=(),
+                            url="", in_stock=True, note="", added="", checked="")
+        self.calls[0](True, [("foam pads", fetched, "")], "")
+        line = dialog._lines[0]
+        self.assertEqual(line.item, "S-4307")
+        self.assertEqual(line.name, "Conductive Foam")
+        self.assertEqual(line.unit, "Pack")
+        self.assertFalse(line.lazy_pending)
+        self.assertEqual(line.alias, "Foam")
+        self.assertIn("foam", dialog._cache["S-4307"].aliases)
+
+    def test_lazy_sets_mode_uses_the_typed_pack_count(self):
+        dialog = self.dialog()
+        dialog._lazy_btn.setChecked(True)
+        dialog._mode_combo.setCurrentText("Sets (packs)")
+        dialog._qty_spin.setValue(4)
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        self.assertTrue(dialog._lines[0].qty_as_sets)
+        self.assertEqual(dialog._lines[0].sets, 4)
+        dialog._lazy_btn.setChecked(False)
+        fetched = UlineItem(item="S-4307", name="Foam", price=12.0, units_per_set=10,
+                            unit="Pack", min_sets=2, base_unit="Pack",
+                            tiers=((1, 12.0),), aliases=(), url="",
+                            in_stock=True, note="", added="", checked="")
+        self.calls[0](True, [("S-4307", fetched, "")], "")
+        line = dialog._lines[0]
+        self.assertEqual(line.sets, 4)
+        self.assertEqual(line.needed_units, 40)
+        self.assertFalse(line.qty_as_sets)
+
+    def test_lazy_fetch_failure_keeps_the_line_pending(self):
+        dialog = self.dialog()
+        dialog._lazy_btn.setChecked(True)
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        dialog._lazy_btn.setChecked(False)
+        results = [("S-4307", None, "Uline has no item 'S-4307'")]
+        self.calls[0](True, results, "")
+        self.assertTrue(dialog._lines[0].lazy_pending)
+        self.assertIn("Uline has no item", dialog._error.text())
+
+    def test_lazy_off_while_busy_flips_the_button_back_on(self):
+        dialog = self.dialog()
+        dialog._lazy_btn.setChecked(True)
+        dialog._key_edit.setText("S-4307")
+        dialog._add()
+        dialog._busy = True
+        dialog._lazy_btn.setChecked(False)
+        self.assertTrue(dialog._lazy_btn.isChecked())  # the toggle flipped back
+        self.assertIn("already running", dialog._error.text())
+        self.assertTrue(dialog._lines[0].lazy_pending)
+        dialog._busy = False
+        dialog._lazy_btn.setChecked(False)
+        self.assertEqual(len(self.calls), 1)  # the fetch runs now
+
+
+class SerialOrders(unittest.TestCase):
+    """The Current Orders button picks orders: a single pick prefills, a
+    multi pick queues a run per order with the same serials."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self._original = None
+
+    def _window(self, picked):
+        from tp_deck import serial_dialog as dmod
+
+        original = dmod.CurrentOrdersWindow
+        dmod.CurrentOrdersWindow = lambda *_a, **_kw: _PickedOrdersWindow(picked)
+        return original
+
+    def test_single_pick_prefills_the_order_box(self):
+        from tp_deck import serial_dialog as dmod
+
+        orders = [("12-34567-89012", "Ann", 2, 3), ("SO-12345", "Bo", 1, 3)]
+        dialog = dmod.SerialDialog(orders=orders)
+        original = self._window(["SO-12345"])
+        try:
+            dialog._open_current_orders()
+        finally:
+            dmod.CurrentOrdersWindow = original
+        self.assertEqual(dialog.order_number(), "SO-12345")
+        self.assertEqual(dialog.multi_orders(), [])
+        self.assertEqual(
+            dmod.order_summaries([
+            ("12-34567-89012", "Ann", "S-4307", 2),
+            ("12-34567-89012", "Ann", "S-11369", 1),
+            ("SO-12345", "Bo", "S-4307", 3),
+        ]),
+            [("12-34567-89012", "Ann", 2, 3), ("SO-12345", "Bo", 1, 3)],
+        )
+
+    def test_multi_pick_queues_a_run_per_order(self):
+        from tp_deck import serial_dialog as dmod
+        from tp_deck.main import AutomationController
+
+        orders = [("SO-1", "A", 1, 1), ("SO-2", "B", 1, 1), ("SO-3", "C", 1, 1)]
+        controller = AutomationController(_StubDashboard())
+        dialog = dmod.SerialDialog(orders=orders)
+        dialog.accepted.connect(lambda: controller._accept_serial_dialog(dialog))
+        original = self._window(["SO-1", "SO-3"])
+        try:
+            dialog._open_current_orders()
+        finally:
+            dmod.CurrentOrdersWindow = original
+        self.assertEqual(dialog.multi_orders(), ["SO-1", "SO-3"])
+        dialog._editor.setPlainText("111\n222")
+        dialog._submit()
+        self.assertEqual(
+            controller._serial_queue,
+            [(["111", "222"], "SO-1"), (["111", "222"], "SO-3")],
+        )
+        self.assertTrue(controller._dashboard.queued)
+
+    def test_no_orders_says_scrape_first(self):
+        from tp_deck import serial_dialog as dmod
+
+        dialog = dmod.SerialDialog(orders=[])
+        dialog._open_current_orders()
+        self.assertIn("scrape", dialog._error.text())
+
+
+class _PickedOrdersWindow:
+    """The Current Orders window, picked without a table."""
+
+    def __init__(self, picked):
+        self._picked = picked
+
+    def exec(self):
+        return 1  # QDialog.DialogCode.Accepted
+
+    def selected_orders(self) -> list[str]:
+        return list(self._picked)
+
+
+class _StubDashboard:
+    """The controller calls a few dashboard methods in these tests."""
+
+    def __init__(self):
+        self.queued = None
+
+    def input_blocked(self) -> bool:
+        return False
+
+    def set_serial_queued(self, value) -> None:
+        self.queued = value
+
+
+class ColumnWidths(unittest.TestCase):
+    """Columns are sized for one screen: Item ~7 chars, Unit ~6, the rest by header."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_item_and_unit_are_narrow_char_caps(self):
+        from PySide6.QtGui import QFont, QFontMetrics
+
+        from tp_deck.uline_dialog import ORDER_COLUMNS, _header_widths
+
+        widths = _header_widths(ORDER_COLUMNS, {0: 7, 3: 6})
+        metrics = QFontMetrics(QFont("Consolas", 12))
+        char = metrics.horizontalAdvance("W")
+        self.assertEqual(widths[0], char * 7 + 12)  # Item
+        self.assertEqual(widths[3], char * 6 + 12)  # Unit
+        # a later column follows its header text, not a char cap
+        self.assertGreater(widths[8], metrics.horizontalAdvance("Line Total"))
 
 
 if __name__ == "__main__":

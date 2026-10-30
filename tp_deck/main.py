@@ -28,7 +28,7 @@ from tp_deck.dashboard import Dashboard
 from tp_deck.job_results import AutomationResult, render_job
 from tp_deck.release_notes import present_release_notes_after_update
 from tp_deck.sales_order import close_detail_tab, shutdown_workday
-from tp_deck.serial_dialog import SerialDialog
+from tp_deck.serial_dialog import SerialDialog, order_summaries
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
 from tp_deck.tools_menu import popup_tools_menu
@@ -131,6 +131,7 @@ class AutomationController:
         self._cycle_passes = 0
         self._serial_queue: list[tuple[list[str], str]] = []
         self._serial_dialog: Optional[SerialDialog] = None
+        self._last_orders: list[tuple[str, str, int, int]] = []
         self._drain_task: Optional[asyncio.Task] = None
         self._draining = False
         self._shutdown_task: Optional[asyncio.Task] = None
@@ -324,7 +325,7 @@ class AutomationController:
             self._serial_dialog.raise_()
             self._serial_dialog.activateWindow()
             return
-        dialog = SerialDialog(self._dashboard)
+        dialog = SerialDialog(self._dashboard, orders=list(self._last_orders))
         dialog.setModal(False)
         dialog.accepted.connect(lambda: self._accept_serial_dialog(dialog))
         dialog.finished.connect(self._finish_serial_dialog)
@@ -338,7 +339,25 @@ class AutomationController:
         serials = dialog.serials()
         if not serials:
             return
-        self._serial_queue.append((serials, dialog.order_number()))
+        orders = dialog.multi_orders()
+        if len(orders) > 1:
+            # Each order gets its own queued batch, so an order that errors on
+            # a serial runs on, and the user is notified per batch as usual.
+            # The same pasted serials apply to each order.
+            for order in orders:
+                self._serial_queue.append((list(serials), order))
+            logging.getLogger("tpdeck").info(
+                "Batch serial queued for %s orders (%s serials each)",
+                len(orders),
+                len(serials),
+            )
+            self._dashboard.set_serial_queued(True)
+            return
+        if len(orders) == 1:
+            order = orders[0]
+        else:
+            order = dialog.order_number()
+        self._serial_queue.append((serials, order))
         self._dashboard.set_serial_queued(True)
         logging.getLogger("tpdeck").info("Batch serial queued (%s)", len(serials))
 
@@ -552,7 +571,11 @@ class AutomationController:
         self._dashboard.set_processing(False)
         self._publish(result)
 
-    def _publish(self, result: Optional[AutomationResult]) -> None:
+    def _publish(
+        self,
+        result: Optional[AutomationResult],
+        order_number: str = "",
+    ) -> None:
         logger = logging.getLogger("tpdeck")
         status = result.status if result else "Success"
         self._dashboard.set_status(status)
@@ -570,12 +593,32 @@ class AutomationController:
             )
         failures = result.failed_serials if result else ()
         if failures:
-            self._dashboard.show_serial_failures(list(failures))
+            self._dashboard.show_serial_failures(
+                list(failures),
+                order=order_number,
+            )
+        # The orders from this scrape are kept so Batch Serial's Current Orders
+        # can list them, and a multi-order queue can be started from them.
+        self._remember_orders(result)
         if result is not None and result.close_detail_url:
             self._close_task = asyncio.create_task(
                 self._close_detail_later(result.close_detail_url),
                 name="tpdeck-close-order",
             )
+
+    def _remember_orders(self, result: Optional[AutomationResult]) -> None:
+        """Keep the orders seen in this scrape for Batch Serial's Current Orders.
+
+        Every scrape that produced lines updates the list, including the
+        auto-cycle cache pass, which never shows a results popup.
+        """
+        if result is None or not result.lines:
+            return
+        self._last_orders = order_summaries(result.lines)
+        logging.getLogger("tpdeck").info(
+            "Orders seen in the last scrape: %s",
+            ", ".join(order for order, _, _items, _qty in self._last_orders),
+        )
 
     async def _close_detail_later(self, url: str) -> None:
         """Wait, then reconnect only long enough to close that detail tab."""
@@ -615,11 +658,16 @@ class AutomationController:
             message = str(exc).strip() or exc.__class__.__name__
             logger.exception("Batch serial failed: %s", exc)
             self._dashboard.set_processing(False)
-            self._dashboard.set_status(f"Error — {message}")
+            label = f"{order_number}: {message}" if order_number else message
+            self._dashboard.set_status(f"Error — {label}")
+            # The status line is replaced when the next order starts, so the
+            # failure window keeps the notice. Index 0 is a batch error, not a
+            # scanned serial, and the dashboard prints it as a plain line.
+            self._dashboard.show_serial_failures([(0, message)], order=order_number)
         else:
             self._dashboard.set_serial_queued(bool(self._serial_queue))
             self._dashboard.set_processing(False)
-            self._publish(result)
+            self._publish(result, order_number=order_number)
         finally:
             self._manual_pending = False
 
@@ -783,6 +831,7 @@ class AutomationController:
                             on_progress=self._on_run_progress,
                         )
                         status_text = result.status
+                        self._remember_orders(result)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:

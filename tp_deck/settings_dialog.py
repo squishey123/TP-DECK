@@ -1,4 +1,4 @@
-"""Settings dialog — mode, ports, URL patterns, and timeouts."""
+"""Settings dialog — mode, ports, URL patterns, timeouts, and scrape behavior."""
 
 from __future__ import annotations
 
@@ -198,7 +198,7 @@ def _with_info(widget: QWidget, text: str) -> QWidget:
 
 
 class SettingsDialog(QDialog):
-    """Toggle Single/Dual mode and edit ports, URL patterns, and timeouts."""
+    """Toggle Single/Dual mode and edit ports, URL patterns, and scrape settings."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -240,7 +240,7 @@ class SettingsDialog(QDialog):
         self.single_radio.toggled.connect(self._on_mode_toggled)
         layout.addWidget(mode_box)
 
-        ports_box = QGroupBox("CDP Ports & Patterns")
+        ports_box = QGroupBox("Scrape & Automation")
         ports_form = QFormLayout(ports_box)
         self.ebay_port_spin = QSpinBox()
         self.ebay_port_spin.setRange(1024, 65535)

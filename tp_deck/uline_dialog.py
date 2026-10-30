@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -33,6 +34,7 @@ from tp_deck.uline_cache import (
     UlineItem,
     add_alias,
     edit_item,
+    is_item_shape,
     load_cache,
     normalize_item,
     put_item,
@@ -58,7 +60,7 @@ from tp_deck.uline_order import (
     write_csv,
     write_pdf,
 )
-from tp_deck.uline_scraper import lookup_item
+from tp_deck.uline_scraper import lookup_item, lookup_items_parallel
 
 logger = logging.getLogger("tpdeck")
 
@@ -68,7 +70,6 @@ ORDER_COLUMNS = (
     "Name",
     "Unit",
     "Units / Set",
-    "Min Packs",
     "Needed Units",
     "Sets To Buy",
     "Price / Unit",
@@ -96,6 +97,31 @@ COLUMN_TIPS = {
 }
 MODE_UNITS = "Units needed"
 MODE_SETS = "Sets (packs)"
+
+
+def _header_widths(headers: tuple[str, ...], char_caps: dict[int, int]) -> list[int]:
+    """Column widths that let more columns show: fixed chars, header + buffer.
+
+    Item and Unit are measured in monospace characters (~7 and ~6 plus a
+    buffer), so their narrow width fits the data. The later columns get the
+    header text plus a buffer, so every header word is readable at a glance
+    without the table getting too wide for one screen.
+    """
+    metrics = QFontMetrics(QFont("Consolas", 12))
+    char_width = metrics.horizontalAdvance("W")
+    widths: list[int] = []
+    for index, header in enumerate(headers):
+        cap = char_caps.get(index)
+        if cap is None:
+            width = metrics.horizontalAdvance(header)
+        else:
+            width = char_width * cap
+        widths.append(width + 12)
+    return widths
+
+
+_CHEVRON_UP = (Path(__file__).resolve().parent / "assets" / "chevron-up.png").as_posix()
+_CHEVRON_DOWN = (Path(__file__).resolve().parent / "assets" / "chevron-down.png").as_posix()
 
 DIALOG_QSS = """
 QDialog, QGroupBox { background-color: #0F172A; color: #F8FAFC; }
@@ -134,7 +160,74 @@ QPushButton:hover { background-color: #0EA5E9; color: #0F172A; }
 QPushButton#addBtn { background-color: #0EA5E9; color: #0F172A; font-weight: bold; }
 QPushButton#addBtn:hover { background-color: #38BDF8; }
 QPushButton:disabled { background-color: #334155; color: #94A3B8; border-color: #475569; }
+QPushButton#lazyBtn {
+    background-color: #B45309; color: #F8FAFC;
+    border: 1px solid #F59E0B; font-weight: bold;
+}
+QPushButton#lazyBtn:hover { background-color: #D97706; }
+QPushButton#lazyBtn:checked { background-color: #15803D; border-color: #4ADE80; }
+QPushButton#lazyBtn:checked:hover { background-color: #16A34A; }
+QComboBox { padding-right: 18px; }
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox::down-arrow {
+    image: url("__CHEVRON_DOWN__");
+    width: 9px; height: 6px;
+    border: none; background: transparent;
+}
+QComboBox QAbstractItemView {
+    background-color: #1E293B; color: #F8FAFC;
+    border: 1px solid #334155;
+    selection-background-color: #0EA5E9; selection-color: #0F172A;
+    outline: none;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    background-color: #334155; border: 1px solid #475569; width: 16px;
+}
+QSpinBox::up-arrow {
+    image: url("__CHEVRON_UP__");
+    width: 9px; height: 6px;
+    border: none; background: transparent;
+}
+QSpinBox::down-arrow {
+    image: url("__CHEVRON_DOWN__");
+    width: 9px; height: 6px;
+    border: none; background: transparent;
+}
+QMenu { background-color: #1E293B; color: #F8FAFC; border: 1px solid #334155; }
+QMenu::item { background: transparent; padding: 4px 22px; }
+QMenu::item:selected { background-color: #0EA5E9; color: #0F172A; }
+QMenu::separator { height: 1px; background: #334155; margin: 4px 8px; }
+QToolTip { background-color: #1E293B; color: #F8FAFC; border: 1px solid #334155; padding: 4px; }
+QMessageBox { background-color: #0F172A; }
+QAbstractItemView {
+    background-color: #0F172A; color: #F8FAFC;
+    selection-background-color: #0EA5E9; selection-color: #0F172A;
+}
+QAbstractItemView::item { background-color: #1E293B; color: #F8FAFC; }
+QTableWidget { selection-background-color: #0EA5E9; selection-color: #0F172A; }
+QTableWidget::item { background-color: #1E293B; color: #F8FAFC; }
+QTableWidget::item:selected { background-color: #0EA5E9; color: #0F172A; }
+QAbstractButton { background-color: #1E293B; }
+QHeaderView { background-color: #1E293B; }
+QScrollBar:vertical, QScrollBar:horizontal {
+    background-color: #1E293B; border: 1px solid #334155;
+    margin: 0;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background-color: #475569; border-radius: 3px;
+    min-width: 12px; min-height: 12px;
+}
+QScrollBar::add-line:vertical, QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:vertical, QScrollBar::sub-line:horizontal {
+    width: 0; height: 0; background: transparent;
+}
+QScrollBar::add-page, QScrollBar::sub-page { background: #0F172A; }
 """
+DIALOG_QSS = (
+    DIALOG_QSS
+    .replace("__CHEVRON_UP__", _CHEVRON_UP)
+    .replace("__CHEVRON_DOWN__", _CHEVRON_DOWN)
+)
 
 
 def _int_text(value: str) -> Optional[int]:
@@ -234,6 +327,7 @@ class UlineDialog(QDialog):
         self._busy = False
         self._pending_key = ""
         self._pending_alias = ""
+        self._lazy_keys: list[str] = []
         self._updating = False
         # The task the runner started (a lookup, a PDF print), kept so closeEvent
         # can cancel it, and _closing so a late result is dropped on the floor.
@@ -274,6 +368,17 @@ class UlineDialog(QDialog):
         self._add_btn.setObjectName("addBtn")
         self._add_btn.clicked.connect(self._add)
         bar.addWidget(self._add_btn)
+
+        self._lazy_btn = QPushButton("Lazy")
+        self._lazy_btn.setObjectName("lazyBtn")
+        self._lazy_btn.setCheckable(True)
+        self._lazy_btn.setToolTip(
+            "Lazy mode: Add records what you typed, with no Uline page. "
+            "Toggle Lazy off to open a tab for every lazy entry at once, and "
+            "read the missing info in parallel."
+        )
+        self._lazy_btn.toggled.connect(self._on_lazy_toggled)
+        bar.addWidget(self._lazy_btn)
         root.addLayout(bar)
 
         self._tabs = QTabWidget()
@@ -307,6 +412,9 @@ class UlineDialog(QDialog):
         header = self._order_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for column, width in enumerate(_header_widths(ORDER_COLUMNS, {0: 7, 3: 6})):
+            if column != 2:
+                header.resizeSection(column, width)
         self._order_table.itemChanged.connect(self._on_order_changed)
         for column, tip in COLUMN_TIPS.items():
             header_item = self._order_table.horizontalHeaderItem(column)
@@ -342,7 +450,6 @@ class UlineDialog(QDialog):
                 line.name,
                 line.unit,
                 str(line.units_per_set),
-                str(max(1, line.min_sets)),
                 str(line.needed_units),
                 str(max(1, line.sets)),
                 f"{line.price_at(max(1, line.sets)):.2f}",
@@ -520,8 +627,14 @@ class UlineDialog(QDialog):
             self._set_error("A Uline lookup is already running")
             return
         canonical, cached = resolve_key(self._cache, key)
+        if self._lazy_btn.isChecked():
+            if cached is not None:
+                self._commit(canonical, cached, self._alias_edit.text().strip(), key)
+            else:
+                self._add_lazy(key)
+            return
         if cached is not None:
-            self._commit(canonical, cached, self._alias_edit.text().strip())
+            self._commit(canonical, cached, self._alias_edit.text().strip(), key)
             return
         if self._runner is None:
             self._set_error(f"{key} is not cached and lookup is not available")
@@ -535,6 +648,141 @@ class UlineDialog(QDialog):
         # The task is kept so closing the dialog can cancel a lookup that is
         # still navigating.
         self._task = self._runner(lookup_item(key, settings), self._on_lookup)
+
+    def _add_lazy(self, typed: str) -> None:
+        """Add one line with exactly what the user typed, no Uline page opened."""
+        raw = typed.strip()
+        canonical = normalize_item(raw)
+        # An Item # is stored in canonical form so the later fetch opens that
+        # product page. A keyword or alias keeps its spaces and casing; stripping
+        # them would search Uline for a different string than the user typed.
+        if is_item_shape(canonical):
+            item_text = canonical
+            lookup = canonical
+        else:
+            item_text = raw
+            lookup = raw
+        alias = self._alias_edit.text().strip()
+        qty = max(1, self._qty_spin.value())
+        as_sets = self._mode_combo.currentText() == MODE_SETS
+        line = OrderLine(
+            item=item_text,
+            name="",
+            alias=alias,
+            unit="",
+            units_per_set=1,
+            min_sets=1,
+            base_unit="",
+            price=0.0,
+            tiers=(),
+            needed_units=qty,
+            sets=max(1, qty),
+            lazy_pending=True,
+            lazy_key=lookup,
+            qty_as_sets=as_sets,
+        )
+        add_line(self._lines, line)
+        saved = self._save_draft()
+        self._refresh_order_table()
+        self._key_edit.clear()
+        self._alias_edit.clear()
+        pending = sum(1 for line in self._lines if line.lazy_pending)
+        self._set_status(
+            f"{item_text} added as a lazy entry · "
+            f"{pending} lazy item(s) on the order · "
+            "toggle Lazy off to fetch the missing info from Uline"
+        )
+        if not saved:
+            self._show_disk_failure()
+
+    def _on_lazy_toggled(self, checked: bool) -> None:
+        if checked:
+            self._set_status(
+                "Lazy mode: Add records what you typed, with no Uline page. "
+                "Toggle Lazy off to fetch all lazy entries at once."
+            )
+            return
+        keys: list[str] = []
+        for line in self._lines:
+            if line.lazy_pending:
+                key = (line.lazy_key or line.item).strip()
+                if key and key not in keys:
+                    keys.append(key)
+        if not keys:
+            self._set_status("Lazy mode off · no lazy entries to fetch")
+            return
+        if self._busy:
+            # The batch cannot start while a lookup, PDF, or lazy fetch is
+            # running, so the toggle flips back and lazy entries stay pending.
+            self._lazy_btn.blockSignals(True)
+            self._lazy_btn.setChecked(True)
+            self._lazy_btn.blockSignals(False)
+            self._set_error(
+                "A Uline action is already running. Toggle Lazy off when it finishes."
+            )
+            return
+        if self._runner is None:
+            self._lazy_btn.blockSignals(True)
+            self._lazy_btn.setChecked(True)
+            self._lazy_btn.blockSignals(False)
+            self._set_error(
+                "Lookup is not available, so lazy entries stay on the order."
+            )
+            return
+        self._lazy_keys = keys
+        self._busy = True
+        self._add_btn.setEnabled(False)
+        settings = self._refresh_settings()
+        timeout_ms = int(settings.get("uline_lookup_timeout_ms", 20000)) * 5
+        self._set_status(
+            f"Lazy fetch: {len(keys)} tab(s) at once, "
+            f"{timeout_ms // 1000} second timeout each…"
+        )
+        self._task = self._runner(lookup_items_parallel(keys, settings), self._on_lazy_results)
+
+    def _on_lazy_results(self, ok: bool, results, err: str) -> None:
+        if self._closing:
+            return
+        self._busy = False
+        self._add_btn.setEnabled(True)
+        if not ok:
+            # Stay in lazy mode so the entries can be fetched again. Signals
+            # are blocked so turning the button back on does not clear the error.
+            self._lazy_btn.blockSignals(True)
+            self._lazy_btn.setChecked(True)
+            self._lazy_btn.blockSignals(False)
+            self._set_error(f"Lazy fetch failed: {err}")
+            return
+        fetched = 0
+        failed: list[str] = []
+        for key, item, note in results:
+            if item is None:
+                failed.append(f"{key}: {note}")
+                continue
+            canonical = normalize_item(item.item)
+            put_item(self._cache, item)
+            fetched += 1
+            for line in self._lines:
+                if not self._lazy_line_matches(line, key):
+                    continue
+                line.item = canonical
+                line.lazy_pending = False
+                line.lazy_key = ""
+                if line.alias:
+                    add_alias(self._cache, canonical, line.alias)
+        self._collapse_same_items()
+        self._save_cache()
+        self._refresh_cache_table()
+        saved = self._sync_lines()
+        if failed:
+            self._set_error(
+                "Lazy fetch: " + "; ".join(failed)
+                + ". Toggle Lazy off again to retry the ones still waiting."
+            )
+        else:
+            self._set_status(f"Lazy fetch: {fetched} item(s) read from Uline")
+        if not saved:
+            self._show_disk_failure()
 
     def _on_lookup(self, ok: bool, item, err: str) -> None:
         if self._closing:
@@ -556,7 +804,7 @@ class UlineDialog(QDialog):
                 f"Uline gave {item.item} for {self._pending_key!r}: {item.name}. "
                 f"Added as {canonical}."
             )
-        self._commit(canonical, item, self._pending_alias)
+        self._commit(canonical, item, self._pending_alias, self._pending_key)
         # _commit shows the pack sentence first, then any alias-ownership text
         # and any disk failure, so the last thing on screen is what the user
         # needs to see. _show_disk_failure is a no-op when nothing failed.
@@ -578,8 +826,26 @@ class UlineDialog(QDialog):
         line.base_unit = cached.base_unit or cached.unit
         line.price = cached.price
         line.tiers = cached.tiers
+        if line.qty_as_sets:
+            # The typed number was packs, not units. The pack size is known now.
+            line.needed_units = max(1, line.sets) * line.units_per_set
+            line.qty_as_sets = False
         line.sets = sets_for(line.needed_units, line.units_per_set, line.min_sets)
         return True
+
+    def _lazy_line_matches(self, line: OrderLine, key: str) -> bool:
+        if not line.lazy_pending:
+            return False
+        if line.lazy_key and line.lazy_key == key:
+            return True
+        return normalize_item(line.item) == normalize_item(key)
+
+    def _collapse_same_items(self) -> None:
+        """One row per item after a lazy fetch resolves keywords to item numbers."""
+        merged: list[OrderLine] = []
+        for line in self._lines:
+            add_line(merged, line)
+        self._lines = merged
 
     def _sync_lines(self, note: str = "") -> bool:
         """Pull the order lines from the cache and redraw the totals.
@@ -596,7 +862,7 @@ class UlineDialog(QDialog):
             logger.info("Uline order lines synced from cache (%s line(s))", updated)
         return saved
 
-    def _commit(self, canonical: str, item: UlineItem, alias_text: str) -> None:
+    def _commit(self, canonical: str, item: UlineItem, alias_text: str, key: str = "") -> None:
         qty = max(1, self._qty_spin.value())
         units = max(1, item.units_per_set)
         min_sets = max(1, item.min_sets)
@@ -620,20 +886,40 @@ class UlineDialog(QDialog):
             sets=sets,
         )
         alias_note = ""
+        # The alias in the alias box is added to the cache, and it is kept for
+        # this line when it belongs to the added item. Adding by alias in the
+        # key box registers that alias too, and the line carries it when the
+        # alias box is empty.
+        typed_alias = ""
+        if key and normalize_item(key) != canonical:
+            typed_alias = key.strip()
+        changed = False
+        if typed_alias:
+            owner = add_alias(self._cache, canonical, typed_alias)
+            changed = True
+            if owner == canonical:
+                line.alias = typed_alias
+            else:
+                alias_note = (
+                    f"{typed_alias} already belongs to {owner}, so it was not "
+                    f"saved for {canonical}. The line was added."
+                )
         if alias_text:
             owner = add_alias(self._cache, canonical, alias_text)
-            self._save_cache()
-            self._refresh_cache_table()
+            changed = True
             if owner == canonical:
-                # The alias is this item's, so the line may carry it.
+                # The alias box is the name the user asked to store on the line.
                 line.alias = alias_text
             else:
-                # An alias owned by another item stays with that item, and the
-                # line is left without an alias.
+                # An alias owned by another item stays with that item. A key-box
+                # alias that does belong to this item stays on the line.
                 alias_note = (
                     f"{alias_text} already belongs to {owner}, so it was not "
                     f"saved for {canonical}. The line was added."
                 )
+        if changed:
+            self._save_cache()
+            self._refresh_cache_table()
         add_line(self._lines, line)
         self._sync_lines()
         self._key_edit.clear()
@@ -670,6 +956,9 @@ class UlineDialog(QDialog):
         header = self._cache_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column, width in enumerate(_header_widths(CACHE_COLUMNS, {0: 7, 2: 6})):
+            if column != 1:
+                header.resizeSection(column, width)
         layout.addWidget(self._cache_table)
 
         self._alias_input = QLineEdit()
