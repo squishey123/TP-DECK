@@ -27,76 +27,11 @@ from tp_deck.sku_overrides import (
     validate_override,
 )
 
-DIALOG_QSS = """
-QDialog {
-    background-color: #0F172A;
-    color: #F8FAFC;
-}
-QLabel {
-    color: #F8FAFC;
-    background: transparent;
-}
-QLabel#errorLabel {
-    color: #FCA5A5;
-}
-QLineEdit, QSpinBox {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #334155;
-    border-radius: 4px;
-    padding: 4px 6px;
-    min-height: 24px;
-}
-QTableWidget {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #334155;
-    gridline-color: #334155;
-    selection-background-color: #0EA5E9;
-    selection-color: #0F172A;
-}
-QHeaderView::section {
-    background-color: #0F172A;
-    color: #0EA5E9;
-    border: 1px solid #334155;
-    padding: 4px;
-    font-weight: bold;
-}
-QPushButton {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #0EA5E9;
-    border-radius: 4px;
-    padding: 6px 14px;
-}
-QPushButton:hover {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-QPushButton#submitBtn {
-    background-color: #0EA5E9;
-    color: #0F172A;
-    font-weight: bold;
-}
-QPushButton#submitBtn:hover {
-    background-color: #38BDF8;
-}
-QCheckBox {
-    color: #F8FAFC;
-    spacing: 6px;
-}
-QCheckBox::indicator {
-    width: 14px;
-    height: 14px;
-    border: 2px solid #64748B;
-    border-radius: 3px;
-    background-color: #0F172A;
-}
-QCheckBox::indicator:checked {
-    border: 2px solid #0EA5E9;
-    background-color: #0EA5E9;
-}
-"""
+from tp_deck.theme import current_palette, sku_qss
+
+
+def _dialog_qss() -> str:
+    return sku_qss(current_palette())
 
 
 class UnknownSkuDialog(QDialog):
@@ -111,7 +46,7 @@ class UnknownSkuDialog(QDialog):
         self.setWindowTitle("TP DECK — Unknown SKUs")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(640, 280)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(_dialog_qss())
         self._mappings: list[tuple[str, str, int]] = []
         self._no_sisters: list[str] = []
 
@@ -236,7 +171,7 @@ class SkuOverrideEditor(QDialog):
         self.setWindowTitle("TP DECK — Alternative SKUs")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(680, 360)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(_dialog_qss())
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)

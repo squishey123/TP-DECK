@@ -31,6 +31,12 @@ logger = logging.getLogger("tpdeck")
 ULINE_BASE = "https://www.uline.com"
 _NOT_FOUND = re.compile(r"not\s+found|no\s+(products|items)", re.IGNORECASE)
 _PRICE_LABEL = re.compile(r"PRICE\s*(?:PER)?\s+([A-Za-z]+)", re.IGNORECASE)
+_ORDER_MIN = re.compile(r"\(\s*MIN\.?\s*(\d+)\s*\)", re.IGNORECASE)
+_PRICE_LABEL_TEXT = re.compile(
+    r"PRICE\s*(?:PER)?\s+[A-Za-z]+"
+    r"(?:\s*\(\s*MIN\.?\s*\d+\s*\)|\s*\(\d+\s*/\s*[A-Za-z]+\))?",
+    re.IGNORECASE,
+)
 _STEPS = re.compile(
     r"(?is)<li[^>]*class=[\"'][^\"']*card[^\"']*[\"'][^>]*>(.*?)</li>"
 )
@@ -325,6 +331,19 @@ def _chart_tiers(
     return tiers
 
 
+def _packs_for_stated_minimum(stated: int, units_per_set: int) -> int:
+    """Turn a minimum stated in the sold unit into whole packs.
+
+    12 each with one each per set is 12 packs. 25 boxes in a bundle of 25
+    is 1 bundle. 18 rolls in a case of 36 is 1 case.
+    """
+    units = max(1, int(units_per_set))
+    count = max(0, int(stated))
+    if count <= 0:
+        return 1
+    return max(1, int(math.ceil(count / units)))
+
+
 def _step_tiers(html: str) -> list[tuple[int, float]]:
     tiers: list[tuple[int, float]] = []
     for card in _STEPS.findall(html):
@@ -429,7 +448,7 @@ def parse_product(html: str, page_url: str) -> Optional[UlineItem]:
     price_index, price_word, _span, price_label = _price_cell(header) if header else (-1, "", 1, "")
     if not price_label:
         text = _strip_tags(html)
-        label_match = re.search(r"Price\s+Per\s+[A-Za-z]+(?:\s*\(\d+\s*/\s*[A-Za-z]+\))?", text, re.IGNORECASE)
+        label_match = _PRICE_LABEL_TEXT.search(text)
         price_label = label_match.group(0) if label_match else ""
         code_match = _PRICE_LABEL.search(price_label)
         if code_match:
@@ -464,6 +483,25 @@ def parse_product(html: str, page_url: str) -> Optional[UlineItem]:
 
     min_sets = min((minimum for minimum, _price in tiers), default=1)
 
+    # "(MIN. N)" on the price header is the order minimum in the unit that
+    # header names. Hidden MinOrderQuantity is the same number when the
+    # header has no label: the quantity-box default, not a pack count.
+    # 25 boxes in a 25-box bundle is 1 bundle. 18 rolls in a 36-roll case
+    # is 1 case. PRICE EACH(MIN. 12) with one each per set is 12.
+    stated: Optional[int] = None
+    label_min = _ORDER_MIN.search(price_label or "")
+    if label_min:
+        stated = int(label_min.group(1))
+    else:
+        page_min = _hidden_value(html, "MinOrderQuantity")
+        if page_min:
+            try:
+                stated = int(page_min)
+            except ValueError:
+                stated = None
+    if stated is not None:
+        min_sets = max(min_sets, _packs_for_stated_minimum(stated, units))
+
     base_price = tiers[0][1] if tiers else 0.0
     if base_price <= 0:
         offers = (jsonld or {}).get("offers") if jsonld else None
@@ -479,6 +517,12 @@ def parse_product(html: str, page_url: str) -> Optional[UlineItem]:
         base_price = float(js.group(1)) if js else 0.0
     if base_price <= 0:
         return None
+
+    # The order builder buys from the page minimum up, so the price it can
+    # pay is the cheapest pack price on the page; the chart's lower tiers
+    # stay as a price guide for a single key lookup.
+    if min_sets > 1 and tiers:
+        base_price = min(price for _minimum, price in tiers)
 
     return UlineItem(
         item=item,

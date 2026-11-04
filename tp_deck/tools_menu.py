@@ -11,29 +11,13 @@ from typing import Callable
 from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QMenu, QPushButton
 
-MENU_QSS = """
-QMenu {
-    background-color: #0F172A;
-    color: #F8FAFC;
-    border: 1px solid #334155;
-    border-radius: 4px;
-    padding: 4px;
-}
-QMenu::item {
-    padding: 6px 26px 6px 10px;
-    border-radius: 3px;
-}
-QMenu::item:selected {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-"""
+from tp_deck.theme import current_palette, tools_menu_qss
 
 
 def popup_tools_menu(button: QPushButton, entries: list[tuple[str, Callable[[], None]]]) -> None:
     """Show the tools menu anchored on the toolbox button."""
     menu = QMenu(button)
-    menu.setStyleSheet(MENU_QSS)
+    menu.setStyleSheet(tools_menu_qss(current_palette()))
     for label, callback in entries:
         action = menu.addAction(label)
         action.triggered.connect(callback)

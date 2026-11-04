@@ -5,7 +5,7 @@ Techyparts Data Entry Control Keeper. A Windows desktop panel that copies order 
 ## Using TP DECK
 
 1. Unzip the release anywhere, for example `C:\Apps\TP-DECK`.
-2. Double-click `TP-DECK.bat`. The first open downloads Chromium (network required once) and starts it minimized. Later opens restore the last tabs. If Windows SmartScreen appears, choose **More info → Run anyway**.
+2. Double-click `TP-DECK.bat`. Each open checks for a newer Chrome and downloads it when the installed copy is older (network required for that download), then starts it minimized. Later opens restore the last tabs. Logins live in `chrome-profiles` beside the app. If Windows SmartScreen appears, choose **More info → Run anyway**.
 3. In that Chromium window, sign in once to Seller Hub orders (`ebay.com/sh/ord`), Razor inventory, and the ShipStation awaiting-shipment page.
 4. Use the panel:
 
@@ -14,14 +14,14 @@ Techyparts Data Entry Control Keeper. A Windows desktop panel that copies order 
 | **Scrape eBay Orders** | Copies `Order - Buyer - SKU - Location`. Also reads store orders from the open ShipStation awaiting-shipment tab |
 | **Auto-cycle** | Repeats that lookup on a timer and only fills the location cache. The ring on the button counts down the wait. ShipStation store orders sync every few passes. Batch Serial stays available during a pass and runs when that pass finishes |
 | **Generate Pick List** | Copies a walk-sorted quantity list. Also reads the open ShipStation awaiting-shipment tab |
-| **Batch Serial** | Types serial numbers into a Razor sales order. `SO-12345` searches the sales order number. An eBay order number searches the eBay order column, not Source Type. A digits-only store order searches that order number, then the sales order number. A blank number uses the one open order tab. Paste serials while a cycle is running; they start when that pass finishes |
+| **Batch Serial** | Types serial numbers into a Razor sales order. `SO-12345` searches the sales order number. An eBay order number searches the PO column. A digits-only store order searches the PO column. A blank number uses the one open order tab. Paste serials while a cycle is running; they start when that pass finishes |
 | **Tools** (toolbox button) | Opens the tools menu. **Uline Order Builder** — type a Uline Item # (`S-11633`) or a saved alias, and TP DECK fills in the full name, price, price tiers, unit of sale, and units per set, then works out how many packs to buy for the units you need (Needed Units ÷ Units Per Set, rounded up, never below Uline's minimum pack). Pages that price a smaller item (boxes, rolls) are converted to the pack Uline sells in (Bundle, Case), so a bundle of 25 boxes at $0.80 per box shows as $20 per Bundle. Items are cached forever in `tp_deck/uline_cache.json`, and the Cached Items tab edits, re-checks, aliases, and deletes them. Typing a price in the Price column overrides the tier price; type 0 to clear it. Export writes CSV and optional PDF into the export folder set in Settings, default `Uline Exports` beside `TP-DECK.bat`. The draft order is kept between opens, and lookups keep the TP DECK Chromium window minimized |
 | **Emergency Stop** or **Pause** | Cancels the current task immediately. During the shutdown fade, Emergency Stop cancels shutdown |
 | **Power** | Safe Shutdown. The panel fades to grey for 5 seconds. Emergency Stop during that fade cancels it. Otherwise TP DECK finishes the current task, closes extra sales-order tabs, and closes Chromium |
 
-The lamp is green while something is running, pulses blue while auto-cycle is waiting, and is red when nothing is running or queued.
+The lamp is green while something is running, purple while the title lamp is forcing a refresh, pulses blue while auto-cycle is waiting, and is red when nothing is running or queued.
 
-A later open of a release install checks for a newer GitHub release. The status shows the version and the day it was released, and the action buttons pulse between yellow and grey. Emergency Stop cancels that update until the next launch. A bar shows download progress. The browser profile, settings, SKU cache, and sister-SKU list stay in place.
+A later open checks for a newer Chrome. A release install also checks for a newer GitHub release. The status names the update. An app update pulses the action buttons between yellow and grey. A Chrome update pulses them between green and grey. When both are ready they alternate yellow and green every half second. Emergency Stop cancels that update until the next launch. A bar shows download progress. The app update installs first and closes TP DECK; Chrome updates on the next open. Logins stay in `chrome-profiles`. Settings, the SKU cache, and the sister-SKU list stay in place.
 
 Ports, timeouts, and window position are in **Settings**. CSS selectors are in `tp_deck/locators.json`.
 

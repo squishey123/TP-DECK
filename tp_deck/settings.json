@@ -3,6 +3,7 @@
   "ebay_port": 9222,
   "erp_port": 9223,
   "chrome_version": "",
+  "chrome_profile_dir": "",
   "window_x": 23,
   "window_y": 146,
   "emergency_hotkey": "pause",
@@ -50,5 +51,6 @@
   "uline_url_pattern": "uline.com",
   "uline_lookup_timeout_ms": 20000,
   "uline_export_dir": "",
+  "theme": "neutral",
   "cache_ttl": "12h"
 }

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from tp_deck import app_version
 from tp_deck.settings_manager import load_settings, update_settings
+from tp_deck.theme import current_palette, notes_document_css, release_notes_qss
 from tp_deck.updater import (
     describe_release,
     fetch_by_tag,
@@ -38,56 +39,13 @@ _BOLD = re.compile(r"\*\*([^*]+)\*\*")
 _URL = re.compile(r'(?<!href=")(https?://[^\s<]+)')
 _NUMBERED = re.compile(r"\d+\.\s+(.*)")
 
-DIALOG_QSS = """
-QDialog {
-    background-color: #0F172A;
-    color: #F8FAFC;
-}
-QLabel#notesTitle {
-    color: #F8FAFC;
-    background: transparent;
-    font-size: 16px;
-    font-weight: 600;
-}
-QTextBrowser {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #334155;
-    border-radius: 4px;
-    padding: 8px 10px;
-    font-size: 13px;
-}
-QPushButton {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #0EA5E9;
-    border-radius: 4px;
-    padding: 6px 14px;
-}
-QPushButton:hover {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-QPushButton#closeBtn {
-    background-color: #0EA5E9;
-    color: #0F172A;
-    font-weight: bold;
-}
-QPushButton#closeBtn:hover {
-    background-color: #38BDF8;
-}
-"""
 
-_NOTES_CSS = (
-    "body { color: #F8FAFC; background-color: #1E293B; "
-    "font-family: 'Segoe UI', sans-serif; font-size: 14px; }"
-    "h1, h2, h3 { color: #F8FAFC; font-size: 16px; margin: 12px 0 6px; }"
-    "p, li { color: #F8FAFC; }"
-    "a { color: #38BDF8; }"
-    "code { color: #7DD3FC; font-family: Consolas, 'Courier New', monospace; }"
-    "ul { margin: 4px 0 8px 18px; }"
-    "li { margin: 0 0 6px; }"
-)
+def _dialog_qss() -> str:
+    return release_notes_qss(current_palette())
+
+
+def _notes_css() -> str:
+    return notes_document_css(current_palette())
 
 
 def _same_version(left: str, right: str) -> bool:
@@ -198,7 +156,7 @@ class ReleaseNotesDialog(QDialog):
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(440, 360)
         self.resize(520, 440)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(_dialog_qss())
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
@@ -212,7 +170,7 @@ class ReleaseNotesDialog(QDialog):
         browser.setOpenExternalLinks(False)
         browser.setOpenLinks(False)
         browser.anchorClicked.connect(self._open_link)
-        browser.document().setDefaultStyleSheet(_NOTES_CSS)
+        browser.document().setDefaultStyleSheet(_notes_css())
         browser.setHtml(notes_html)
         layout.addWidget(browser)
 

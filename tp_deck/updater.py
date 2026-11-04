@@ -81,7 +81,7 @@ try {
   if (Test-Path -LiteralPath $keep) { Remove-Item -LiteralPath $keep -Recurse -Force -ErrorAction SilentlyContinue }
   New-Item -ItemType Directory -Path $keep -Force | Out-Null
   Get-ChildItem -LiteralPath $destRoot -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-    ($keepNames -contains $_.Name) -and ($_.FullName -notmatch '\\browser\\')
+    ($keepNames -contains $_.Name) -and ($_.FullName -notmatch '\\browser\\') -and ($_.FullName -notmatch '\\chrome-profiles\\')
   } | ForEach-Object {
     $rel = Rel $destRoot $_.FullName
     if (-not $rel) { return }
@@ -94,7 +94,7 @@ try {
   $attempt = 0
   do {
     $attempt++
-    & robocopy $Source $destRoot /E /NFL /NDL /NJH /NJS /R:2 /W:1 /XD browser /XF settings.json sku_overrides.json sku_location_cache.json uline_cache.json uline_draft.json tpdeck.log tpdeck.log.1 tpdeck.log.2 tpdeck.log.3 tpdeck.log.4 tpdeck.log.5
+    & robocopy $Source $destRoot /E /NFL /NDL /NJH /NJS /R:2 /W:1 /XD browser chrome-profiles /XF settings.json sku_overrides.json sku_location_cache.json uline_cache.json uline_draft.json tpdeck.log tpdeck.log.1 tpdeck.log.2 tpdeck.log.3 tpdeck.log.4 tpdeck.log.5
     if ($null -ne $LASTEXITCODE) { $code = $LASTEXITCODE } else { $code = 0 }
     if ($code -lt 8) { break }
     Note ("robocopy attempt " + $attempt + " code " + $code)
@@ -116,7 +116,7 @@ try {
 }
 
 Get-ChildItem -LiteralPath $destRoot -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-  $_.FullName -notmatch '\\browser\\'
+  $_.FullName -notmatch '\\browser\\' -and $_.FullName -notmatch '\\chrome-profiles\\'
 } | Unblock-File -ErrorAction SilentlyContinue
 
 $log = Join-Path $destRoot 'tp_deck\tpdeck.log'

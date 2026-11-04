@@ -23,7 +23,13 @@ from tp_deck.automation_engine import (
     run_automation,
     run_batch_serials,
 )
-from tp_deck.chrome_launcher import app_root, ensure_debug_chromium
+from tp_deck.chrome_launcher import (
+    app_root,
+    download_chrome,
+    ensure_debug_chromium,
+    migrate_profiles_safely,
+    peek_chrome_update,
+)
 from tp_deck.dashboard import Dashboard
 from tp_deck.job_results import AutomationResult, render_job
 from tp_deck.release_notes import present_release_notes_after_update
@@ -31,6 +37,7 @@ from tp_deck.sales_order import close_detail_tab, shutdown_workday
 from tp_deck.serial_dialog import SerialDialog, order_summaries
 from tp_deck.settings_dialog import SettingsDialog
 from tp_deck.settings_manager import load_settings
+from tp_deck.theme import apply_theme
 from tp_deck.tools_menu import popup_tools_menu
 from tp_deck.uline_dialog import UlineDialog
 from tp_deck.updater import (
@@ -170,6 +177,26 @@ class AutomationController:
         )
         self._manual_task.add_done_callback(self._on_manual_done)
         logging.getLogger("tpdeck").info("Automation task started (%s)", job)
+        return True
+
+    def start_urgent(self) -> bool:
+        """Refresh eBay and sync ShipStation now, past the refresh hold."""
+        if self._dashboard.input_blocked():
+            return False
+        if self._lock.locked() or self._manual_pending or self._cycle_busy:
+            return False
+        if self._manual_task is not None and not self._manual_task.done():
+            return False
+        self._manual_pending = True
+        self._job = "orders"
+        self._dashboard.begin_urgent_sync()
+        self._dashboard.set_processing(True, job="orders")
+        self._manual_task = asyncio.create_task(
+            self._run_urgent(),
+            name="tpdeck-urgent-sync",
+        )
+        self._manual_task.add_done_callback(self._on_manual_done)
+        logging.getLogger("tpdeck").info("Urgent sync started")
         return True
 
     def start_sister_lookup(
@@ -327,6 +354,7 @@ class AutomationController:
             return
         dialog = SerialDialog(self._dashboard, orders=list(self._last_orders))
         dialog.setModal(False)
+        dialog.order_queued.connect(self._queue_serial_order)
         dialog.accepted.connect(lambda: self._accept_serial_dialog(dialog))
         dialog.finished.connect(self._finish_serial_dialog)
         self._serial_dialog = dialog
@@ -335,31 +363,24 @@ class AutomationController:
         dialog.raise_()
         dialog.activateWindow()
 
+    def _queue_serial_order(self, order: str, serials: list[str]) -> None:
+        """Queue one order's own serial list. Earlier submits stay queued."""
+        cleaned = [str(serial) for serial in serials if str(serial).strip()]
+        if not cleaned:
+            return
+        self._serial_queue.append((cleaned, str(order)))
+        self._dashboard.set_serial_queued(True)
+        logging.getLogger("tpdeck").info(
+            "Batch serial queued for %s (%s serials)",
+            order,
+            len(cleaned),
+        )
+
     def _accept_serial_dialog(self, dialog: SerialDialog) -> None:
         serials = dialog.serials()
         if not serials:
             return
-        orders = dialog.multi_orders()
-        if len(orders) > 1:
-            # Each order gets its own queued batch, so an order that errors on
-            # a serial runs on, and the user is notified per batch as usual.
-            # The same pasted serials apply to each order.
-            for order in orders:
-                self._serial_queue.append((list(serials), order))
-            logging.getLogger("tpdeck").info(
-                "Batch serial queued for %s orders (%s serials each)",
-                len(orders),
-                len(serials),
-            )
-            self._dashboard.set_serial_queued(True)
-            return
-        if len(orders) == 1:
-            order = orders[0]
-        else:
-            order = dialog.order_number()
-        self._serial_queue.append((serials, order))
-        self._dashboard.set_serial_queued(True)
-        logging.getLogger("tpdeck").info("Batch serial queued (%s)", len(serials))
+        self._queue_serial_order(dialog.order_number(), serials)
 
     def _finish_serial_dialog(self, _code: int) -> None:
         self._serial_dialog = None
@@ -451,6 +472,24 @@ class AutomationController:
                 )
         finally:
             self._manual_pending = False
+
+    async def _run_urgent(self):
+        try:
+            async with self._lock:
+                settings = load_settings()
+                return await run_automation(
+                    settings,
+                    job="orders",
+                    copy_clipboard=True,
+                    refresh_ebay=True,
+                    honor_refresh_hold=False,
+                    sync_shipstation=True,
+                    scrape_shipstation=True,
+                    on_progress=self._on_run_progress,
+                )
+        finally:
+            self._manual_pending = False
+            self._dashboard.end_urgent_sync()
 
     async def _run_sister_lookup(
         self,
@@ -562,14 +601,6 @@ class AutomationController:
         for sku in skus:
             cache.mark_prompted(str(sku))
         cache.save()
-
-    def _present_deferred(self, result: AutomationResult) -> None:
-        """Copy and show a finished run whose clipboard waited on the prompt."""
-        text = result.clipboard_text or ""
-        if text.strip():
-            copy_to_clipboard(text)
-        self._dashboard.set_processing(False)
-        self._publish(result)
 
     def _publish(
         self,
@@ -918,63 +949,154 @@ async def _prepare_chromium(dashboard: Dashboard) -> None:
 
 
 async def _startup(dashboard: Dashboard) -> None:
-    """Install a newer public release when one exists, then start Chromium."""
+    """Move Chrome profiles, offer updates, then start Chrome.
+
+    An app update closes TP DECK before a Chrome download starts. Chrome
+    needs this process to stay open while its binary is replaced.
+    """
     logger = logging.getLogger("tpdeck")
-    updated = False
+    profiles_ready = False
     try:
-        updated = await _apply_update(dashboard)
+        profiles_ready = await migrate_profiles_safely(load_settings())
+    except Exception:
+        logger.exception("Chrome profile migration failed")
+        profiles_ready = False
+    app_pending: Optional[tuple] = None
+    chrome_pending: Optional[tuple[str, str]] = None
+    chrome_hold = ""
+    dashboard.set_active(True)
+    dashboard.set_status("Checking for updates")
+    try:
+        app_pending = await asyncio.to_thread(peek_app_release)
     except Exception as exc:
         message = str(exc).strip() or exc.__class__.__name__
         logger.exception("Update failed: %s", exc)
         dashboard.clear_progress()
         dashboard.set_status(f"Error — {message}")
-    if updated:
-        logger.info("Update helper started; closing")
-        dashboard.close()
-        return
+    if profiles_ready:
+        try:
+            chrome_pending = await peek_chrome_update(load_settings())
+        except Exception:
+            logger.exception("Chrome update check failed")
+            chrome_hold = "Chrome update check failed — opening the current browser"
+            dashboard.set_status(chrome_hold)
+            chrome_pending = None
+    if app_pending or chrome_pending:
+        if app_pending and chrome_pending:
+            label = f"{app_pending[0]} and Chrome {chrome_pending[0]}"
+            kind = "both"
+        elif app_pending:
+            label = app_pending[0]
+            kind = "app"
+        else:
+            assert chrome_pending is not None
+            label = f"Chrome {chrome_pending[0]}"
+            kind = "chrome"
+        cancelled = await _confirm_update(dashboard, label, kind)
+        if not cancelled and app_pending:
+            try:
+                await _download_app_release(dashboard, app_pending)
+            except Exception as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                logger.exception("Update failed: %s", exc)
+                dashboard.clear_progress()
+                dashboard.set_status(f"Error — {message}")
+            else:
+                logger.info("Update helper started; closing")
+                dashboard.close()
+                return
+        elif not cancelled and chrome_pending:
+            installed = await download_chrome(
+                chrome_pending[0],
+                chrome_pending[1],
+                load_settings(),
+                dashboard.set_status,
+                _chrome_download_progress(dashboard, chrome_pending[0]),
+            )
+            if installed is None:
+                chrome_hold = dashboard._status_text
+                dashboard.clear_progress()
+            else:
+                dashboard.set_run_progress(1.0, None)
     notes = asyncio.create_task(
         present_release_notes_after_update(dashboard),
         name="tpdeck-release-notes",
     )
     try:
         await _prepare_chromium(dashboard)
+        if chrome_hold and not dashboard._error:
+            dashboard.set_status(chrome_hold)
     finally:
         if not notes.done():
             await notes
 
 
-async def _apply_update(dashboard: Dashboard) -> bool:
+def peek_app_release() -> Optional[tuple]:
+    """Label and download details for a newer release, without downloading it."""
     logger = logging.getLogger("tpdeck")
     if not is_release_layout():
         logger.info("Update check skipped; this is not a release install")
-        return False
+        return None
     settings = load_settings()
     repo = str(settings.get("update_repo") or "").strip()
     if "/" not in repo:
         logger.info("Update check skipped; update_repo is empty")
-        return False
-    dashboard.set_active(True)
-    dashboard.set_status("Checking for updates")
-    release = await asyncio.to_thread(fetch_latest, repo)
+        return None
+    release = fetch_latest(repo)
     if not release:
-        return False
+        return None
     tag = str(release.get("tag_name") or "")
     if not is_newer(tag, app_version()):
         logger.info("No update; installed %s, latest %s", app_version(), tag or "unknown")
-        return False
+        return None
     asset = find_windows_asset(release)
     if asset is None:
         logger.info("Release %s has no Windows zip", tag or "unknown")
-        return False
+        return None
     name, url = asset
     version, released = describe_release(release)
     label = f"{version} — released {released}" if released else version
     logger.info("Update %s is ready (%s)", tag or name, label)
-    if await _confirm_update(dashboard, label):
-        return False
+    return (label, name, url, release)
+
+
+def _chrome_download_progress(
+    dashboard: Dashboard,
+    version: str,
+) -> Callable[[int, int], None]:
+    """Paint the same bar an app download uses, from the Chrome bytes read."""
+    loop = asyncio.get_running_loop()
+    last_pct = -1
+    label = f"Downloading Chrome {version}"
+
+    def on_progress(read: int, total: int) -> None:
+        nonlocal last_pct
+        if total > 0:
+            pct = int(read * 100 / total)
+            if pct == last_pct:
+                return
+            last_pct = pct
+            fraction = max(0.0, min(1.0, read / total))
+        else:
+            fraction = 0.0
+
+        def paint(locked: float = fraction, size: int = total) -> None:
+            dashboard.set_status(label)
+            if size > 0:
+                dashboard.set_run_progress(locked, None)
+            else:
+                dashboard.set_run_progress(0.0, (0.0, 1.0))
+
+        loop.call_soon_threadsafe(paint)
+
+    return on_progress
+
+
+async def _download_app_release(dashboard: Dashboard, pending: tuple) -> None:
+    label, name, url, release = pending
     dashboard.set_status(f"Downloading {label}")
     dashboard.set_run_progress(0.0, None)
-    logger.info("Downloading update %s", name)
+    logging.getLogger("tpdeck").info("Downloading update %s", name)
     loop = asyncio.get_running_loop()
     last_pct = -1
 
@@ -1008,13 +1130,12 @@ async def _apply_update(dashboard: Dashboard) -> bool:
     )
     dashboard.set_status(f"Updating to {label}")
     dashboard.set_run_progress(1.0, None)
-    return True
 
 
-async def _confirm_update(dashboard: Dashboard, label: str) -> bool:
+async def _confirm_update(dashboard: Dashboard, label: str, kind: str = "app") -> bool:
     """Pulse the action buttons for 5 seconds. True when Emergency Stop cancelled."""
     dashboard.set_status(f"{label} — Emergency Stop to cancel")
-    dashboard.begin_update_warning()
+    dashboard.begin_update_warning(kind)
     try:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
@@ -1046,6 +1167,9 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("TP DECK")
+    # Push the saved theme (Settings ▸ Appearance) onto every window before any
+    # is built, so title bars, dialogs, menus, and tooltips follow it too.
+    apply_theme()
     # The dashboard is a tool window, so Qt does not count it as a main window.
     # Leaving this on makes closing Settings, Batch Serial, or a sister-SKU
     # dialog quit the process. The dashboard closeEvent quits explicitly.
@@ -1099,6 +1223,7 @@ def main() -> int:
         on_arm_shutdown=_arm_shutdown,
     )
     controller = AutomationController(dashboard)
+    dashboard._on_urgent_sync = controller.start_urgent
     controller.bind_loop(loop)
 
     try:

@@ -69,14 +69,6 @@ class _RunProgress:
             sheen = (locked, sheen_end)
         self.report(locked, sheen, label)
 
-    def refresh_sheen(self, label: str, done: float = 0.0) -> None:
-        span = _REFRESH_WEIGHT
-        locked = span * max(0.0, min(1.0, done))
-        self.report(locked, (locked, span), label)
-
-    def refresh_done(self, label: str = "Scraping orders") -> None:
-        self.report(_REFRESH_WEIGHT, (_REFRESH_WEIGHT, _REFRESH_WEIGHT + _SCRAPE_WEIGHT), label)
-
     def scrape_done(self, label: str = "Checking locations") -> None:
         locked = _REFRESH_WEIGHT + _SCRAPE_WEIGHT
         self.report(locked, None, label)
@@ -304,30 +296,6 @@ def _require_selector(selectors: dict[str, Any], key: str) -> str:
             f"Missing CSS selector '{key}' in locators.json."
         )
     return raw
-
-
-async def extract_text(
-    page: Page,
-    selector: str,
-    *,
-    timeout_ms: int,
-    label: str = "element",
-) -> str:
-    """Read visible text (or input value) from the first matching element."""
-    locator = page.locator(selector).first
-    try:
-        await locator.wait_for(state="visible", timeout=timeout_ms)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Timed out waiting for {label} ({selector}). "
-            "Open the correct page, then recopy the selector in Settings."
-        ) from exc
-    text = await locator.inner_text()
-    cleaned = _clean_text(text)
-    if cleaned:
-        return cleaned
-    value = await locator.input_value()
-    return _clean_text(value)
 
 
 async def collect_grid_column_texts(

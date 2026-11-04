@@ -125,6 +125,7 @@ class ParsedSamples(unittest.TestCase):
         self.assertEqual(item.units_per_set, 36)
         self.assertEqual(item.base_unit, "Roll")
         self.assertEqual(item.tiers[0][0], 1)
+        self.assertEqual(item.min_sets, 1)  # 18 rolls is half a case, not 18 cases
         self.assertEqual(item.tiers[2], (2, 153.0))
         line = OrderLine(item="S-15575", unit=item.unit, units_per_set=item.units_per_set,
                          min_sets=item.min_sets, base_unit=item.base_unit,
@@ -133,6 +134,15 @@ class ParsedSamples(unittest.TestCase):
         self.assertEqual(line.total(), 162.0)
         line.sets = 2
         self.assertEqual(line.total(), 306.0)
+
+    def test_each_minimum_raises_the_line_to_twelve(self):
+        item = item_of(sample("S-6615.html"), "S-6615",
+                       "https://www.uline.com/Product/Detail/S-6615")
+        self.assertEqual(item.item, "S-6615")
+        self.assertEqual(item.unit, "Each")
+        self.assertEqual(item.units_per_set, 1)
+        self.assertEqual(item.min_sets, 12)
+        self.assertEqual(sets_for(1, item.units_per_set, item.min_sets), 12)
 
     def test_step_cards_keep_the_pack_multiplier(self):
         item = item_of(sample("qty per case.html"), "S-22454",
@@ -1115,8 +1125,8 @@ class LazyMode(unittest.TestCase):
 
 
 class SerialOrders(unittest.TestCase):
-    """The Current Orders button picks orders: a single pick prefills, a
-    multi pick queues a run per order with the same serials."""
+    """The Current Orders button picks orders: a single pick prefills and
+    closes on submit, a multi pick asks for a separate serial list per order."""
 
     @classmethod
     def setUpClass(cls):
@@ -1146,6 +1156,16 @@ class SerialOrders(unittest.TestCase):
             dmod.CurrentOrdersWindow = original
         self.assertEqual(dialog.order_number(), "SO-12345")
         self.assertEqual(dialog.multi_orders(), [])
+        from PySide6.QtWidgets import QDialog
+
+        from tp_deck.main import AutomationController
+
+        controller = AutomationController(_StubDashboard())
+        dialog.accepted.connect(lambda: controller._accept_serial_dialog(dialog))
+        dialog._editor.setPlainText("111")
+        dialog._submit()
+        self.assertEqual(controller._serial_queue, [(["111"], "SO-12345")])
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
         self.assertEqual(
             dmod.order_summaries([
             ("12-34567-89012", "Ann", "S-4307", 2),
@@ -1156,12 +1176,15 @@ class SerialOrders(unittest.TestCase):
         )
 
     def test_multi_pick_queues_a_run_per_order(self):
+        from PySide6.QtWidgets import QDialog
+
         from tp_deck import serial_dialog as dmod
         from tp_deck.main import AutomationController
 
         orders = [("SO-1", "A", 1, 1), ("SO-2", "B", 1, 1), ("SO-3", "C", 1, 1)]
         controller = AutomationController(_StubDashboard())
         dialog = dmod.SerialDialog(orders=orders)
+        dialog.order_queued.connect(controller._queue_serial_order)
         dialog.accepted.connect(lambda: controller._accept_serial_dialog(dialog))
         original = self._window(["SO-1", "SO-3"])
         try:
@@ -1171,10 +1194,17 @@ class SerialOrders(unittest.TestCase):
         self.assertEqual(dialog.multi_orders(), ["SO-1", "SO-3"])
         dialog._editor.setPlainText("111\n222")
         dialog._submit()
+        self.assertEqual(controller._serial_queue, [(["111", "222"], "SO-1")])
+        self.assertEqual(dialog.order_number(), "SO-3")
+        self.assertEqual(dialog.serials(), [])
+        self.assertNotEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        dialog._editor.setPlainText("999")
+        dialog._submit()
         self.assertEqual(
             controller._serial_queue,
-            [(["111", "222"], "SO-1"), (["111", "222"], "SO-3")],
+            [(["111", "222"], "SO-1"), (["999"], "SO-3")],
         )
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
         self.assertTrue(controller._dashboard.queued)
 
     def test_no_orders_says_scrape_first(self):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import time
 from typing import Callable, Optional
 
@@ -36,11 +37,35 @@ from PySide6.QtWidgets import (
 
 from tp_deck import app_version
 from tp_deck.settings_manager import load_settings, update_settings
+from tp_deck.theme import (
+    NEUTRAL,
+    action_qss,
+    cycle_qss,
+    dashboard_qss,
+    fade_qss,
+    palette_for,
+    results_qss,
+    slow_label_qss,
+    pulse_qss,
+    title_qss,
+    update_pulse_qss,
+    version_qss,
+)
 
 logger = logging.getLogger("tpdeck")
 
 _DASHBOARD_HEIGHT = 372
 _DASHBOARD_HEIGHT_SLOW = 404
+_RAINBOW = (
+    "#EF4444",
+    "#F97316",
+    "#EAB308",
+    "#22C55E",
+    "#06B6D4",
+    "#3B82F6",
+    "#A855F7",
+)
+_URGENT_LAMP = "#A855F7"
 
 
 def _mix_color(start: QColor, end: QColor, amount: float) -> QColor:
@@ -53,18 +78,19 @@ def _mix_color(start: QColor, end: QColor, amount: float) -> QColor:
     )
 
 
-def _mix_hex(start: str, end: str, amount: float) -> str:
-    return _mix_color(QColor(start), QColor(end), amount).name()
+def _palette_mix(p: dict[str, str], key: str, t: float, toward: str = "#94A3B8") -> QColor:
+    """Palette color eased toward the shutdown grey."""
+    return _mix_color(QColor(p[key]), QColor(toward), max(0.0, min(1.0, t)))
 
 
-def _cycle_icon(color: QColor | None = None) -> QIcon:
+def _cycle_icon(color: QColor) -> QIcon:
     """Two arrows chasing each other around a circle."""
     size = 20
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(color or QColor("#F8FAFC"))
+    pen = QPen(color)
     pen.setWidthF(1.7)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -112,167 +138,15 @@ def _format_status(text: str) -> str:
     return raw
 
 
-# Techyparts enterprise hardware dark theme
-THEME_QSS = """
-QMainWindow, QWidget#dashboardRoot {
-    background-color: #0F172A;
-    color: #F8FAFC;
-}
-QLabel#titleLabel {
-    color: #0EA5E9;
-    font-size: 14px;
-    font-weight: bold;
-}
-QLabel#versionLabel {
-    color: #22D3EE;
-    font-family: Consolas, "Courier New", monospace;
-    font-size: 9px;
-    font-weight: 700;
-    padding: 0px;
-    margin: 0px;
-}
-QLabel#statusLabel {
-    color: #F8FAFC;
-    font-size: 11px;
-    min-height: 52px;
-}
-QPushButton {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #0EA5E9;
-    border-radius: 4px;
-    padding: 6px 12px;
-    font-size: 12px;
-}
-QPushButton:hover {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-QPushButton:disabled {
-    background-color: #1E293B;
-    color: #64748B;
-    border-color: #334155;
-}
-QPushButton#executeBtn, QPushButton#pickBtn, QPushButton#batchBtn {
-    background-color: #0EA5E9;
-    color: #0F172A;
-    font-weight: bold;
-    min-height: 28px;
-    padding: 6px 6px;
-}
-QPushButton#executeBtn:hover, QPushButton#pickBtn:hover, QPushButton#batchBtn:hover {
-    background-color: #38BDF8;
-}
-QPushButton#executeBtn:disabled, QPushButton#pickBtn:disabled, QPushButton#batchBtn:disabled {
-    background-color: #334155;
-    color: #94A3B8;
-    border-color: #475569;
-}
-QPushButton#cycleBtn {
-    background-color: #B45309;
-    color: #F8FAFC;
-    border: 1px solid #F59E0B;
-    padding: 0px;
-    min-width: 34px;
-    max-width: 34px;
-    min-height: 34px;
-    max-height: 34px;
-}
-QPushButton#cycleBtn:hover {
-    background-color: #D97706;
-    color: #F8FAFC;
-}
-QPushButton#cycleBtn[cycleOn="true"] {
-    background-color: #15803D;
-    border: 1px solid #4ADE80;
-}
-QPushButton#cycleBtn[cycleOn="true"]:hover {
-    background-color: #16A34A;
-    color: #F8FAFC;
-}
-QPushButton#cycleBtn:disabled {
-    background-color: #334155;
-    color: #94A3B8;
-    border-color: #475569;
-}
-QPushButton#stopBtn {
-    background-color: #7F1D1D;
-    color: #FCA5A5;
-    border: 1px solid #FCA5A5;
-    font-weight: bold;
-    font-size: 11px;
-    padding: 4px 4px;
-}
-QPushButton#stopBtn:hover {
-    background-color: #991B1B;
-    color: #FEE2E2;
-}
-QPushButton#settingsBtn, QPushButton#powerBtn, QPushButton#toolsBtn {
-    border-color: #64748B;
-    padding: 0px;
-    min-width: 34px;
-    max-width: 34px;
-    min-height: 34px;
-    max-height: 34px;
-}
-QLabel#slowRazorLabel {
-    color: #FBBF24;
-    font-size: 12px;
-    font-weight: bold;
-}
-"""
-
-RESULTS_QSS = """
-QWidget#resultsRoot {
-    background-color: #FFFFFF;
-    color: #000000;
-}
-QLabel#resultsNote {
-    background-color: #FFFFFF;
-    color: #000000;
-    font-size: 16px;
-}
-QTextEdit#resultsText {
-    background-color: #FFFFFF;
-    color: #000000;
-    border: 1px solid #CBD5E1;
-    border-radius: 4px;
-    font-family: Consolas, "Courier New", monospace;
-    font-size: 22px;
-    padding: 6px;
-}
-QPushButton#closeBtn {
-    background-color: #0EA5E9;
-    color: #0F172A;
-    border: 1px solid #0EA5E9;
-    border-radius: 4px;
-    padding: 6px 12px;
-    font-size: 12px;
-    font-weight: bold;
-    min-height: 28px;
-}
-QPushButton#closeBtn:hover {
-    background-color: #38BDF8;
-    color: #0F172A;
-}
-QTableWidget#resultsTable {
-    background-color: #FFFFFF;
-    color: #000000;
-    border: 1px solid #CBD5E1;
-    gridline-color: #E2E8F0;
-    font-family: Consolas, "Courier New", monospace;
-    font-size: 18px;
-    selection-background-color: #E0F2FE;
-    selection-color: #000000;
-}
-QTableWidget#resultsTable QHeaderView::section {
-    background-color: #F1F5F9;
-    color: #0F172A;
-    font-weight: bold;
-    padding: 4px 6px;
-    border: 1px solid #CBD5E1;
-}
-"""
+# Techyparts enterprise hardware dark theme. Every color comes from the palette
+# module, keyed off the wheel color picked in Settings ▸ Appearance; "neutral"
+# (and the legacy "slate") maps to the original cyan-on-slate theme exactly.
+def _startup_palette() -> dict[str, str]:
+    try:
+        settings = load_settings()
+    except Exception:  # a damaged settings file must not stop the panel
+        return NEUTRAL
+    return palette_for(settings.get("theme", "neutral"))
 
 
 def _ordinal(index: int) -> str:
@@ -306,7 +180,12 @@ class ResultsWindow(QWidget):
             | Qt.WindowType.WindowMaximizeButtonHint
         )
         self.setMinimumSize(420, 180)
-        self.setStyleSheet(RESULTS_QSS)
+        parent_dashboard = parent if isinstance(parent, Dashboard) else None
+        self._palette = (
+            parent_dashboard.palette() if parent_dashboard is not None
+            else _startup_palette()
+        )
+        self.setStyleSheet(results_qss(self._palette))
         self._unknown_rows: list[bool] = []
         self._filling = False
 
@@ -397,7 +276,7 @@ class ResultsWindow(QWidget):
         self._table.setColumnCount(len(headers) + 1)
         self._table.setHorizontalHeaderLabels(["", *headers])
         self._table.setRowCount(len(rows))
-        unknown_bg = QColor("#FEE2E2")
+        unknown_bg = QColor(self._palette["results_flag"])
         for row_index, row in enumerate(rows):
             flagged = self._unknown_rows[row_index]
             check = QTableWidgetItem("")
@@ -471,6 +350,37 @@ class ResultsWindow(QWidget):
         current = table.columnWidth(buyer_at)
         table.setColumnWidth(buyer_at, max(72, current - overflow))
 
+    def set_palette(self, p: dict[str, str]) -> None:
+        """Re-theme the report window and repaint any rows already on screen."""
+        self._palette = p
+        self.setStyleSheet(results_qss(p))
+        if self._table.isVisible() and self._table.rowCount():
+            for row in range(self._table.rowCount()):
+                flagged = row < len(self._unknown_rows) and self._unknown_rows[row]
+                processed = False
+                check = self._table.item(row, 0)
+                if check is not None:
+                    processed = check.checkState() == Qt.CheckState.Checked
+                background = QColor(p["results_processed_bg"]) if processed else (
+                    QColor(p["results_flag"])
+                    if flagged
+                    else QColor(p["results_bg"])
+                )
+                foreground = (
+                    QColor(p["results_processed_text"])
+                    if processed
+                    else QColor(p["results_text"])
+                )
+                self._table.blockSignals(True)
+                try:
+                    for column in range(self._table.columnCount()):
+                        cell = self._table.item(row, column)
+                        if cell is not None:
+                            cell.setBackground(background)
+                            cell.setForeground(foreground)
+                finally:
+                    self._table.blockSignals(False)
+
     def _on_result_checked(self, item: QTableWidgetItem) -> None:
         """Grey a row while its checkbox is on. The next results clear it."""
         if self._filling or item.column() != 0:
@@ -479,10 +389,16 @@ class ResultsWindow(QWidget):
         flagged = (
             item.row() < len(self._unknown_rows) and self._unknown_rows[item.row()]
         )
-        background = QColor("#4B5563") if processed else (
-            QColor("#FEE2E2") if flagged else QColor("#FFFFFF")
+        background = QColor(self._palette["results_processed_bg"]) if processed else (
+            QColor(self._palette["results_flag"])
+            if flagged
+            else QColor(self._palette["results_bg"])
         )
-        foreground = QColor("#F8FAFC") if processed else QColor("#000000")
+        foreground = (
+            QColor(self._palette["results_processed_text"])
+            if processed
+            else QColor(self._palette["results_text"])
+        )
         self._table.blockSignals(True)
         try:
             for column in range(self._table.columnCount()):
@@ -567,7 +483,10 @@ class ResultsWindow(QWidget):
 
 
 class ChassisLight(QWidget):
-    """Small lamp beside the title. It breathes only while auto-cycle is waiting."""
+    """Small lamp beside the title. It breathes only while auto-cycle is waiting.
+
+    A click starts an urgent sync. There is no label.
+    """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -575,8 +494,22 @@ class ChassisLight(QWidget):
         self._state = "idle"
         self._phase = 0.0
         self._fade = 0.0
+        self._palette = NEUTRAL
+        self._on_click: Optional[Callable[[], None]] = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
+
+    def set_click_handler(self, handler: Optional[Callable[[], None]]) -> None:
+        self._on_click = handler
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 — Qt override
+        if event.button() == Qt.MouseButton.LeftButton and self._on_click is not None:
+            self._on_click()
+        super().mousePressEvent(event)
+
+    def set_palette(self, p: dict[str, str]) -> None:
+        self._palette = p
+        self.update()
 
     def set_state(self, state: str) -> None:
         self._state = state or "idle"
@@ -600,17 +533,23 @@ class ChassisLight(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         colors = {
-            "idle": QColor("#FCA5A5"),
-            "running": QColor("#4ADE80"),
-            "error": QColor("#FCA5A5"),
+            "idle": QColor(self._palette["danger_text"]),
+            "running": QColor(self._palette["success_border"]),
+            "error": QColor(self._palette["danger_text"]),
         }
-        color = colors.get(self._state, QColor("#FCA5A5"))
-        if self._state == "waiting":
+        color = colors.get(self._state, QColor(self._palette["danger_text"]))
+        if self._state == "urgent":
+            color = QColor(_URGENT_LAMP)
+        elif self._state == "waiting":
             wave = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(self._phase))
-            color = QColor("#0EA5E9")
+            color = QColor(self._palette["accent"])
             color.setAlphaF(wave)
         if self._fade > 0:
-            color = _mix_color(QColor(color.red(), color.green(), color.blue()), QColor("#94A3B8"), self._fade)
+            color = _mix_color(
+                QColor(color.red(), color.green(), color.blue()),
+                QColor("#94A3B8"),
+                self._fade,
+            )
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
         painter.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
@@ -625,12 +564,18 @@ class CycleButton(QPushButton):
         self._deadline: Optional[float] = None
         self._total = 0.0
         self._fade = 0.0
+        self._palette = NEUTRAL
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update)
 
+    def set_palette(self, p: dict[str, str]) -> None:
+        self._palette = p
+        self.setIcon(_cycle_icon(_mix_color(QColor(p["text"]), QColor("#94A3B8"), self._fade)))
+        self.update()
+
     def set_fade(self, amount: float) -> None:
         self._fade = max(0.0, min(1.0, amount))
-        self.setIcon(_cycle_icon(_mix_color(QColor("#F8FAFC"), QColor("#94A3B8"), self._fade)))
+        self.setIcon(_cycle_icon(_mix_color(QColor(self._palette["text"]), QColor("#94A3B8"), self._fade)))
         self.update()
 
     def start_countdown(self, seconds: float) -> None:
@@ -655,11 +600,12 @@ class CycleButton(QPushButton):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor("#E0F2FE"))
+        ring = QColor(self._palette["ring"])
+        pen = QPen(ring)
         pen.setWidthF(2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         if self._fade > 0:
-            pen.setColor(_mix_color(QColor("#E0F2FE"), QColor("#94A3B8"), self._fade))
+            pen.setColor(_mix_color(ring, QColor("#94A3B8"), self._fade))
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         side = min(self.width(), self.height()) - 8
@@ -678,7 +624,12 @@ class PowerButton(QPushButton):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._fade = 0.0
+        self._palette = NEUTRAL
         self.setFixedSize(36, 36)
+
+    def set_palette(self, p: dict[str, str]) -> None:
+        self._palette = p
+        self.update()
 
     def set_fade(self, amount: float) -> None:
         self._fade = max(0.0, min(1.0, amount))
@@ -688,7 +639,7 @@ class PowerButton(QPushButton):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = _mix_color(QColor("#F8FAFC"), QColor("#94A3B8"), self._fade)
+        color = _palette_mix(self._palette, "text", self._fade)
         pen = QPen(color)
         pen.setWidthF(1.8)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -710,7 +661,12 @@ class ToolboxButton(QPushButton):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._fade = 0.0
+        self._palette = NEUTRAL
         self.setFixedSize(36, 36)
+
+    def set_palette(self, p: dict[str, str]) -> None:
+        self._palette = p
+        self.update()
 
     def set_fade(self, amount: float) -> None:
         self._fade = max(0.0, min(1.0, amount))
@@ -720,7 +676,7 @@ class ToolboxButton(QPushButton):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = _mix_color(QColor("#F8FAFC"), QColor("#94A3B8"), self._fade)
+        color = _palette_mix(self._palette, "text", self._fade)
         pen = QPen(color)
         pen.setWidthF(1.6)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -749,8 +705,13 @@ class StatusWell(QWidget):
         self._serial = False
         self._phase = 0.0
         self._fade = 0.0
+        self._palette = NEUTRAL
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
+
+    def set_palette(self, p: dict[str, str]) -> None:
+        self._palette = p
+        self.update()
 
     def set_fade(self, amount: float) -> None:
         self._fade = max(0.0, min(1.0, amount))
@@ -810,14 +771,14 @@ class StatusWell(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         bounds = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        border = _mix_color(QColor("#0EA5E9"), QColor("#94A3B8"), self._fade)
+        border = _palette_mix(self._palette, "accent", self._fade)
         painter.setPen(QPen(border, 1))
-        painter.setBrush(QColor("#1E293B"))
+        painter.setBrush(_palette_mix(self._palette, "surface", self._fade, "#334155"))
         painter.drawRoundedRect(bounds, 6, 6)
 
         text_bottom = 16 if self._show_track else 8
         text_rect = bounds.adjusted(8, 6, -8, -text_bottom)
-        painter.setPen(_mix_color(QColor("#F8FAFC"), QColor("#94A3B8"), self._fade))
+        painter.setPen(_palette_mix(self._palette, "text", self._fade))
         painter.setFont(self.font())
         painter.drawText(
             text_rect,
@@ -830,11 +791,11 @@ class StatusWell(QWidget):
 
         track = QRectF(10, self.height() - 14, max(1, self.width() - 20), 6)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#0F172A"))
+        painter.setBrush(_palette_mix(self._palette, "track", self._fade))
         painter.drawRoundedRect(track, 3, 3)
         fill_width = track.width() * self._display
         if fill_width > 0:
-            painter.setBrush(_mix_color(QColor("#0EA5E9"), QColor("#64748B"), self._fade))
+            painter.setBrush(_palette_mix(self._palette, "accent", self._fade, "#64748B"))
             painter.drawRoundedRect(
                 QRectF(track.x(), track.y(), fill_width, track.height()),
                 3,
@@ -845,7 +806,7 @@ class StatusWell(QWidget):
             span = max(0.04, end - start)
             band = min(0.08, span * 0.45)
             travel = start + self._phase * max(0.0, span - band)
-            painter.setBrush(_mix_color(QColor("#7DD3FC"), QColor("#94A3B8"), self._fade))
+            painter.setBrush(_palette_mix(self._palette, "sheen", self._fade))
             painter.drawRoundedRect(
                 QRectF(
                     track.x() + track.width() * travel,
@@ -857,7 +818,7 @@ class StatusWell(QWidget):
                 3,
             )
         if self._serial and fill_width > 0:
-            painter.setBrush(QColor("#F0F9FF"))
+            painter.setBrush(_palette_mix(self._palette, "cap", self._fade))
             cap = QRectF(track.x() + fill_width - 3, track.y(), 4, track.height())
             painter.drawRoundedRect(cap, 2, 2)
         painter.end()
@@ -877,6 +838,7 @@ class Dashboard(QMainWindow):
         on_open_tools: Optional[Callable[[], None]] = None,
         on_shutdown: Optional[Callable[[], None]] = None,
         on_arm_shutdown: Optional[Callable[[], None]] = None,
+        on_urgent_sync: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -889,12 +851,14 @@ class Dashboard(QMainWindow):
         self._on_open_tools = on_open_tools
         self._on_shutdown = on_shutdown
         self._on_arm_shutdown = on_arm_shutdown
+        self._on_urgent_sync = on_urgent_sync
         self._persist_enabled = False
         self._results: Optional[ResultsWindow] = None
         self._failures: Optional[ResultsWindow] = None
         self._failure_lines: list[str] = []
         self._active = False
         self._error = False
+        self._status_text = ""
         self._serial_queued = False
         self._job = ""
         self._autocycle_on = False
@@ -902,11 +866,14 @@ class Dashboard(QMainWindow):
         self._shutting_down = False
         self._arm_started = 0.0
         self._fade = 0.0
+        self._update_kind = "app"
         self._update_warning = False
         self._update_cancelled = False
         self._update_started = 0.0
+        self._urgent = False
         self._update_restore_enabled: Optional[list[bool]] = None
         self._quitting = False
+        self._palette = _startup_palette()
 
         self.setWindowTitle("TP DECK")
         self.setWindowFlags(
@@ -917,8 +884,10 @@ class Dashboard(QMainWindow):
         self._arm_timer.timeout.connect(self._tick_shutdown_arm)
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._tick_update_warning)
+        self._rainbow_timer = QTimer(self)
+        self._rainbow_timer.timeout.connect(self._tick_rainbow)
         self.setFixedSize(300, _DASHBOARD_HEIGHT)
-        self.setStyleSheet(THEME_QSS)
+        self.setStyleSheet(dashboard_qss(self._palette))
 
         self._build_ui()
         self._restore_position()
@@ -938,6 +907,7 @@ class Dashboard(QMainWindow):
         title_row.setSpacing(6)
         title_row.addStretch()
         self._light = ChassisLight()
+        self._light.set_click_handler(self._handle_urgent)
         title_row.addWidget(self._light)
         title_col = QVBoxLayout()
         title_col.setSpacing(0)
@@ -984,7 +954,7 @@ class Dashboard(QMainWindow):
         self.cycle_btn = CycleButton()
         self.cycle_btn.setObjectName("cycleBtn")
         self.cycle_btn.setFixedSize(36, 36)
-        self.cycle_btn.setIcon(_cycle_icon())
+        self.cycle_btn.setIcon(_cycle_icon(QColor(self._palette["text"])))
         self.cycle_btn.setIconSize(QSize(18, 18))
         self.cycle_btn.setToolTip("Auto-cycle eBay scrape (off)")
         self.cycle_btn.clicked.connect(self._handle_cycle)
@@ -1032,6 +1002,26 @@ class Dashboard(QMainWindow):
 
         layout.addLayout(row)
 
+    def palette(self) -> dict[str, str]:
+        """The palette this panel is themed with."""
+        return self._palette
+
+    def apply_palette(self, p: dict[str, str]) -> None:
+        """Re-theme the panel, its painted widgets, and any report windows."""
+        self._palette = p
+        self.setStyleSheet(dashboard_qss(p))
+        self._light.set_palette(p)
+        self._well.set_palette(p)
+        self.cycle_btn.set_palette(p)
+        self.power_btn.set_palette(p)
+        self.tools_btn.set_palette(p)
+        if self._fade > 0:
+            self._apply_fade(self._fade)
+        if self._results is not None:
+            self._results.set_palette(p)
+        if self._failures is not None:
+            self._failures.set_palette(p)
+
     def _restore_position(self) -> None:
         settings = load_settings()
         x = int(settings.get("window_x", 100))
@@ -1062,6 +1052,7 @@ class Dashboard(QMainWindow):
 
     def set_status(self, text: str) -> None:
         raw = str(text or "").strip()
+        self._status_text = raw
         self._well.set_text(_format_status(raw))
         self._well.setToolTip(raw)
         self._error = raw.startswith("Error")
@@ -1082,7 +1073,9 @@ class Dashboard(QMainWindow):
         return self._armed or self._shutting_down or self._update_warning
 
     def _apply_lamp(self) -> None:
-        if self._active or self._serial_queued:
+        if self._urgent:
+            state = "urgent"
+        elif self._active or self._serial_queued:
             state = "running"
         elif self._error:
             state = "error"
@@ -1091,6 +1084,57 @@ class Dashboard(QMainWindow):
         else:
             state = "idle"
         self._light.set_state(state)
+
+    def _handle_urgent(self) -> None:
+        """Hidden lamp click. Ignored while a job or an update warning is up."""
+        if self._active or self.input_blocked():
+            return
+        if self._on_urgent_sync:
+            self._on_urgent_sync()
+
+    def begin_urgent_sync(self) -> None:
+        """Purple lamp and a rainbow pulse on the three action buttons."""
+        self._urgent = True
+        self._paint_rainbow()
+        if not self._rainbow_timer.isActive():
+            self._rainbow_timer.start(500)
+        self._apply_lamp()
+
+    def end_urgent_sync(self) -> None:
+        """Restore the lamp and the action buttons, including a pulse already running."""
+        self._urgent = False
+        self._rainbow_timer.stop()
+        buttons = (self.execute_btn, self.pick_btn, self.batch_btn)
+        if self._update_warning:
+            self._paint_update_pulse(
+                (math.sin((time.monotonic() - self._update_started) * math.tau / 0.8) + 1.0)
+                / 2.0
+            )
+        elif self._fade > 0:
+            self._apply_fade(self._fade)
+        else:
+            for button in buttons:
+                button.setStyleSheet("")
+        self._apply_lamp()
+
+    def _tick_rainbow(self) -> None:
+        if not self._urgent:
+            return
+        self._paint_rainbow()
+
+    def _paint_rainbow(self) -> None:
+        color = random.choice(_RAINBOW)
+        rule = (
+            f"background-color: {color}; color: #0F172A; "
+            f"border: 1px solid {color}; font-weight: bold;"
+        )
+        qss = (
+            "QPushButton#executeBtn, QPushButton#pickBtn, QPushButton#batchBtn, "
+            "QPushButton#executeBtn:disabled, QPushButton#pickBtn:disabled, "
+            f"QPushButton#batchBtn:disabled {{ {rule} }}"
+        )
+        for button in (self.execute_btn, self.pick_btn, self.batch_btn):
+            button.setStyleSheet(qss)
 
     def begin_shutdown_arm(self) -> None:
         """Ease the panel to grey over 5 seconds, then start Safe Shutdown."""
@@ -1109,8 +1153,13 @@ class Dashboard(QMainWindow):
         self._arm_timer.stop()
         self._apply_fade(0.0)
 
-    def begin_update_warning(self) -> None:
-        """Pulse the action buttons between yellow and grey so an update can be cancelled."""
+    def begin_update_warning(self, kind: str = "app") -> None:
+        """Pulse the action buttons so an update can be cancelled.
+
+        App updates pulse yellow and grey. Chrome pulses green and grey.
+        Both alternate yellow and green.
+        """
+        self._update_kind = kind if kind in {"app", "chrome", "both"} else "app"
         buttons = (self.execute_btn, self.pick_btn, self.batch_btn)
         self._update_restore_enabled = [button.isEnabled() for button in buttons]
         self._update_cancelled = False
@@ -1153,17 +1202,27 @@ class Dashboard(QMainWindow):
         self._paint_update_pulse(amount)
 
     def _paint_update_pulse(self, amount: float) -> None:
-        bg = _mix_hex("#FBBF24", "#64748B", amount)
-        fg = _mix_hex("#0F172A", "#F8FAFC", amount)
-        rule = (
-            f"background-color: {bg}; color: {fg}; "
-            f"border: 1px solid {bg}; font-weight: bold;"
-        )
-        qss = (
-            "QPushButton#executeBtn, QPushButton#pickBtn, QPushButton#batchBtn, "
-            "QPushButton#executeBtn:disabled, QPushButton#pickBtn:disabled, "
-            f"QPushButton#batchBtn:disabled {{ {rule} }}"
-        )
+        kind = self._update_kind
+        if kind == "both":
+            elapsed = time.monotonic() - self._update_started
+            color = "#FBBF24" if int(elapsed / 0.5) % 2 == 0 else "#22C55E"
+            qss = pulse_qss(
+                color,
+                color,
+                self._palette["text"],
+                self._palette["on_accent"],
+                0.0,
+            )
+        elif kind == "chrome":
+            qss = pulse_qss(
+                "#22C55E",
+                self._palette["strong_border"],
+                self._palette["text"],
+                self._palette["on_accent"],
+                amount,
+            )
+        else:
+            qss = update_pulse_qss(self._palette, amount)
         for button in (self.execute_btn, self.pick_btn, self.batch_btn):
             button.setStyleSheet(qss)
 
@@ -1208,46 +1267,17 @@ class Dashboard(QMainWindow):
                 widget.setStyleSheet("")
             self.set_autocycle(self._autocycle_on)
             return
-        grey_text = _mix_hex("#F8FAFC", "#94A3B8", t)
-        self._title.setStyleSheet(
-            f"color: {_mix_hex('#0EA5E9', '#94A3B8', t)}; background: transparent; font-weight: bold;"
-        )
-        self._version.setStyleSheet(
-            f"color: {_mix_hex('#22D3EE', '#94A3B8', t)}; background: transparent; font-weight: bold;"
-        )
-        self._slow_label.setStyleSheet(
-            f"color: {_mix_hex('#FBBF24', '#94A3B8', t)}; background: transparent; font-weight: bold;"
-        )
-        blue_bg = _mix_hex("#0EA5E9", "#334155", t)
-        blue_text = _mix_hex("#0F172A", "#94A3B8", t)
-        action_qss = (
-            f"background-color: {blue_bg}; color: {blue_text}; "
-            f"border: 1px solid {blue_bg}; font-weight: bold;"
-        )
+        self._title.setStyleSheet(title_qss(self._palette, t))
+        self._version.setStyleSheet(version_qss(self._palette, t))
+        self._slow_label.setStyleSheet(slow_label_qss(self._palette, t))
+        action_qss_text = action_qss(self._palette, t)
         for button in (self.execute_btn, self.pick_btn, self.batch_btn):
-            button.setStyleSheet(action_qss)
-        self.settings_btn.setStyleSheet(
-            f"background-color: {_mix_hex('#1E293B', '#334155', t)}; "
-            f"color: {grey_text}; border: 1px solid {_mix_hex('#64748B', '#94A3B8', t)};"
-        )
-        self.tools_btn.setStyleSheet(
-            f"background-color: {_mix_hex('#1E293B', '#334155', t)}; "
-            f"border: 1px solid {_mix_hex('#64748B', '#94A3B8', t)};"
-        )
-        self.power_btn.setStyleSheet(
-            f"background-color: {_mix_hex('#1E293B', '#334155', t)}; "
-            f"border: 1px solid {_mix_hex('#64748B', '#94A3B8', t)};"
-        )
-        if self._autocycle_on:
-            cycle_bg = _mix_hex("#15803D", "#334155", t)
-            cycle_border = _mix_hex("#4ADE80", "#94A3B8", t)
-        else:
-            cycle_bg = _mix_hex("#B45309", "#334155", t)
-            cycle_border = _mix_hex("#F59E0B", "#94A3B8", t)
-        self.cycle_btn.setStyleSheet(
-            f"background-color: {cycle_bg}; color: {grey_text}; "
-            f"border: 1px solid {cycle_border};"
-        )
+            button.setStyleSheet(action_qss_text)
+        fade_rule = fade_qss(self._palette, t)
+        self.settings_btn.setStyleSheet(fade_rule)
+        self.tools_btn.setStyleSheet(fade_rule)
+        self.power_btn.setStyleSheet(fade_rule)
+        self.cycle_btn.setStyleSheet(cycle_qss(self._palette, t, self._autocycle_on))
 
     def set_run_progress(
         self,

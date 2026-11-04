@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from tp_deck.settings_manager import load_settings
+from tp_deck.theme import current_palette, uline_qss
 from tp_deck.uline_cache import (
     UlineItem,
     add_alias,
@@ -99,6 +100,12 @@ MODE_UNITS = "Units needed"
 MODE_SETS = "Sets (packs)"
 
 
+# Alias needs a short saved name, not just the word "Alias". Name needs a
+# product title. Both stay draggable; these are the floors.
+ALIAS_FLOOR = 180
+NAME_FLOOR = 260
+
+
 def _header_widths(headers: tuple[str, ...], char_caps: dict[int, int]) -> list[int]:
     """Column widths that let more columns show: fixed chars, header + buffer.
 
@@ -120,116 +127,36 @@ def _header_widths(headers: tuple[str, ...], char_caps: dict[int, int]) -> list[
     return widths
 
 
-_CHEVRON_UP = (Path(__file__).resolve().parent / "assets" / "chevron-up.png").as_posix()
-_CHEVRON_DOWN = (Path(__file__).resolve().parent / "assets" / "chevron-down.png").as_posix()
+def _size_columns(
+    header: QHeaderView,
+    headers: tuple[str, ...],
+    char_caps: dict[int, int],
+    floors: dict[int, int],
+    stretch: int,
+) -> None:
+    """Size each column, then let the name column take leftover space.
 
-DIALOG_QSS = """
-QDialog, QGroupBox { background-color: #0F172A; color: #F8FAFC; }
-QGroupBox { border: 1px solid #334155; border-radius: 4px; margin-top: 10px;
-            padding-top: 8px; font-weight: bold; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #0EA5E9; }
-QLabel { color: #F8FAFC; background: transparent; }
-QLabel#totalsLabel { color: #38BDF8; font-weight: bold; }
-QLabel#statusLabel { color: #94A3B8; }
-QLabel#errorLabel { color: #FCA5A5; font-weight: bold; }
-QLineEdit, QSpinBox, QComboBox {
-    background-color: #1E293B; color: #F8FAFC;
-    border: 1px solid #334155; border-radius: 3px; padding: 3px 6px;
-    font-family: Consolas, "Courier New", monospace;
-}
-QComboBox::drop-down { border: none; }
-QTabBar::tab {
-    background-color: #1E293B; color: #F8FAFC;
-    border: 1px solid #334155; padding: 6px 12px; margin-right: 4px;
-}
-QTabBar::tab:selected { background-color: #0EA5E9; color: #0F172A; font-weight: bold; }
-QTableWidget {
-    background-color: #0F172A; color: #F8FAFC;
-    gridline-color: #334155; border: 1px solid #334155; border-radius: 4px;
-    font-family: Consolas, "Courier New", monospace; font-size: 12px;
-}
-QHeaderView::section {
-    background-color: #1E293B; color: #38BDF8; border: 1px solid #334155;
-    font-weight: bold; padding: 4px;
-}
-QPushButton {
-    background-color: #1E293B; color: #F8FAFC;
-    border: 1px solid #0EA5E9; border-radius: 4px; padding: 6px 12px;
-}
-QPushButton:hover { background-color: #0EA5E9; color: #0F172A; }
-QPushButton#addBtn { background-color: #0EA5E9; color: #0F172A; font-weight: bold; }
-QPushButton#addBtn:hover { background-color: #38BDF8; }
-QPushButton:disabled { background-color: #334155; color: #94A3B8; border-color: #475569; }
-QPushButton#lazyBtn {
-    background-color: #B45309; color: #F8FAFC;
-    border: 1px solid #F59E0B; font-weight: bold;
-}
-QPushButton#lazyBtn:hover { background-color: #D97706; }
-QPushButton#lazyBtn:checked { background-color: #15803D; border-color: #4ADE80; }
-QPushButton#lazyBtn:checked:hover { background-color: #16A34A; }
-QComboBox { padding-right: 18px; }
-QComboBox::drop-down { border: none; width: 18px; }
-QComboBox::down-arrow {
-    image: url("__CHEVRON_DOWN__");
-    width: 9px; height: 6px;
-    border: none; background: transparent;
-}
-QComboBox QAbstractItemView {
-    background-color: #1E293B; color: #F8FAFC;
-    border: 1px solid #334155;
-    selection-background-color: #0EA5E9; selection-color: #0F172A;
-    outline: none;
-}
-QSpinBox::up-button, QSpinBox::down-button {
-    background-color: #334155; border: 1px solid #475569; width: 16px;
-}
-QSpinBox::up-arrow {
-    image: url("__CHEVRON_UP__");
-    width: 9px; height: 6px;
-    border: none; background: transparent;
-}
-QSpinBox::down-arrow {
-    image: url("__CHEVRON_DOWN__");
-    width: 9px; height: 6px;
-    border: none; background: transparent;
-}
-QMenu { background-color: #1E293B; color: #F8FAFC; border: 1px solid #334155; }
-QMenu::item { background: transparent; padding: 4px 22px; }
-QMenu::item:selected { background-color: #0EA5E9; color: #0F172A; }
-QMenu::separator { height: 1px; background: #334155; margin: 4px 8px; }
-QToolTip { background-color: #1E293B; color: #F8FAFC; border: 1px solid #334155; padding: 4px; }
-QMessageBox { background-color: #0F172A; }
-QAbstractItemView {
-    background-color: #0F172A; color: #F8FAFC;
-    selection-background-color: #0EA5E9; selection-color: #0F172A;
-}
-QAbstractItemView::item { background-color: #1E293B; color: #F8FAFC; }
-QTableWidget { selection-background-color: #0EA5E9; selection-color: #0F172A; }
-QTableWidget::item { background-color: #1E293B; color: #F8FAFC; }
-QTableWidget::item:selected { background-color: #0EA5E9; color: #0F172A; }
-QAbstractButton { background-color: #1E293B; }
-QHeaderView { background-color: #1E293B; }
-QScrollBar:vertical, QScrollBar:horizontal {
-    background-color: #1E293B; border: 1px solid #334155;
-    margin: 0;
-}
-QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-    background-color: #475569; border-radius: 3px;
-    min-width: 12px; min-height: 12px;
-}
-QScrollBar::add-line:vertical, QScrollBar::add-line:horizontal,
-QScrollBar::sub-line:vertical, QScrollBar::sub-line:horizontal {
-    width: 0; height: 0; background: transparent;
-}
-QScrollBar::add-page, QScrollBar::sub-page { background: #0F172A; }
-"""
-DIALOG_QSS = (
-    DIALOG_QSS
-    .replace("__CHEVRON_UP__", _CHEVRON_UP)
-    .replace("__CHEVRON_DOWN__", _CHEVRON_DOWN)
-)
+    Floors apply to Alias and Name. A drag that would hide the text is put
+    back, and the stretch column still cannot shrink under its floor.
+    """
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    widths = _header_widths(headers, char_caps)
+    for column, width in enumerate(widths):
+        header.resizeSection(column, max(width, floors.get(column, 0)))
+    header.setSectionResizeMode(stretch, QHeaderView.ResizeMode.Stretch)
+
+    def _hold_floor(column: int, _old: int, new: int) -> None:
+        floor = floors.get(column, 0)
+        if floor and new < floor:
+            header.blockSignals(True)
+            header.resizeSection(column, floor)
+            header.blockSignals(False)
+
+    header.sectionResized.connect(_hold_floor)
 
 
+def _dialog_qss() -> str:
+    return uline_qss(current_palette())
 def _int_text(value: str) -> Optional[int]:
     cleaned = str(value or "").replace("$", "").replace(",", "").strip()
     try:
@@ -253,7 +180,7 @@ class UlineItemEditor(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"Edit {item.item}")
         self.setMinimumWidth(430)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(_dialog_qss())
 
         form = QFormLayout(self)
         locked = QLineEdit(item.item)
@@ -339,8 +266,8 @@ class UlineDialog(QDialog):
 
         self.setWindowTitle("TP DECK — Uline Order Builder")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
-        self.setMinimumSize(820, 540)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setMinimumSize(1180, 540)
+        self.setStyleSheet(_dialog_qss())
 
         root = QVBoxLayout(self)
         root.setSpacing(8)
@@ -410,11 +337,13 @@ class UlineDialog(QDialog):
         self._order_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._order_table.verticalHeader().setVisible(False)
         header = self._order_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        for column, width in enumerate(_header_widths(ORDER_COLUMNS, {0: 7, 3: 6})):
-            if column != 2:
-                header.resizeSection(column, width)
+        _size_columns(
+            header,
+            ORDER_COLUMNS,
+            {0: 7, 3: 6},
+            {1: ALIAS_FLOOR, 2: NAME_FLOOR},
+            stretch=2,
+        )
         self._order_table.itemChanged.connect(self._on_order_changed)
         for column, tip in COLUMN_TIPS.items():
             header_item = self._order_table.horizontalHeaderItem(column)
@@ -954,11 +883,15 @@ class UlineDialog(QDialog):
         self._cache_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._cache_table.verticalHeader().setVisible(False)
         header = self._cache_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column, width in enumerate(_header_widths(CACHE_COLUMNS, {0: 7, 2: 6})):
-            if column != 1:
-                header.resizeSection(column, width)
+        alias_column = CACHE_COLUMNS.index("Aliases")
+        name_column = CACHE_COLUMNS.index("Name")
+        _size_columns(
+            header,
+            CACHE_COLUMNS,
+            {0: 7, 2: 6},
+            {name_column: NAME_FLOOR, alias_column: ALIAS_FLOOR},
+            stretch=name_column,
+        )
         layout.addWidget(self._cache_table)
 
         self._alias_input = QLineEdit()

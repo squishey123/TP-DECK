@@ -35,5 +35,8 @@ build/
 # Local scratch dumps / notes (not part of the app)
 Mailbox/
 
-# Portable Chromium download and its profiles (created on first launch)
+# Portable Chrome download (created on first launch)
 browser/
+
+# Chrome logins. An app or Chrome update must not copy or delete this folder.
+chrome-profiles/

@@ -48,15 +48,23 @@ def normalize_order_number(value: str) -> str:
     return "SO-" + _SO_PREFIX.sub("", text, count=1)
 
 
+def prepare_order_query(value: str) -> str:
+    """Trim the typed order and drop one leading # from a pasted store number."""
+    text = re.sub(r"\s+", "", (value or "").strip())
+    if text.startswith("#"):
+        text = text[1:]
+    return normalize_order_number(text)
+
+
 def classify_order(value: str) -> str:
     """Return service, ebay, or store.
 
     service: an SO number, with or without the SO- prefix (SO-12345, SO12345).
     ebay: a Seller Hub id such as 12-34567-89012.
-    store: digits only. A bare sales-order number looks the same, so that
-    search tries the store order column and then the sales-order column.
+    store: digits only. That search uses the PO column and does not also try SO #.
+    A single leading # is ignored, so #48559 is still a store order.
     """
-    text = re.sub(r"\s+", "", (value or "").strip())
+    text = prepare_order_query(value)
     if not text:
         return ""
     if _SO_PREFIX.match(text) or re.fullmatch(r"so\d+", text, flags=re.IGNORECASE):
@@ -897,8 +905,8 @@ async def _scroll_filter_into_view(page: Page, selector: str, col_id: str = "") 
     """Scroll sideways until a virtualized filter column is actually rendered."""
     if not selector:
         return
-    # nth-child follows whatever cells are rendered. Scrolling the grid
-    # changes which column is the 8th child, so stay at the left edge.
+    # nth-child follows whatever cells are rendered. The SO # fallback is the
+    # first filter, so it is only used with the grid scrolled home.
     if "nth-child" in selector:
         await _scroll_grid_home(page)
         return
@@ -1021,48 +1029,46 @@ async def _collect_filter_columns(page: Page) -> list[dict[str, Any]]:
     return columns
 
 
-def _best_service_column(columns: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    best: Optional[dict[str, Any]] = None
-    best_score = 0
+def _header_name(column: dict[str, Any]) -> str:
+    return re.sub(r"\s+", " ", str(column.get("name") or "")).strip()
+
+
+def _exact_po_columns(columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The floating filter whose header text is PO, not Direction or Ref."""
+    found: list[dict[str, Any]] = []
     for col in columns:
         if not col.get("hasInput") or not col.get("colId"):
             continue
-        score = service_column_score(str(col.get("name") or ""), str(col.get("colId")))
-        if score > best_score:
-            best = col
-            best_score = score
-    return best
+        if _header_name(col).casefold() == "po":
+            found.append(col)
+    return found
 
 
-def _marketplace_columns(columns: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
-    ranked: list[tuple[int, str, dict[str, Any]]] = []
+def _exact_service_column(columns: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """SO # by its header, or the SoNo column when the header is not rendered."""
+    by_id: Optional[dict[str, Any]] = None
     for col in columns:
         if not col.get("hasInput") or not col.get("colId"):
             continue
-        score = marketplace_column_score(
-            str(col.get("name") or ""),
-            str(col.get("colId")),
-            kind,
-        )
-        if score > 0:
-            ranked.append((score, str(col.get("colId")), col))
-    ranked.sort(key=lambda item: (-item[0], item[1]))
-    return [col for _score, _col_id, col in ranked[:3]]
+        if _header_name(col).casefold() in {"so #", "so#"}:
+            return col
+        if str(col.get("colId") or "").casefold() == "sono":
+            by_id = col
+    return by_id
 
 
 def _search_targets(
     kind: str,
     columns: list[dict[str, Any]],
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Columns to try, in order. Source Type is never included."""
-    service = _best_service_column(columns)
-    if kind == "ebay":
-        return [("marketplace", col) for col in _marketplace_columns(columns, "ebay")]
-    if kind == "store":
-        targets = [("marketplace", col) for col in _marketplace_columns(columns, "store")]
-        if service is not None:
-            targets.append(("service", service))
-        return targets
+    """Columns to try, in order. Source Type, Direction, and Ref are never included.
+
+    eBay ids and store numbers go only to the header named PO. Service orders
+    go only to SO #. A store number does not fall through to SO #.
+    """
+    if kind in {"ebay", "store"}:
+        return [("marketplace", col) for col in _exact_po_columns(columns)]
+    service = _exact_service_column(columns)
     if service is not None:
         return [("service", service)]
     return []
@@ -1111,7 +1117,7 @@ def _missing_column_message(kind: str, columns: list[dict[str, Any]]) -> str:
         )
     if kind == "store":
         return (
-            "Could not find a store-order column or the sales order number column. "
+            "Could not find the PO column. "
             f"Columns: {seen}."
         )
     return f"Could not find the sales order number column. Columns: {seen}."
@@ -1302,31 +1308,18 @@ def _configured_targets(
     kind: str,
     locators: dict[str, str],
 ) -> list[tuple[str, dict[str, Any]]]:
-    """SO # and PO boxes at the positions on the Razor sales-order grid.
+    """Fallback SO # box when the header scan did not render that column.
 
-    SO- numbers go in the first floating filter (SO #). eBay and store
-    order numbers go in the eighth (PO). A digits-only number can also be
-    a sales order, so that search tries PO and then SO #.
+    eBay and store numbers are not given a fixed column. The eighth filter
+    is Direction, so PO has to be found by its header.
     """
+    if kind != "service":
+        return []
     so = _configured_column(
         locators.get("sales_order_filter", ""),
         "SO #",
-        "idx-so",
+        "SoNo",
     )
-    po = _configured_column(
-        locators.get("sales_order_external_filter", ""),
-        "PO",
-        "idx-po",
-    )
-    if kind == "ebay":
-        return [("marketplace", po)] if po else []
-    if kind == "store":
-        targets: list[tuple[str, dict[str, Any]]] = []
-        if po:
-            targets.append(("marketplace", po))
-        if so:
-            targets.append(("service", so))
-        return targets
     if so:
         return [("service", so)]
     return []
@@ -1360,12 +1353,12 @@ async def _filter_order_list(
     submit_key: str,
 ) -> tuple[Any, str]:
     """Filter the list and return the matching row plus service or marketplace."""
+    order_number = prepare_order_query(order_number)
     kind = classify_order(order_number)
     columns = await _collect_filter_columns(page)
-    targets = _merge_targets(
-        _configured_targets(kind, locators),
-        _search_targets(kind, columns),
-    )
+    discovered = _search_targets(kind, columns)
+    fallback = [] if discovered else _configured_targets(kind, locators)
+    targets = _merge_targets(discovered, fallback)
     if not targets:
         raise RuntimeError(_missing_column_message(kind, columns))
     logger.info(
@@ -1551,7 +1544,7 @@ async def prepare_sales_order(
     locators = load_locators()
     detail_pattern = locators["sales_order_detail_pattern"]
     list_pattern = locators["sales_orders_url_pattern"]
-    typed = normalize_order_number(order_number)
+    typed = prepare_order_query(order_number)
     kind = classify_order(typed)
     details = _detail_pages(browser, detail_pattern, list_pattern)
     keeper: Optional[Page] = None

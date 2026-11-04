@@ -16,6 +16,7 @@ DEFAULTS: dict[str, Any] = {
     "ebay_port": 9222,
     "erp_port": 9223,
     "chrome_version": "",
+    "chrome_profile_dir": "",
     "window_x": 100,
     "window_y": 100,
     "emergency_hotkey": "pause",
@@ -47,6 +48,7 @@ DEFAULTS: dict[str, Any] = {
     "uline_url_pattern": "uline.com",
     "uline_lookup_timeout_ms": 20000,
     "uline_export_dir": "",
+    "theme": "neutral",
 }
 
 

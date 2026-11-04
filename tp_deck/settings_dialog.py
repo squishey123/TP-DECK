@@ -14,12 +14,16 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGroupBox,
+    QComboBox,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
     QRadioButton,
     QSpinBox,
+    QTabWidget,
+    QTextBrowser,
     QToolButton,
     QToolTip,
     QVBoxLayout,
@@ -30,6 +34,14 @@ import tp_deck.runtime_state as runtime_state
 from tp_deck.duration import cache_ttl_label, parse_duration
 from tp_deck.settings_manager import load_settings, update_settings
 from tp_deck.sku_override_dialog import SkuOverrideEditor
+from tp_deck.theme import (
+    THEME_KEYS,
+    THEME_LABELS,
+    dialog_qss,
+    normalize_theme,
+    palette_for,
+    set_theme,
+)
 from tp_deck.uline_order import export_dir
 
 logger = logging.getLogger("tpdeck")
@@ -43,111 +55,6 @@ def _clamp_int(value: object, low: int, high: int) -> int:
     except ValueError:
         return low
     return max(low, min(high, number))
-
-DIALOG_QSS = """
-QDialog, QGroupBox {
-    background-color: #0F172A;
-    color: #F8FAFC;
-}
-QGroupBox {
-    border: 1px solid #334155;
-    border-radius: 4px;
-    margin-top: 10px;
-    padding-top: 8px;
-    font-weight: bold;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 4px;
-    color: #0EA5E9;
-}
-QLabel, QRadioButton, QCheckBox {
-    color: #F8FAFC;
-    background: transparent;
-}
-QRadioButton, QCheckBox {
-    spacing: 10px;
-    padding: 6px 8px;
-    border-radius: 4px;
-}
-QRadioButton:hover, QCheckBox:hover {
-    background-color: #1E293B;
-}
-QRadioButton:checked {
-    color: #38BDF8;
-    font-weight: bold;
-    background-color: #1E293B;
-    border: 1px solid #0EA5E9;
-}
-QRadioButton::indicator, QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-    border: 2px solid #64748B;
-    background-color: #0F172A;
-}
-QRadioButton::indicator {
-    border-radius: 9px;
-}
-QCheckBox::indicator {
-    border-radius: 3px;
-}
-QRadioButton::indicator:checked {
-    border: 2px solid #0EA5E9;
-    background-color: #0EA5E9;
-}
-QCheckBox::indicator:checked {
-    border: 2px solid #0EA5E9;
-    background-color: #0EA5E9;
-}
-QSpinBox, QLineEdit {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #334155;
-    border-radius: 3px;
-    padding: 3px 6px;
-}
-QWidget#infoHost {
-    background: transparent;
-}
-QToolButton#infoBtn {
-    background-color: transparent;
-    color: #0EA5E9;
-    border: 1px solid #0EA5E9;
-    border-radius: 9px;
-    min-width: 18px;
-    max-width: 18px;
-    min-height: 18px;
-    max-height: 18px;
-    padding: 0px;
-    font-size: 11px;
-    font-weight: bold;
-    font-style: italic;
-}
-QToolButton#infoBtn:hover {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-QPushButton {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #0EA5E9;
-    border-radius: 4px;
-    padding: 6px 14px;
-}
-QPushButton:hover {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-QPushButton#saveBtn {
-    background-color: #0EA5E9;
-    color: #0F172A;
-    font-weight: bold;
-}
-QPushButton#saveBtn:hover {
-    background-color: #38BDF8;
-}
-"""
 
 def _tip(text: str) -> str:
     body = html.escape(text).replace("\n", "<br>")
@@ -206,7 +113,8 @@ class SettingsDialog(QDialog):
         self.setWindowFlags(
             self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setStyleSheet(DIALOG_QSS)
+        self._palette = palette_for(load_settings().get("theme", "neutral"))
+        self.setStyleSheet(dialog_qss(self._palette))
 
         self._build_ui()
         self._load_into_form()
@@ -214,6 +122,14 @@ class SettingsDialog(QDialog):
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
+
+        self._tabs = QTabWidget()
+        self._tabs.setDocumentMode(True)
+
+        first_tab = QWidget()
+        first_layout = QVBoxLayout(first_tab)
+        first_layout.setContentsMargins(4, 8, 4, 4)
+        first_layout.setSpacing(10)
 
         mode_box = QGroupBox("Browser Connection Mode")
         mode_layout = QVBoxLayout(mode_box)
@@ -238,7 +154,7 @@ class SettingsDialog(QDialog):
             )
         )
         self.single_radio.toggled.connect(self._on_mode_toggled)
-        layout.addWidget(mode_box)
+        first_layout.addWidget(mode_box)
 
         ports_box = QGroupBox("Scrape & Automation")
         ports_form = QFormLayout(ports_box)
@@ -428,7 +344,14 @@ class SettingsDialog(QDialog):
                 "and the 0.5s serial confirm into 5s.",
             ),
         )
-        layout.addWidget(ports_box)
+        first_layout.addWidget(ports_box)
+        first_layout.addStretch(1)
+        self._tabs.addTab(first_tab, "Connection & Scrape")
+
+        uline_tab = QWidget()
+        uline_tab_layout = QVBoxLayout(uline_tab)
+        uline_tab_layout.setContentsMargins(4, 8, 4, 4)
+        uline_tab_layout.setSpacing(10)
 
         uline_box = QGroupBox("Uline Order Builder")
         uline_form = QFormLayout(uline_box)
@@ -478,7 +401,90 @@ class SettingsDialog(QDialog):
             "Export folder:",
             _with_info(export_host, _export_dir_tip()),
         )
-        layout.addWidget(uline_box)
+        uline_tab_layout.addWidget(uline_box)
+        uline_tab_layout.addStretch(1)
+        self._tabs.addTab(uline_tab, "Uline Builder")
+
+        appearance_tab = QWidget()
+        appearance_layout = QVBoxLayout(appearance_tab)
+        appearance_layout.setContentsMargins(4, 8, 4, 4)
+        appearance_layout.setSpacing(10)
+
+        theme_box = QGroupBox("Theme")
+        theme_form = QFormLayout(theme_box)
+        self.theme_combo = QComboBox()
+        for key in THEME_KEYS:
+            self.theme_combo.addItem(THEME_LABELS[key], key)
+        swatch_host = QWidget()
+        swatch_host.setObjectName("infoHost")
+        swatch_row = QHBoxLayout(swatch_host)
+        swatch_row.setContentsMargins(0, 0, 0, 0)
+        swatch_row.setSpacing(6)
+        self.theme_swatch = QLabel()
+        self.theme_swatch.setFixedSize(20, 20)
+        swatch_row.addWidget(self.theme_swatch)
+        swatch_row.addWidget(self.theme_combo, 1)
+        theme_form.addRow(
+            "Color wheel:",
+            _with_info(
+                swatch_host,
+                "One palette per color on the wheel. The accent, backgrounds, "
+                "borders, buttons, and toggles are all derived from that one "
+                "color so nothing clashes: a red theme has no amber cycle "
+                "button, a yellow theme has no cyan highlights. Save applies "
+                "the theme to every TP DECK window right away.",
+            ),
+        )
+        self.theme_combo.currentData.connect(self._on_theme_preview)
+        appearance_layout.addWidget(theme_box)
+
+        preview_box = QGroupBox("Palette preview")
+        preview_form = QFormLayout(preview_box)
+        self.preview_title = QLabel("Scrape eBay Orders")
+        self.preview_title.setObjectName("previewTitle")
+        preview_form.addRow("Title text:", _with_info(
+            self.preview_title,
+            "Window titles use the bright accent of the palette.",
+        ))
+        self.preview_version = QLabel("v1.0 · build 250")
+        self.preview_version.setObjectName("previewVersion")
+        preview_form.addRow("Version text:", _with_info(
+            self.preview_version,
+            "The version line uses the softer accent next on the wheel.",
+        ))
+        self.preview_cycle_off = QPushButton("Cycle off")
+        self.preview_cycle_off.setObjectName("previewCycleOff")
+        preview_form.addRow("Cycle button off:", _with_info(
+            self.preview_cycle_off,
+            "Off is a muted tone of the theme color, never amber on yellow "
+            "themes. On is a green that sits next to the wheel color.",
+        ))
+        self.preview_cycle_on = QPushButton("Cycle on")
+        self.preview_cycle_on.setObjectName("previewCycleOn")
+        preview_form.addRow("Cycle button on:", _with_info(
+            self.preview_cycle_on,
+            "Green toggles sit beside every wheel color, so they stay readable "
+            "on red, orange, and yellow themes too.",
+        ))
+        self.preview_stop = QPushButton("Stop")
+        self.preview_stop.setObjectName("previewStop")
+        preview_form.addRow("Stop button:", _with_info(
+            self.preview_stop,
+            "The stop button is a dark alert color. On a red theme it shifts "
+            "so it does not match the accent.",
+        ))
+        self.preview_results = QLabel("Results window: light paper")
+        self.preview_results.setObjectName("previewResults")
+        preview_form.addRow("Results popup:", _with_info(
+            self.preview_results,
+            "The results popup stays a light paper surface tinted with the "
+            "theme color so copied text is easy to read.",
+        ))
+        appearance_layout.addWidget(preview_box)
+
+        self._tabs.addTab(appearance_tab, "Appearance")
+
+        layout.addWidget(self._tabs, 1)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
@@ -556,8 +562,46 @@ class SettingsDialog(QDialog):
             _clamp_int(settings.get("uline_lookup_timeout_ms", 20000), 1000, 120000)
         )
         self.uline_export_edit.setText(str(settings.get("uline_export_dir", "")))
+        theme_key = normalize_theme(settings.get("theme", "neutral"))
+        index = self.theme_combo.findData(theme_key)
+        if index < 0:
+            index = 0
+        self.theme_combo.setCurrentIndex(index)
+        self._paint_preview(palette_for(theme_key))
         self._on_mode_toggled()
         self._on_refresh_hold_toggled()
+
+    def _paint_preview(self, p: dict[str, str]) -> None:
+        """Paint the Appearance tab preview widgets with one palette."""
+        self.theme_swatch.setStyleSheet(
+            f"background-color: {p['accent']}; border: 1px solid {p['text']};"
+        )
+        self.preview_title.setStyleSheet(
+            f"color: {p['title']}; background: transparent; font-weight: bold;"
+        )
+        self.preview_version.setStyleSheet(
+            f"color: {p['version']}; background: transparent;"
+        )
+        self.preview_cycle_off.setStyleSheet(
+            f"background-color: {p['cycle_off_bg']}; color: {p['text']}; "
+            f"border: 1px solid {p['cycle_off_border']}; border-radius: 4px; padding: 6px 12px;"
+        )
+        self.preview_cycle_on.setStyleSheet(
+            f"background-color: {p['success_bg']}; color: {p['text']}; "
+            f"border: 1px solid {p['success_border']}; border-radius: 4px; padding: 6px 12px;"
+        )
+        self.preview_stop.setStyleSheet(
+            f"background-color: {p['danger_bg']}; color: {p['danger_text']}; "
+            f"border: 1px solid {p['danger_text']}; border-radius: 4px; padding: 6px 12px;"
+        )
+        self.preview_results.setStyleSheet(
+            f"background-color: {p['results_bg']}; color: {p['results_text']}; "
+            f"border: 1px solid {p['results_border']}; border-radius: 4px; padding: 6px 12px;"
+        )
+
+    def _on_theme_preview(self, key: object) -> None:
+        """Show the picked palette on the swatch and preview as the combo changes."""
+        self._paint_preview(palette_for(str(key)))
 
     def _on_mode_toggled(self) -> None:
         dual = self.dual_radio.isChecked()
@@ -580,7 +624,7 @@ class SettingsDialog(QDialog):
     def _save(self) -> None:
         ttl_text = self.cache_ttl_edit.text().strip()
         try:
-            ttl_seconds = parse_duration(ttl_text)
+            parse_duration(ttl_text)
         except ValueError as exc:
             QMessageBox.warning(self, "TP DECK", str(exc))
             return
@@ -595,7 +639,6 @@ class SettingsDialog(QDialog):
             wait_timeout_ms=self.timeout_spin.value(),
             cache_enabled=self.cache_enabled_check.isChecked(),
             cache_ttl=ttl_text,
-            cache_ttl_hours=ttl_seconds / 3600.0,
             slow_razor_multiplier=self.slow_razor_spin.value(),
             ebay_refresh_hold_enabled=self.refresh_hold_check.isChecked(),
             ebay_refresh_hold_minutes=self.refresh_hold_spin.value(),
@@ -612,14 +655,20 @@ class SettingsDialog(QDialog):
             uline_export_dir=self.uline_export_edit.text().strip(),
         )
         runtime_state.slow_razor_enabled = self.slow_razor_check.isChecked()
+        theme_key = str(self.theme_combo.currentData() or "neutral")
+        palette = set_theme(theme_key)
         parent = self.parent()
-        if parent is not None and hasattr(parent, "set_slow_razor"):
-            parent.set_slow_razor(runtime_state.slow_razor_enabled)
+        if parent is not None:
+            if hasattr(parent, "set_slow_razor"):
+                parent.set_slow_razor(runtime_state.slow_razor_enabled)
+            if hasattr(parent, "apply_palette"):
+                parent.apply_palette(palette)
         logger.info(
-            "Settings saved: mode=%s ebay_port=%s erp_port=%s slow_razor=%s",
+            "Settings saved: mode=%s ebay_port=%s erp_port=%s slow_razor=%s theme=%s",
             mode,
             self.ebay_port_spin.value(),
             self.erp_port_spin.value(),
             runtime_state.slow_razor_enabled,
+            theme_key,
         )
         self.accept()

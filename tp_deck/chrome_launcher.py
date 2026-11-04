@@ -1,40 +1,44 @@
-"""Start the portable Chromium debug browser when TP DECK opens.
+"""Start the portable Chrome debug browser when TP DECK opens.
 
-Playwright still only attaches with connect_over_cdp. This module installs
-Playwright's Chromium under browser/ and starts it as its own Windows process.
+Playwright still only attaches with connect_over_cdp. Chrome for Testing
+lives under browser/chrome-<version>/. Logins live in chrome-profiles/,
+outside that folder, so an update can replace the binary without them.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Optional
-
-from playwright._impl._driver import compute_driver_executable, get_driver_env
 
 from tp_deck.settings_manager import load_settings, update_settings
 
 logger = logging.getLogger("tpdeck")
 
+CFT_STABLE_URL = (
+    "https://googlechromelabs.github.io/chrome-for-testing/"
+    "last-known-good-versions-with-downloads.json"
+)
+
 _PORT_READY_TIMEOUT_S = 45.0
 _MINIMIZE_FOR_S = 4.0
 _MINIMIZE_INTERVAL_S = 0.25
-_INSTALL_TIMEOUT_S = 900.0
 
 _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _SW_SHOWMINNOACTIVE = 7
 _TH32CS_SNAPPROCESS = 0x00000002
-
-_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_PERCENT = re.compile(r"(\d{1,3})%")
 
 
 def app_root() -> Path:
@@ -43,8 +47,241 @@ def app_root() -> Path:
 
 
 def browser_dir() -> Path:
-    """Portable Chromium install and profiles, next to the app."""
+    """Portable Chrome binaries, next to the app. Profiles do not live here."""
     return app_root() / "browser"
+
+
+def profiles_root() -> Path:
+    """Permanent Chrome user-data directories, outside the binary install."""
+    return app_root() / "chrome-profiles"
+
+
+def _is_version_dir(name: str) -> bool:
+    """True for chrome-131.0.x or chromium-1148, not for chrome-profiles."""
+    if name.startswith("chromium-"):
+        return True
+    if name.startswith("chrome-") and len(name) > len("chrome-"):
+        return name[len("chrome-")].isdigit()
+    return False
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def profile_is_inside_browser_tree(path: Path) -> bool:
+    """True when this folder would be replaced with a Chrome binary."""
+    resolved = path.resolve()
+    if _is_relative_to(resolved, browser_dir()):
+        return True
+    for parent in (resolved, *resolved.parents):
+        if _is_version_dir(parent.name):
+            return True
+    return False
+
+
+def profiles_block_chrome_update(profiles: list[Path], delete_dirs: list[Path]) -> bool:
+    """Refuse a binary replace while a profile sits in the install or a delete target."""
+    for profile in profiles:
+        if not profile.exists():
+            continue
+        if profile_is_inside_browser_tree(profile):
+            return True
+        resolved = profile.resolve()
+        for directory in delete_dirs:
+            if _is_relative_to(resolved, directory) or resolved == directory.resolve():
+                return True
+    return False
+
+
+def deletion_targets_are_safe(targets: list[Path], profiles: list[Path]) -> bool:
+    """A Chrome update may delete only versioned binary folders."""
+    if profiles_block_chrome_update(profiles, targets):
+        return False
+    for target in targets:
+        if not target.is_dir() or not _is_version_dir(target.name):
+            return False
+    return True
+
+
+def _cookies_file(root: Path) -> Optional[Path]:
+    for relative in (
+        Path("Default") / "Network" / "Cookies",
+        Path("Default") / "Cookies",
+    ):
+        candidate = root / relative
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def profile_copy_matches(src: Path, dest: Path) -> bool:
+    """Local State is present, and Cookies matches in size when the source has it.
+
+    A lock or journal file that differs does not fail the copy.
+    """
+    if not (src / "Local State").is_file() or not (dest / "Local State").is_file():
+        return False
+    src_cookies = _cookies_file(src)
+    if src_cookies is None:
+        return True
+    dest_cookies = dest / src_cookies.relative_to(src)
+    return dest_cookies.is_file() and dest_cookies.stat().st_size == src_cookies.stat().st_size
+
+
+def migrate_one_profile(src: Path, dest: Path) -> str:
+    """Copy one profile out of the browser install.
+
+    Returns kept, copied, missing, or failed. An existing destination is not
+    touched. A failed copy leaves the source in place and removes a partial dest.
+    """
+    if dest.exists():
+        if src.exists() and profile_copy_matches(src, dest):
+            try:
+                shutil.rmtree(src)
+            except OSError:
+                logger.exception("Copied Chrome profile but could not remove %s", src)
+        return "kept"
+    if not src.exists():
+        return "missing"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dest)
+    except OSError:
+        logger.exception("Could not copy Chrome profile %s", src)
+        shutil.rmtree(dest, ignore_errors=True)
+        return "failed"
+    if not profile_copy_matches(src, dest):
+        shutil.rmtree(dest, ignore_errors=True)
+        logger.error("Chrome profile copy %s did not match; the original was kept", src)
+        return "failed"
+    try:
+        shutil.rmtree(src)
+    except OSError:
+        logger.exception("Copied Chrome profile but could not remove %s", src)
+        return "failed"
+    return "copied"
+
+
+def migrate_profiles() -> bool:
+    """Move browser/profile and browser/profile-erp into chrome-profiles.
+
+    False means a copy failed, so a Chrome download must not run.
+    """
+    ready = True
+    for name in ("profile", "profile-erp"):
+        result = migrate_one_profile(browser_dir() / name, profiles_root() / name)
+        if result == "failed":
+            ready = False
+    if ready:
+        remember_profile_root()
+    return ready
+
+
+def remember_profile_root() -> None:
+    """Store the absolute profile folder. Settings survive an app update."""
+    root = str(profiles_root().resolve())
+    if str(load_settings().get("chrome_profile_dir") or "") == root:
+        return
+    update_settings(chrome_profile_dir=root)
+    logger.info("Chrome profiles are in %s", root)
+
+
+def resolve_profile_dir(settings: dict[str, Any], name: str) -> Path:
+    """The profile to launch. An empty folder is used only when none exists yet."""
+    saved = str(settings.get("chrome_profile_dir") or "").strip()
+    candidates: list[Path] = []
+    if saved:
+        candidates.append(Path(saved) / name)
+    candidates.append(profiles_root() / name)
+    candidates.append(browser_dir() / name)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    parent = Path(saved) if saved else profiles_root()
+    return parent / name
+
+
+def _chrome_version_tuple(text: str) -> Optional[tuple[int, ...]]:
+    from tp_deck.updater import parse_version
+
+    parts = parse_version(text)
+    if len(parts) < 3:
+        return None
+    return parts
+
+
+def chrome_update_needed(installed: str, stable: str) -> bool:
+    """True when the installed Chrome is missing or older than stable.
+
+    A single Playwright revision number is not a Chrome version, so it counts
+    as not installed.
+    """
+    remote = _chrome_version_tuple(stable)
+    if remote is None:
+        return False
+    current = _chrome_version_tuple(installed)
+    if current is None:
+        return True
+    return remote > current
+
+
+def stable_chrome_download(payload: dict[str, Any]) -> tuple[str, str]:
+    """Stable Chrome for Testing, Windows 64-bit. Other channels are ignored."""
+    channels = payload.get("channels") if isinstance(payload, dict) else None
+    stable = channels.get("Stable") if isinstance(channels, dict) else None
+    if not isinstance(stable, dict):
+        raise RuntimeError("Chrome for Testing did not list a stable build.")
+    version = str(stable.get("version") or "").strip()
+    downloads = stable.get("downloads") if isinstance(stable.get("downloads"), dict) else {}
+    chrome = downloads.get("chrome") if isinstance(downloads, dict) else None
+    if not version or not isinstance(chrome, list):
+        raise RuntimeError("Chrome for Testing did not list a stable build.")
+    for item in chrome:
+        if isinstance(item, dict) and item.get("platform") == "win64":
+            url = str(item.get("url") or "").strip()
+            if url:
+                return version, url
+    raise RuntimeError("Chrome for Testing stable has no Windows 64-bit build.")
+
+
+def exe_product_version(path: Optional[Path]) -> str:
+    """Product version from the executable, or blank when it cannot be read."""
+    if path is None or not path.is_file() or sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        version = ctypes.windll.version
+        size = version.GetFileVersionInfoSizeW(str(path), None)
+        if not size:
+            return ""
+        buf = ctypes.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(str(path), 0, size, buf):
+            return ""
+        ptr = ctypes.c_void_p()
+        length = wintypes.UINT()
+        if not version.VerQueryValueW(
+            buf,
+            "\\VarFileInfo\\Translation",
+            ctypes.byref(ptr),
+            ctypes.byref(length),
+        ):
+            return ""
+        pair = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ushort * 2)).contents
+        key = f"\\StringFileInfo\\{pair[0]:04x}{pair[1]:04x}\\ProductVersion"
+        if not version.VerQueryValueW(buf, key, ctypes.byref(ptr), ctypes.byref(length)):
+            return ""
+        raw = ctypes.wstring_at(ptr, length.value)
+    except (OSError, AttributeError, ValueError):
+        return ""
+    match = re.search(r"\d+(?:\.\d+){2,}", raw or "")
+    return match.group(0) if match else ""
 
 
 def find_chromium_executable(root: Optional[Path] = None) -> Optional[Path]:
@@ -68,23 +305,61 @@ def find_chromium_executable(root: Optional[Path] = None) -> Optional[Path]:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def _revision_of(exe: Path) -> str:
-    name = exe.parent.parent.name
-    prefix = "chromium-"
-    if name.startswith(prefix):
-        return name[len(prefix) :]
-    return name
+def find_installed_chrome(root: Optional[Path] = None) -> Optional[Path]:
+    """chrome-<version>/chrome.exe, or an older Playwright chromium build."""
+    base = browser_dir() if root is None else root
+    if not base.is_dir():
+        return None
+    candidates = [path for path in base.glob("chrome-*/chrome.exe") if path.is_file()]
+    if candidates:
+        return max(
+            candidates,
+            key=lambda path: _chrome_version_tuple(path.parent.name[len("chrome-") :])
+            or (0,),
+        )
+    return find_chromium_executable(base)
+
+
+def old_version_dirs(keep: Optional[Path] = None, root: Optional[Path] = None) -> list[Path]:
+    """Versioned binary folders. The folder that holds the new chrome.exe stays."""
+    base = browser_dir() if root is None else root
+    if not base.is_dir():
+        return []
+    keep_resolved = keep.resolve() if keep is not None else None
+    found: list[Path] = []
+    for child in base.iterdir():
+        if not child.is_dir() or not _is_version_dir(child.name):
+            continue
+        if keep_resolved is not None and child.resolve() == keep_resolved:
+            continue
+        found.append(child)
+    return found
+
+
+def remove_old_browsers(keep: Path, profiles: list[Path], root: Optional[Path] = None) -> bool:
+    """Delete old version folders only. Returns False when that would be unsafe."""
+    targets = old_version_dirs(keep, root)
+    if not deletion_targets_are_safe(targets, profiles):
+        logger.warning("Chrome update left old binaries in place to protect the profiles")
+        return False
+    for target in targets:
+        shutil.rmtree(target)
+        logger.info("Removed old Chrome build %s", target)
+    return True
 
 
 def _launch_targets(settings: dict[str, Any]) -> list[tuple[int, Path]]:
-    root = browser_dir()
     ebay_port = int(settings.get("ebay_port", 9222))
-    targets = [(ebay_port, root / "profile")]
+    targets = [(ebay_port, resolve_profile_dir(settings, "profile"))]
     if str(settings.get("mode", "single")).lower() == "dual":
         erp_port = int(settings.get("erp_port", 9223))
         if erp_port != ebay_port:
-            targets.append((erp_port, root / "profile-erp"))
+            targets.append((erp_port, resolve_profile_dir(settings, "profile-erp")))
     return targets
+
+
+def launch_ports(settings: dict[str, Any]) -> list[int]:
+    return [port for port, _profile in _launch_targets(settings)]
 
 
 def _debug_port_ready(port: int) -> bool:
@@ -309,26 +584,6 @@ async def close_listening_browsers(ports: list[int]) -> None:
     )
 
 
-def _clip(text: str, limit: int = 240) -> str:
-    clean = " ".join(text.split())
-    if len(clean) <= limit:
-        return clean
-    return clean[: limit - 1] + "…"
-
-
-def _remember_revision(exe: Optional[Path]) -> None:
-    if exe is None:
-        return
-    revision = _revision_of(exe)
-    if not revision:
-        return
-    current = str(load_settings().get("chrome_version", ""))
-    if current == revision:
-        return
-    update_settings(chrome_version=revision)
-    logger.info("Recorded Chromium revision %s", revision)
-
-
 def _spawn_chromium(exe: Path, port: int, profile: Path) -> subprocess.Popen[bytes]:
     profile.mkdir(parents=True, exist_ok=True)
     args = [
@@ -386,101 +641,6 @@ async def _wait_for_port(port: int, proc: subprocess.Popen[bytes]) -> None:
     raise RuntimeError(
         f"Chromium did not open debug port {port}. Close anything already using that port and open TP DECK again."
     )
-
-
-def _note_install_line(
-    piece: str,
-    last_line: str,
-    last_status: str,
-    on_status: Callable[[str], None],
-) -> tuple[str, str]:
-    clean = " ".join(_ANSI.sub("", piece).split())
-    if not clean:
-        return last_line, last_status
-    displayed = last_status
-    match = _PERCENT.search(clean)
-    if match:
-        displayed = f"Downloading Chromium — {match.group(1)}%"
-    elif "Download" in clean or "Chromium" in clean or "Chrome" in clean:
-        displayed = "Downloading Chromium"
-    if displayed != last_status:
-        on_status(displayed)
-    return clean, displayed
-
-
-async def _stream_install_output(
-    stream: asyncio.StreamReader,
-    on_status: Callable[[str], None],
-) -> str:
-    last_line = ""
-    last_status = ""
-    pending = ""
-    while True:
-        chunk = await stream.read(1024)
-        if not chunk:
-            break
-        pending += chunk.decode("utf-8", errors="replace")
-        pieces = re.split(r"[\r\n]+", pending)
-        pending = pieces.pop() if pieces else ""
-        for piece in pieces:
-            last_line, last_status = _note_install_line(
-                piece, last_line, last_status, on_status
-            )
-        if "%" in pending:
-            last_line, last_status = _note_install_line(
-                pending, last_line, last_status, on_status
-            )
-    if pending.strip():
-        last_line, _last_status = _note_install_line(
-            pending, last_line, last_status, on_status
-        )
-    return last_line
-
-
-async def _install_chromium(on_status: Callable[[str], None]) -> Path:
-    on_status("Downloading Chromium")
-    root = browser_dir()
-    root.mkdir(parents=True, exist_ok=True)
-    driver_executable, driver_cli = compute_driver_executable()
-    env = get_driver_env()
-    env["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
-    logger.info("Installing Playwright Chromium into %s", root)
-    proc = await asyncio.create_subprocess_exec(
-        driver_executable,
-        driver_cli,
-        "install",
-        "chromium",
-        "--no-shell",
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    if proc.stdout is None:
-        raise RuntimeError("Could not install Chromium (no installer output).")
-
-    try:
-        tail = await asyncio.wait_for(
-            _stream_install_output(proc.stdout, on_status),
-            timeout=_INSTALL_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError("Chromium download timed out.") from None
-
-    code = await proc.wait()
-    exe = find_chromium_executable(root)
-    if exe is None:
-        detail = _clip(tail) if tail else f"exit code {code}"
-        raise RuntimeError(f"Could not install Chromium. {detail}")
-    if code != 0:
-        logger.warning(
-            "Chromium install exited %s after chrome.exe was written: %s",
-            code,
-            _clip(tail),
-        )
-    logger.info("Chromium installed at %s", exe)
-    return exe
 
 
 def _process_tree(root_pid: int) -> set[int]:
@@ -679,6 +839,162 @@ async def _keep_minimized(root_pid: int) -> None:
         await asyncio.sleep(_MINIMIZE_INTERVAL_S)
 
 
+def _profile_dirs(settings: dict[str, Any]) -> list[Path]:
+    return [profile for _port, profile in _launch_targets(settings)]
+
+
+async def browsers_still_open(ports: list[int]) -> bool:
+    ready = [port for port in ports if await asyncio.to_thread(_debug_port_ready, port)]
+    return bool(ready)
+
+
+async def migrate_profiles_safely(settings: dict[str, Any]) -> bool:
+    """Close Chrome, then copy profiles. A browser that stays open skips both."""
+    ports = launch_ports(settings)
+    if await browsers_still_open(ports):
+        await close_listening_browsers(ports)
+        if await browsers_still_open(ports):
+            logger.warning(
+                "Chrome stayed open. Profile copy and the Chrome download were skipped."
+            )
+            return False
+    return migrate_profiles()
+
+
+async def peek_chrome_update(settings: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """Stable version and download URL when Chrome should be replaced.
+
+    None means the installed build is current, or the profiles are not safe
+    to leave behind a binary replace. A check that cannot be read raises.
+    """
+    version, url = stable_chrome_download(
+        await asyncio.to_thread(_read_json, CFT_STABLE_URL)
+    )
+    profiles = _profile_dirs(settings)
+    exe = find_installed_chrome()
+    installed = exe_product_version(exe)
+    if not chrome_update_needed(installed, version):
+        if installed:
+            current = str(settings.get("chrome_version") or "")
+            if current != installed:
+                update_settings(chrome_version=installed)
+        return None
+    delete_dirs = old_version_dirs(exe.parent if exe is not None else None)
+    if profiles_block_chrome_update(profiles, delete_dirs):
+        logger.warning("Chrome update skipped; a profile is still inside the browser install")
+        return None
+    return version, url
+
+
+def _read_json(url: str) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers={"User-Agent": "TP-DECK"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Chrome for Testing returned an unexpected response.")
+    return payload
+
+
+def _download_file(
+    url: str,
+    dest: Path,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> None:
+    """Save a Chrome zip. on_progress receives bytes read and the total size.
+
+    The total is 0 when the server does not send a length. The bar then sweeps
+    instead of filling a known fraction.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(url, headers={"User-Agent": "TP-DECK"})
+    with urllib.request.urlopen(request, timeout=60) as response, dest.open("wb") as handle:
+        try:
+            total = int(response.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError, AttributeError):
+            total = 0
+        read = 0
+        if on_progress is not None:
+            on_progress(0, total)
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
+            read += len(chunk)
+            if on_progress is not None:
+                on_progress(read, total)
+
+
+def install_chrome_zip(zip_path: Path, version: str, root: Optional[Path] = None) -> Path:
+    """Unpack a Chrome for Testing zip into browser/chrome-<version>/chrome.exe."""
+    base = browser_dir() if root is None else root
+    base.mkdir(parents=True, exist_ok=True)
+    dest = base / f"chrome-{version}"
+    exe = dest / "chrome.exe"
+    if exe.is_file():
+        return exe
+    with tempfile.TemporaryDirectory(prefix="tpdeck-chrome-") as tmp:
+        stage = Path(tmp)
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(stage)
+        found = next((path for path in stage.rglob("chrome.exe") if path.is_file()), None)
+        if found is None:
+            raise RuntimeError("Chrome download did not contain chrome.exe.")
+        partial = base / f".chrome-{version}.partial"
+        if partial.exists():
+            shutil.rmtree(partial)
+        shutil.copytree(found.parent, partial)
+    if not (partial / "chrome.exe").is_file():
+        shutil.rmtree(partial, ignore_errors=True)
+        raise RuntimeError("Chrome download did not contain chrome.exe.")
+    if dest.exists():
+        shutil.rmtree(dest)
+    partial.rename(dest)
+    if not exe.is_file():
+        shutil.rmtree(dest, ignore_errors=True)
+        raise RuntimeError("Chrome download did not contain chrome.exe.")
+    return exe
+
+
+async def download_chrome(
+    version: str,
+    url: str,
+    settings: dict[str, Any],
+    on_status: Callable[[str], None],
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> Optional[Path]:
+    """Download stable Chrome. None leaves the current browser in place."""
+    ports = launch_ports(settings)
+    if await browsers_still_open(ports):
+        await close_listening_browsers(ports)
+        if await browsers_still_open(ports):
+            on_status("Chrome is still open — leaving the current browser")
+            return None
+    profiles = _profile_dirs(settings)
+    current = find_installed_chrome()
+    keep = current.parent if current is not None else None
+    if profiles_block_chrome_update(profiles, old_version_dirs(keep)):
+        on_status("Chrome update skipped — logins are still inside the browser folder")
+        return None
+    on_status(f"Downloading Chrome {version}")
+    try:
+        with tempfile.TemporaryDirectory(prefix="tpdeck-chrome-zip-") as tmp:
+            zip_path = Path(tmp) / f"chrome-{version}.zip"
+            await asyncio.to_thread(_download_file, url, zip_path, on_progress)
+            exe = await asyncio.to_thread(install_chrome_zip, zip_path, version)
+    except Exception:
+        logger.exception("Chrome download failed")
+        on_status("Chrome download failed — opening the current browser")
+        return None
+    if profiles_block_chrome_update(profiles, old_version_dirs(exe.parent)):
+        on_status("Chrome update skipped — logins are still inside the browser folder")
+        return None
+    remove_old_browsers(exe.parent, profiles)
+    update_settings(chrome_version=version)
+    on_status("Updating Chrome")
+    return exe
+
+
 async def ensure_debug_chromium(
     settings: dict[str, Any],
     on_status: Callable[[str], None],
@@ -695,11 +1011,13 @@ async def ensure_debug_chromium(
             continue
         pending.append((port, profile))
 
-    exe = find_chromium_executable()
+    exe = find_installed_chrome()
     if pending and exe is None:
-        exe = await _install_chromium(on_status)
-        on_status("Starting Chromium")
-    _remember_revision(exe)
+        on_status("Chrome is not installed — opening TP DECK without it")
+        return
+    version = exe_product_version(exe)
+    if version and str(settings.get("chrome_version") or "") != version:
+        update_settings(chrome_version=version)
 
     if not pending or exe is None:
         return

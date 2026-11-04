@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -20,137 +20,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-DIALOG_QSS = """
-QDialog {
-    background-color: #0F172A;
-    color: #F8FAFC;
-}
-QLabel {
-    color: #F8FAFC;
-    background: transparent;
-}
-QLabel#errorLabel {
-    color: #FCA5A5;
-}
-QLineEdit, QTextEdit {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #334155;
-    border-radius: 4px;
-    font-family: Consolas, "Courier New", monospace;
-    font-size: 12px;
-    padding: 4px 6px;
-}
-QPushButton {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #0EA5E9;
-    border-radius: 4px;
-    padding: 6px 14px;
-}
-QPushButton:hover {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-QPushButton#submitBtn {
-    background-color: #0EA5E9;
-    color: #0F172A;
-    font-weight: bold;
-}
-QPushButton#submitBtn:hover {
-    background-color: #38BDF8;
-}
-QPushButton#ordersBtn {
-    background-color: #1E293B;
-    color: #38BDF8;
-    border: 1px solid #38BDF8;
-}
-QPushButton#ordersBtn:hover {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-"""
+from tp_deck.theme import current_palette, dialog_qss, orders_qss
 
-ORDERS_QSS = """
-QDialog {
-    background-color: #0F172A;
-    color: #F8FAFC;
-}
-QLabel {
-    color: #F8FAFC;
-    background: transparent;
-}
-QTableWidget {
-    background-color: #0F172A;
-    color: #F8FAFC;
-    gridline-color: #334155;
-    border: 1px solid #334155;
-    border-radius: 4px;
-    font-family: Consolas, "Courier New", monospace;
-    font-size: 12px;
-}
-QTableWidget::item:selected {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-QHeaderView::section {
-    background-color: #1E293B;
-    color: #38BDF8;
-    border: 1px solid #334155;
-    font-weight: bold;
-    padding: 4px;
-}
-QTableWidget QComboBox, QTableWidget { selection-background-color: #0EA5E9; }
-QCheckBox {
-    background-color: transparent;
-    color: #F8FAFC;
-}
-QScrollBar:vertical, QScrollBar:horizontal {
-    background-color: #1E293B;
-    border: 1px solid #334155;
-}
-QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-    background-color: #475569;
-    border-radius: 3px;
-    min-height: 12px;
-    min-width: 12px;
-}
-QScrollBar::add-line, QScrollBar::add-page {
-    background-color: transparent;
-    width: 0;
-    height: 0;
-}
-QScrollBar::sub-line, QScrollBar::sub-page {
-    background-color: transparent;
-    width: 0;
-    height: 0;
-}
-QPushButton {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #0EA5E9;
-    border-radius: 4px;
-    padding: 6px 14px;
-}
-QPushButton:hover {
-    background-color: #0EA5E9;
-    color: #0F172A;
-}
-QPushButton#queueBtn {
-    background-color: #0EA5E9;
-    color: #0F172A;
-    font-weight: bold;
-}
-QPushButton#queueBtn:hover {
-    background-color: #38BDF8;
-}
-QToolTip {
-    background-color: #1E293B;
-    color: #F8FAFC;
-    border: 1px solid #334155;
-    padding: 4px;
-}
-"""
+
+def _dialog_qss() -> str:
+    return dialog_qss(current_palette())
+
+
+def _orders_qss() -> str:
+    return orders_qss(current_palette())
 
 
 def parse_serials(text: str) -> list[str]:
@@ -202,14 +80,15 @@ class CurrentOrdersWindow(QDialog):
         self.setWindowTitle("Current Orders")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(520, 380)
-        self.setStyleSheet(ORDERS_QSS)
+        self.setStyleSheet(_orders_qss())
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
         hint = QLabel(
             "Double-click one order to put it in the order box and close. "
-            "Tick rows to queue a batch serial run for each ticked order."
+            "Tick several rows to give each order its own serial list. "
+            "Batch Serial stays open until each one is submitted."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -269,7 +148,13 @@ class CurrentOrdersWindow(QDialog):
 
 
 class SerialDialog(QDialog):
-    """Collect a pasted list of serial numbers. Stays open when the list is empty."""
+    """Collect a pasted list of serial numbers. Stays open when the list is empty.
+
+    Several ticked orders each get their own submit. The window closes after
+    the last one. Cancel drops prompts that have not been submitted.
+    """
+
+    order_queued = Signal(str, list)
 
     def __init__(
         self,
@@ -278,11 +163,11 @@ class SerialDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._orders = list(orders or [])
-        self._multi_orders: list[str] = []
+        self._pending_orders: list[str] = []
         self.setWindowTitle("TP DECK — Batch Serial")
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self.setMinimumSize(360, 320)
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(_dialog_qss())
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
@@ -291,8 +176,8 @@ class SerialDialog(QDialog):
             "Paste one serial number per line. "
             "SO-12345 searches the SO # column. "
             "An eBay order (12-34567-89012) or a digits-only store order "
-            "searches the PO column. A digits-only number also tries SO # "
-            "when PO has no match. Leave it blank to use the one sales "
+            "searches the PO column. A pasted # in front of a store number "
+            "is ignored. Leave the order blank to use the one sales "
             "order already open."
         )
         hint.setWordWrap(True)
@@ -302,7 +187,7 @@ class SerialDialog(QDialog):
         self._orders_btn.setObjectName("ordersBtn")
         self._orders_btn.setToolTip(
             "The orders seen in the last scrape. Pick one to fill the order box, "
-            "or tick rows to queue a run for each one."
+            "or tick rows and paste a separate serial list for each order."
         )
         self._orders_btn.clicked.connect(self._open_current_orders)
         layout.addWidget(self._orders_btn)
@@ -339,8 +224,8 @@ class SerialDialog(QDialog):
         return parse_serials(self._editor.toPlainText())
 
     def multi_orders(self) -> list[str]:
-        """Orders ticked in Current Orders, for a run per order."""
-        return list(self._multi_orders)
+        """Orders still waiting for their own serial list."""
+        return list(self._pending_orders)
 
     def _open_current_orders(self) -> None:
         if not self._orders:
@@ -355,22 +240,39 @@ class SerialDialog(QDialog):
         picked = window.selected_orders()
         self._error.setText("")
         if len(picked) == 1:
-            # Single pick prefills the box; the queued run is one batch.
+            # Single pick prefills the box. Submit once and the window closes.
             self._order.setText(picked[0])
-            self._multi_orders = []
+            self._pending_orders = []
         elif len(picked) > 1:
-            # Ticked rows queue one run per order. Submit uses the same serial
-            # list on every order, with that order number filled in for each run.
-            self._multi_orders = picked
+            self._pending_orders = picked
             self._order.setText(picked[0])
+            self._editor.clear()
             self._error.setText(
-                f"{len(picked)} orders selected: {', '.join(picked)}. "
-                "Submit enters this serial list on each of them."
+                f"Order 1 of {len(picked)}: {picked[0]}. "
+                "Paste this order's serials and submit. "
+                "The window stays open for the next order."
             )
 
     def _submit(self) -> None:
-        if not self.serials():
+        serials = self.serials()
+        if not serials:
             self._error.setText("Paste at least one serial number.")
             return
         self._error.setText("")
+        if not self._pending_orders:
+            self.accept()
+            return
+        order = self._order.text().strip() or self._pending_orders[0]
+        self.order_queued.emit(order, list(serials))
+        self._pending_orders.pop(0)
+        self._editor.clear()
+        if self._pending_orders:
+            nxt = self._pending_orders[0]
+            self._order.setText(nxt)
+            left = len(self._pending_orders)
+            noun = "order" if left == 1 else "orders"
+            self._error.setText(
+                f"Next: {nxt}. {left} {noun} still need serials."
+            )
+            return
         self.accept()

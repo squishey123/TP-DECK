@@ -133,6 +133,7 @@ class SerialQueue(unittest.TestCase):
         class _FakeDialog:
             accepted = _Sig()
             finished = _Sig()
+            order_queued = _Sig()
 
             def __init__(self, parent, orders):
                 captured["orders"] = list(orders)
@@ -170,7 +171,9 @@ class SerialQueue(unittest.TestCase):
         self.assertIn("Incomplete — 1/2 serials, 1 skipped", dashboard.statuses)
         self.assertEqual(dashboard.failures, [[("2", "222")]])
 
-    def test_the_multi_pick_queues_the_same_serials_per_order(self):
+    def test_the_multi_pick_queues_a_separate_prompt_per_order(self):
+        from PySide6.QtWidgets import QDialog
+
         from tp_deck import main as m
         from tp_deck import serial_dialog as dmod
 
@@ -178,6 +181,7 @@ class SerialQueue(unittest.TestCase):
         dashboard = _StubDashboard()
         controller = m.AutomationController(dashboard)
         dialog = dmod.SerialDialog(orders=orders)
+        dialog.order_queued.connect(controller._queue_serial_order)
         dialog.accepted.connect(lambda: controller._accept_serial_dialog(dialog))
         original = dmod.CurrentOrdersWindow
         dmod.CurrentOrdersWindow = lambda *_a, **_kw: _Picked(["SO-1", "SO-2"])
@@ -185,12 +189,19 @@ class SerialQueue(unittest.TestCase):
             dialog._open_current_orders()
             dialog._editor.setPlainText("111\n222")
             dialog._submit()
+            self.assertEqual(controller._serial_queue, [(["111", "222"], "SO-1")])
+            self.assertEqual(dialog.order_number(), "SO-2")
+            self.assertEqual(dialog.serials(), [])
+            self.assertNotEqual(dialog.result(), QDialog.DialogCode.Accepted)
+            dialog._editor.setPlainText("333")
+            dialog._submit()
         finally:
             dmod.CurrentOrdersWindow = original
         self.assertEqual(
             controller._serial_queue,
-            [(["111", "222"], "SO-1"), (["111", "222"], "SO-2")],
+            [(["111", "222"], "SO-1"), (["333"], "SO-2")],
         )
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
 
 
 class _Picked:
@@ -394,21 +405,38 @@ class OrderTableLayout(unittest.TestCase):
         self.assertEqual(uline_order.load_draft()[0].min_sets, 2)
 
     def test_order_table_columns_are_sized_for_one_screen(self):
-        from PySide6.QtGui import QFont, QFontMetrics
         from PySide6.QtWidgets import QHeaderView
 
-        from tp_deck.uline_dialog import ORDER_COLUMNS, _header_widths
+        from tp_deck.uline_dialog import (
+            ALIAS_FLOOR,
+            CACHE_COLUMNS,
+            NAME_FLOOR,
+            ORDER_COLUMNS,
+            _header_widths,
+        )
 
         dialog = self.dialog()
         header = dialog._order_table.horizontalHeader()
-        metrics = QFontMetrics(QFont("Consolas", 12))
-        char = metrics.horizontalAdvance("W")
         widths = _header_widths(ORDER_COLUMNS, {0: 7, 3: 6})
         self.assertEqual(header.sectionSize(0), widths[0])  # Item: 7 chars
+        self.assertGreaterEqual(header.sectionSize(1), ALIAS_FLOOR)
+        self.assertGreaterEqual(header.sectionSize(2), NAME_FLOOR)
         self.assertEqual(header.sectionSize(3), widths[3])  # Unit: 6 chars
         self.assertEqual(header.sectionSize(8), widths[8])  # header text + buffer
+        self.assertEqual(header.sectionResizeMode(1), QHeaderView.ResizeMode.Interactive)
         self.assertEqual(header.sectionResizeMode(2), QHeaderView.ResizeMode.Stretch)
         self.assertEqual(header.sectionResizeMode(8), QHeaderView.ResizeMode.Interactive)
+        self.assertGreaterEqual(dialog.minimumWidth(), 1100)
+
+        cache = dialog._cache_table.horizontalHeader()
+        name_column = CACHE_COLUMNS.index("Name")
+        alias_column = CACHE_COLUMNS.index("Aliases")
+        self.assertGreaterEqual(cache.sectionSize(name_column), NAME_FLOOR)
+        self.assertGreaterEqual(cache.sectionSize(alias_column), ALIAS_FLOOR)
+        self.assertEqual(
+            cache.sectionResizeMode(alias_column),
+            QHeaderView.ResizeMode.Interactive,
+        )
 
     def test_the_columns_that_follow_the_dropped_one_are_in_order(self):
         from tp_deck.uline_dialog import COL_NEEDED, COL_SETS, COL_PRICE, ORDER_COLUMNS
@@ -459,6 +487,149 @@ class AliasOnLine(unittest.TestCase):
         self.assertEqual(uline_order.load_draft()[0].alias, "conductive foam")
         # the table shows the alias on the line
         self.assertEqual(dialog._order_table.item(0, 1).text(), "conductive foam")
+
+
+class UrgentLamp(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _dashboard(self):
+        from tp_deck.dashboard import Dashboard
+
+        return Dashboard()
+
+    def test_click_is_ignored_while_busy_or_updating(self):
+        dashboard = self._dashboard()
+        called: list[int] = []
+        dashboard._on_urgent_sync = lambda: called.append(1)
+        dashboard.set_processing(True)
+        dashboard._handle_urgent()
+        dashboard.set_processing(False)
+        dashboard.begin_update_warning()
+        dashboard._handle_urgent()
+        dashboard.end_update_warning()
+        self.assertEqual(called, [])
+        dashboard._light._on_click()
+        self.assertEqual(called, [1])
+
+    def test_purple_lamp_and_rainbow_leave_the_other_buttons(self):
+        dashboard = self._dashboard()
+        dashboard.start_cycle_countdown(30)
+        dashboard.begin_urgent_sync()
+        self.assertEqual(dashboard._light._state, "urgent")
+        self.assertIn("background-color", dashboard.execute_btn.styleSheet())
+        self.assertIn("background-color", dashboard.pick_btn.styleSheet())
+        self.assertIn("background-color", dashboard.batch_btn.styleSheet())
+        self.assertEqual(dashboard.cycle_btn.styleSheet(), "")
+        self.assertEqual(dashboard.stop_btn.styleSheet(), "")
+        self.assertEqual(dashboard.settings_btn.styleSheet(), "")
+        self.assertEqual(dashboard.tools_btn.styleSheet(), "")
+        dashboard._update_warning = True
+        dashboard._update_started = __import__("time").monotonic()
+        dashboard.end_urgent_sync()
+        self.assertFalse(dashboard._urgent)
+        self.assertIn("background-color", dashboard.execute_btn.styleSheet())
+        self.assertEqual(dashboard._light._state, "waiting")
+        dashboard._update_warning = False
+        dashboard.end_urgent_sync()
+        self.assertEqual(dashboard.execute_btn.styleSheet(), "")
+        self.assertEqual(dashboard._light._state, "waiting")
+
+    def test_urgent_sync_refreshes_ebay_and_syncs_shipstation(self):
+        from tp_deck.job_results import AutomationResult
+        from tp_deck.main import AutomationController
+
+        captured: dict = {}
+
+        async def fake_run(*_args, **kwargs):
+            captured["kwargs"] = kwargs
+            return AutomationResult(status="Urgent", job="orders")
+
+        async def body():
+            dashboard = self._dashboard()
+            controller = AutomationController(dashboard)
+            with mock.patch("tp_deck.main.run_automation", fake_run):
+                self.assertTrue(controller.start_urgent())
+                await controller._manual_task
+            self.assertFalse(captured["kwargs"]["honor_refresh_hold"])
+            self.assertTrue(captured["kwargs"]["sync_shipstation"])
+            self.assertTrue(captured["kwargs"]["refresh_ebay"])
+            self.assertFalse(dashboard._urgent)
+            dashboard.begin_update_warning()
+            self.assertFalse(controller.start_urgent())
+            dashboard.end_update_warning()
+
+        asyncio.run(body())
+
+
+class ThemePalette(unittest.TestCase):
+    def test_cycle_off_and_warning_follow_the_accent(self):
+        from tp_deck.theme import FAMILIES, NEUTRAL
+
+        green = FAMILIES["green"]
+        blue = FAMILIES["blue"]
+        cyan = FAMILIES["cyan"]
+        red = FAMILIES["red"]
+        self.assertNotEqual(green["cycle_off_bg"].upper(), "#7C4620")
+        self.assertNotEqual(green["warning"].upper(), "#C27A3F")
+        self.assertNotEqual(blue["cycle_off_bg"].upper(), "#8A4630")
+        self.assertNotEqual(blue["cycle_off_border"].upper(), "#D07C5C")
+        self.assertNotEqual(blue["warning"].upper(), "#C2873F")
+        self.assertEqual(cyan["cycle_off_bg"].upper(), "#B45309")
+        self.assertEqual(cyan["warning"].upper(), "#FBBF24")
+        self.assertEqual(NEUTRAL["warning"].upper(), "#FBBF24")
+        self.assertNotEqual(red["danger_bg"].upper(), red["accent"].upper())
+        self.assertNotEqual(red["danger_bg"].upper(), "#7F1D1D")
+        self.assertEqual(cyan["danger_bg"].upper(), "#7F1D1D")
+
+
+class OrderColumnTargets(unittest.TestCase):
+    """eBay and store numbers search the PO header. Service numbers search SO #."""
+
+    def _columns(self):
+        return [
+            {"name": "SO #", "colId": "SoNo", "hasInput": True},
+            {"name": "Source Type", "colId": "SourceType", "hasInput": True},
+            {"name": "Direction", "colId": "Direction", "hasInput": True},
+            {"name": "PO", "colId": "PoNumber", "hasInput": True},
+            {"name": "Ref", "colId": "Ref", "hasInput": True},
+        ]
+
+    def test_classification_and_column_choice(self):
+        from tp_deck.locators import DEFAULTS
+        from tp_deck.sales_order import (
+            _configured_targets,
+            _search_targets,
+            classify_order,
+        )
+
+        columns = self._columns()
+        self.assertEqual(classify_order("SO-99858"), "service")
+        self.assertEqual(classify_order("SO99858"), "service")
+        self.assertEqual(classify_order("18-15368-46357"), "ebay")
+        self.assertEqual(classify_order("48559"), "store")
+        self.assertEqual(classify_order("#48559"), "store")
+
+        ebay = _search_targets("ebay", columns)
+        store = _search_targets("store", columns)
+        service = _search_targets("service", columns)
+        self.assertEqual([col["name"] for _role, col in ebay], ["PO"])
+        self.assertEqual([col["name"] for _role, col in store], ["PO"])
+        self.assertEqual([role for role, _col in store], ["marketplace"])
+        self.assertEqual([col["colId"] for _role, col in service], ["SoNo"])
+        self.assertNotIn("service", [role for role, _col in store])
+        self.assertEqual(
+            _configured_targets("store", {"sales_order_filter": "#so"}),
+            [],
+        )
+        self.assertEqual(
+            _configured_targets("ebay", {"sales_order_filter": "#so"}),
+            [],
+        )
+        self.assertNotIn("sales_order_external_filter", DEFAULTS)
 
 
 if __name__ == "__main__":

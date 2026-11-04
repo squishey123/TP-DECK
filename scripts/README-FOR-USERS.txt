@@ -1,7 +1,7 @@
 TP DECK — how to run (no Python install needed)
 
 1. Unzip this folder anywhere (example: C:\Apps\TP-DECK).
-2. Double-click TP-DECK.bat. The first open downloads Chromium (needs network once) and starts it minimized. Later opens restore the last tabs. If a newer TP DECK has been published, that open installs it and keeps your logins and settings.
+2. Double-click TP-DECK.bat. Each open checks for a newer Chrome and downloads it when the installed copy is older (needs network for that download), then starts it minimized. Later opens restore the last tabs. Your logins live in the chrome-profiles folder beside this app. If a newer TP DECK has been published, that open installs it first and keeps your logins and settings. An app update pulses the action buttons yellow and grey. A Chrome update pulses them green and grey. When both are ready they alternate yellow and green. Emergency Stop cancels the update until the next open.
 3. In that Chromium window, open Seller Hub orders (ebay.com/sh/ord), RazorERP Inventory Detail, and ShipStation awaiting shipment. You only need to log in once.
 4. Scrape eBay Orders copies order lines. Generate Pick List copies a walk-sorted list. Batch Serial types serial numbers into a sales order. The cycle button repeats the scrape on a timer.
 
