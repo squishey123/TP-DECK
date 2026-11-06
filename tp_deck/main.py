@@ -1012,12 +1012,11 @@ async def _startup(dashboard: Dashboard) -> None:
                 load_settings(),
                 dashboard.set_status,
                 _chrome_download_progress(dashboard, chrome_pending[0]),
+                _chrome_progress_sweep(dashboard),
             )
-            if installed is None:
+            if installed is None and not chrome_hold:
                 chrome_hold = dashboard._status_text
-                dashboard.clear_progress()
-            else:
-                dashboard.set_run_progress(1.0, None)
+            dashboard.clear_progress()
     notes = asyncio.create_task(
         present_release_notes_after_update(dashboard),
         name="tpdeck-release-notes",
@@ -1090,6 +1089,24 @@ def _chrome_download_progress(
         loop.call_soon_threadsafe(paint)
 
     return on_progress
+
+
+def _chrome_progress_sweep(dashboard: Dashboard) -> Callable[[], None]:
+    """Sweep the bar for a Chrome step that has nothing to measure.
+
+    Unpacking the new build and deleting the old folders have no byte count
+    to fill, so the bar keeps the indeterminate sweep a download with no
+    length already gets instead of sitting full until Chrome opens.
+    """
+    loop = asyncio.get_running_loop()
+
+    def paint() -> None:
+        dashboard.set_run_progress(0.0, (0.0, 1.0))
+
+    def sweep() -> None:
+        loop.call_soon_threadsafe(paint)
+
+    return sweep
 
 
 async def _download_app_release(dashboard: Dashboard, pending: tuple) -> None:

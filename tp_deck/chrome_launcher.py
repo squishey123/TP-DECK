@@ -32,6 +32,7 @@ CFT_STABLE_URL = (
 )
 
 _PORT_READY_TIMEOUT_S = 45.0
+_CHROME_DOWNLOAD_DEADLINE_S = 10 * 60.0
 _MINIMIZE_FOR_S = 4.0
 _MINIMIZE_INTERVAL_S = 0.25
 
@@ -861,6 +862,20 @@ async def migrate_profiles_safely(settings: dict[str, Any]) -> bool:
     return migrate_profiles()
 
 
+async def clear_leftover_browsers(keep: Path, profiles: list[Path]) -> None:
+    """Delete chrome-*/chromium-* folders that an update left behind.
+
+    The new build lands before the old folders are gone, so an app closed
+    mid-delete leaves them there. The next launch sees Chrome as current and
+    never offers the update, so this cleanup runs by itself, off the UI thread
+    and without the prompt. The folder holding the live chrome.exe stays.
+    """
+    try:
+        await asyncio.to_thread(remove_old_browsers, keep, profiles)
+    except Exception:
+        logger.exception("Leftover Chrome build folders could not be removed")
+
+
 async def peek_chrome_update(settings: dict[str, Any]) -> Optional[tuple[str, str]]:
     """Stable version and download URL when Chrome should be replaced.
 
@@ -878,6 +893,8 @@ async def peek_chrome_update(settings: dict[str, Any]) -> Optional[tuple[str, st
             current = str(settings.get("chrome_version") or "")
             if current != installed:
                 update_settings(chrome_version=installed)
+        if exe is not None:
+            await clear_leftover_browsers(exe.parent, profiles)
         return None
     delete_dirs = old_version_dirs(exe.parent if exe is not None else None)
     if profiles_block_chrome_update(profiles, delete_dirs):
@@ -903,10 +920,13 @@ def _download_file(
     """Save a Chrome zip. on_progress receives bytes read and the total size.
 
     The total is 0 when the server does not send a length. The bar then sweeps
-    instead of filling a known fraction.
+    instead of filling a known fraction. A stalled connection gives up after
+    _CHROME_DOWNLOAD_DEADLINE_S so the open cannot sit there forever.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(url, headers={"User-Agent": "TP-DECK"})
+    started = time.monotonic()
+    deadline = started + _CHROME_DOWNLOAD_DEADLINE_S
     with urllib.request.urlopen(request, timeout=60) as response, dest.open("wb") as handle:
         try:
             total = int(response.headers.get("Content-Length") or 0)
@@ -923,34 +943,42 @@ def _download_file(
             read += len(chunk)
             if on_progress is not None:
                 on_progress(read, total)
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Chrome download gave up after {int(_CHROME_DOWNLOAD_DEADLINE_S // 60)} minutes."
+                )
+    logger.info("Chrome zip read in %.1fs", time.monotonic() - started)
 
 
 def install_chrome_zip(zip_path: Path, version: str, root: Optional[Path] = None) -> Path:
-    """Unpack a Chrome for Testing zip into browser/chrome-<version>/chrome.exe."""
+    """Unpack a Chrome for Testing zip into browser/chrome-<version>/chrome.exe.
+
+    The zip is unpacked straight into the hidden staging folder beside the
+    destination, so the move onto its final name is a rename and never a second
+    copy of a 150 MB build. Chrome keeps running from the old folder while this
+    one fills.
+    """
     base = browser_dir() if root is None else root
     base.mkdir(parents=True, exist_ok=True)
     dest = base / f"chrome-{version}"
     exe = dest / "chrome.exe"
     if exe.is_file():
         return exe
-    with tempfile.TemporaryDirectory(prefix="tpdeck-chrome-") as tmp:
-        stage = Path(tmp)
+    partial = base / f".chrome-{version}.partial"
+    if partial.exists():
+        shutil.rmtree(partial)
+    try:
         with zipfile.ZipFile(zip_path) as archive:
-            archive.extractall(stage)
-        found = next((path for path in stage.rglob("chrome.exe") if path.is_file()), None)
+            archive.extractall(partial)
+        found = next((path for path in partial.rglob("chrome.exe") if path.is_file()), None)
         if found is None:
             raise RuntimeError("Chrome download did not contain chrome.exe.")
-        partial = base / f".chrome-{version}.partial"
-        if partial.exists():
-            shutil.rmtree(partial)
-        shutil.copytree(found.parent, partial)
-    if not (partial / "chrome.exe").is_file():
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.move(str(found.parent), str(dest))
+    finally:
         shutil.rmtree(partial, ignore_errors=True)
-        raise RuntimeError("Chrome download did not contain chrome.exe.")
-    if dest.exists():
-        shutil.rmtree(dest)
-    partial.rename(dest)
-    if not exe.is_file():
+    if not (dest / "chrome.exe").is_file():
         shutil.rmtree(dest, ignore_errors=True)
         raise RuntimeError("Chrome download did not contain chrome.exe.")
     return exe
@@ -962,8 +990,17 @@ async def download_chrome(
     settings: dict[str, Any],
     on_status: Callable[[str], None],
     on_progress: Optional[Callable[[int, int], None]] = None,
+    on_sweep: Optional[Callable[[], None]] = None,
 ) -> Optional[Path]:
-    """Download stable Chrome. None leaves the current browser in place."""
+    """Download stable Chrome. None leaves the current browser in place.
+
+    The new chrome.exe is the finished update. The old build folders are
+    deleted after it lands, off the UI thread, and a delete that fails is
+    logged and left alone: the new browser still opens, and the next launch
+    clears whatever is left over. Steps with no byte count to fill, the
+    unpack and that delete, hand the bar to on_sweep so it sweeps instead
+    of sitting full.
+    """
     ports = launch_ports(settings)
     if await browsers_still_open(ports):
         await close_listening_browsers(ports)
@@ -981,7 +1018,12 @@ async def download_chrome(
         with tempfile.TemporaryDirectory(prefix="tpdeck-chrome-zip-") as tmp:
             zip_path = Path(tmp) / f"chrome-{version}.zip"
             await asyncio.to_thread(_download_file, url, zip_path, on_progress)
+            on_status(f"Unpacking Chrome {version}")
+            if on_sweep is not None:
+                on_sweep()
+            unpack_start = time.monotonic()
             exe = await asyncio.to_thread(install_chrome_zip, zip_path, version)
+            logger.info("Chrome unpacked and installed in %.1fs", time.monotonic() - unpack_start)
     except Exception:
         logger.exception("Chrome download failed")
         on_status("Chrome download failed — opening the current browser")
@@ -989,7 +1031,15 @@ async def download_chrome(
     if profiles_block_chrome_update(profiles, old_version_dirs(exe.parent)):
         on_status("Chrome update skipped — logins are still inside the browser folder")
         return None
-    remove_old_browsers(exe.parent, profiles)
+    on_status("Removing old Chrome")
+    if on_sweep is not None:
+        on_sweep()
+    try:
+        await asyncio.to_thread(remove_old_browsers, exe.parent, profiles)
+    except Exception:
+        logger.exception(
+            "Old Chrome folders could not be removed; the new build is in place"
+        )
     update_settings(chrome_version=version)
     on_status("Updating Chrome")
     return exe

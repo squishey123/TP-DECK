@@ -8,6 +8,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
+from PySide6.QtWidgets import QApplication
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -29,6 +30,13 @@ from tp_deck.chrome_launcher import (
 )
 from tp_deck.theme import NEUTRAL
 from tp_deck.updater import _HELPER_PS1
+
+# PySide6 aborts the process when a widget is built with no application
+# instance, and again at shutdown when that application is dropped while
+# widgets are still alive. These tests build real dialogs and a real
+# dashboard, so one application at module level keeps the whole run
+# in one piece. Tests that need it take the same instance.
+SESSION_APP = QApplication.instance() or QApplication([])
 
 
 def _write_profile(root: Path, cookies: bytes = b"cookies", lock: bytes = b"lock") -> None:
@@ -597,3 +605,137 @@ class StartupOrder(unittest.TestCase):
 
         asyncio.run(body())
         self.assertEqual(calls, ["migrate", "app", "prepare"])
+
+    def test_a_locked_old_folder_still_opens_the_new_chrome(self):
+        from tp_deck.main import _startup
+
+        calls: list = []
+        saved: list[dict] = []
+
+        class Dash:
+            def __init__(self):
+                self._error = False
+                self._status_text = ""
+                self.statuses: list[str] = []
+                self.progress: list[tuple] = []
+
+            def set_active(self, _active):
+                return None
+
+            def set_status(self, text):
+                self._status_text = text
+                self.statuses.append(text)
+                self._error = str(text).startswith("Error")
+
+            def set_run_progress(self, locked, sheen):
+                self.progress.append((locked, sheen))
+
+            def clear_progress(self):
+                return None
+
+        async def migrate(_settings):
+            calls.append("migrate")
+            return True
+
+        def peek_app():
+            calls.append("app")
+            return None
+
+        async def peek_chrome(_settings):
+            calls.append("chrome")
+            return "131.0.6778.85", "http://example.invalid/chrome.zip"
+
+        async def confirm(_dashboard, label, kind="chrome"):
+            calls.append(("confirm", kind, label))
+            return False
+
+        async def prepare(dashboard):
+            calls.append("prepare")
+            dashboard.set_status("Idle")
+
+        async def notes(_dashboard):
+            return None
+
+        async def not_open(_ports):
+            return False
+
+        def save_settings(**kwargs):
+            saved.append(kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            browser = root / "browser"
+            old = browser / "chrome-120.0.0.0"
+            old.mkdir(parents=True)
+            (old / "chrome.exe").write_bytes(b"old")
+            profile = root / "chrome-profiles" / "profile"
+            _write_profile(profile)
+            zip_name = root / "chrome.zip"
+            with zipfile.ZipFile(zip_name, "w") as archive:
+                archive.writestr("chrome-win64/chrome.exe", b"new")
+            payload = zip_name.read_bytes()
+
+            def fake_download(_url, dest, on_progress=None):
+                dest.write_bytes(payload)
+                if on_progress is not None:
+                    on_progress(0, len(payload))
+                    on_progress(len(payload), len(payload))
+
+            dash = Dash()
+
+            async def body():
+                with (
+                    mock.patch("tp_deck.main.migrate_profiles_safely", migrate),
+                    mock.patch("tp_deck.main.peek_app_release", peek_app),
+                    mock.patch("tp_deck.main.peek_chrome_update", peek_chrome),
+                    mock.patch("tp_deck.main._confirm_update", confirm),
+                    mock.patch("tp_deck.main._prepare_chromium", prepare),
+                    mock.patch("tp_deck.main.present_release_notes_after_update", notes),
+                    mock.patch(
+                        "tp_deck.main.load_settings",
+                        return_value={
+                            "mode": "single",
+                            "ebay_port": 9222,
+                            "chrome_profile_dir": str(root / "chrome-profiles"),
+                        },
+                    ),
+                    mock.patch("tp_deck.chrome_launcher.browsers_still_open", not_open),
+                    mock.patch("tp_deck.chrome_launcher.browser_dir", return_value=browser),
+                    mock.patch(
+                        "tp_deck.chrome_launcher.profiles_root",
+                        return_value=root / "chrome-profiles",
+                    ),
+                    mock.patch("tp_deck.chrome_launcher._download_file", fake_download),
+                    mock.patch("tp_deck.chrome_launcher.update_settings", save_settings),
+                    mock.patch(
+                        "tp_deck.chrome_launcher.remove_old_browsers",
+                        side_effect=OSError("the old folder is still locked"),
+                    ),
+                ):
+                    await _startup(dash)
+
+            asyncio.run(body())
+
+            new_exe = browser / "chrome-131.0.6778.85" / "chrome.exe"
+            self.assertEqual(new_exe.read_bytes(), b"new")
+            self.assertTrue(old.is_dir())
+            self.assertEqual(saved, [{"chrome_version": "131.0.6778.85"}])
+            self.assertIn("Unpacking Chrome 131.0.6778.85", dash.statuses)
+            self.assertIn("Removing old Chrome", dash.statuses)
+            self.assertEqual(dash.statuses[-1], "Idle")
+            self.assertNotIn(
+                "Chrome update failed — opening the current browser",
+                dash.statuses,
+            )
+            self.assertIn((1.0, None), dash.progress)
+            self.assertIn((0.0, (0.0, 1.0)), dash.progress)
+            self.assertEqual(
+                calls[:5],
+                [
+                    "migrate",
+                    "app",
+                    "chrome",
+                    ("confirm", "chrome", "Chrome 131.0.6778.85"),
+                    "prepare",
+                ],
+            )
