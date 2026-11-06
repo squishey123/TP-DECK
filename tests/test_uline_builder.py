@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from PySide6.QtWidgets import QApplication
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -38,6 +39,13 @@ from tp_deck.uline_order import (
     sets_for,
 )
 from tp_deck.uline_scraper import _blocked_message, _first_detail_link, looks_like_item, parse_product
+
+# PySide6 aborts the process when a widget is built with no application
+# instance, and again at shutdown when that application is dropped while
+# widgets are still alive. Some of these tests build a real order dialog,
+# so one application at module level keeps the whole run in one piece.
+# Tests that need it take the same instance.
+SESSION_APP = QApplication.instance() or QApplication([])
 
 SAMPLES = REPO / "uline_samples"
 

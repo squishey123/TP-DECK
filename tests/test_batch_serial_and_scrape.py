@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from PySide6.QtWidgets import QApplication
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -26,6 +27,13 @@ from tp_deck import uline_cache, uline_order
 from tp_deck.job_results import AutomationResult
 from tp_deck.uline_cache import UlineItem
 from tp_deck.uline_order import OrderLine, sets_for
+
+# PySide6 aborts the process when a widget is built with no application
+# instance, and again at shutdown when that application is dropped while
+# widgets are still alive. Some of these tests build a real Serial
+# Dialog, so one application at module level keeps the whole run in one
+# piece. Tests that need it take the same instance.
+SESSION_APP = QApplication.instance() or QApplication([])
 
 EBAY_FAIL = "No eBay order rows found on /sh/ord. Open the Seller Hub order list."
 STORE = ("INV-1000", "Bob", "S-4307", 2)
