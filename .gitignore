@@ -34,6 +34,8 @@ build/
 
 # Local scratch dumps / notes (not part of the app)
 Mailbox/
+probe_*.py
+pytest_out.txt
 
 # Portable Chrome download (created on first launch)
 browser/
