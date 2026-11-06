@@ -119,7 +119,7 @@ def release_notes_html(markdown: str) -> str:
     body = "\n".join(parts) or "<p>This release has no notes.</p>"
     return (
         "<html><head><style>"
-        + _NOTES_CSS
+        + _notes_css()
         + "</style></head><body>"
         + body
         + "</body></html>"

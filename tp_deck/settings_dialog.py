@@ -435,7 +435,7 @@ class SettingsDialog(QDialog):
                 "the theme to every TP DECK window right away.",
             ),
         )
-        self.theme_combo.currentData.connect(self._on_theme_preview)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_index_changed)
         appearance_layout.addWidget(theme_box)
 
         preview_box = QGroupBox("Palette preview")
@@ -598,6 +598,15 @@ class SettingsDialog(QDialog):
             f"background-color: {p['results_bg']}; color: {p['results_text']}; "
             f"border: 1px solid {p['results_border']}; border-radius: 4px; padding: 6px 12px;"
         )
+
+    def _on_theme_index_changed(self, index: int) -> None:
+        """Re-preview the palette when the Appearance combo moves to another row."""
+        if index < 0:
+            return
+        key = self.theme_combo.itemData(index)
+        if key is None:
+            return
+        self._on_theme_preview(key)
 
     def _on_theme_preview(self, key: object) -> None:
         """Show the picked palette on the swatch and preview as the combo changes."""
