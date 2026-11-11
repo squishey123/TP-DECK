@@ -24,6 +24,10 @@ from tp_deck.settings_manager import load_settings, update_settings
 
 logger = logging.getLogger("tpdeck")
 
+# Edge of one square icon button on the laptop panel. The QSS box and the drawn
+# glyph are both driven from this so a smaller button cannot overflow its art.
+_MOBILE_ICON_EDGE = 28
+
 # Tailwind stops each theme family is built from. "neutral" is the slate
 # palette TP DECK shipped with; cyan reproduces it exactly.
 FAMILIES: dict[str, dict[str, str]] = {
@@ -436,8 +440,37 @@ def _mix_text(p: dict[str, str], amount: float) -> str:
     return mix_hex(p["text"], "#94A3B8", amount)
 
 
-def dashboard_qss(p: dict[str, str]) -> str:
-    """QSS for the floating dashboard window from a palette."""
+def dashboard_qss(p: dict[str, str], compact: bool = False) -> str:
+    """QSS for the floating dashboard window from a palette.
+
+    compact draws the laptop panel: the same object names, so the fade, pulse,
+    and cycle rules keep matching, only smaller boxes and type.
+    """
+    if compact:
+        # Laptop panel: every action button is a square the size of the drawn
+        # glyph boxes, so the row is 8 equal squares and the symbol inside it
+        # is the only thing that has to be legible.
+        title_px, version_px = 11, 7
+        status_px, status_min = 9, 26
+        button_pad, button_px = "3px 7px", 10
+        icon_edge = _MOBILE_ICON_EDGE
+        action_h, action_pad, action_px = icon_edge, "0px", 13
+        action_min_w, action_max_w = icon_edge, 16777215
+        settings_px = 13
+        stop_px, stop_pad = 13, "0px"
+        stop_h = icon_edge
+        stop_min_w, stop_max_w = icon_edge, icon_edge
+    else:
+        title_px, version_px = 14, 9
+        status_px, status_min = 11, 52
+        button_pad, button_px = "6px 12px", 12
+        icon_edge = 34
+        action_h, action_pad, action_px = 28, "6px 6px", 12
+        action_min_w, action_max_w = 0, 16777215
+        settings_px = 12
+        stop_px, stop_pad = 11, "4px 4px"
+        stop_h = 0
+        stop_min_w, stop_max_w = 0, 16777215
     return f"""
 QMainWindow, QWidget#dashboardRoot {{
     background-color: {p["bg"]};
@@ -451,29 +484,29 @@ QToolTip {{
 }}
 QLabel#titleLabel {{
     color: {p["title"]};
-    font-size: 14px;
+    font-size: {title_px}px;
     font-weight: bold;
 }}
 QLabel#versionLabel {{
     color: {p["version"]};
     font-family: Consolas, "Courier New", monospace;
-    font-size: 9px;
+    font-size: {version_px}px;
     font-weight: 700;
     padding: 0px;
     margin: 0px;
 }}
 QLabel#statusLabel {{
     color: {p["text"]};
-    font-size: 11px;
-    min-height: 52px;
+    font-size: {status_px}px;
+    min-height: {status_min}px;
 }}
 QPushButton {{
     background-color: {p["surface"]};
     color: {p["text"]};
     border: 1px solid {p["accent"]};
     border-radius: 4px;
-    padding: 6px 12px;
-    font-size: 12px;
+    padding: {button_pad};
+    font-size: {button_px}px;
 }}
 QPushButton:hover {{
     background-color: {p["accent"]};
@@ -488,8 +521,12 @@ QPushButton#executeBtn, QPushButton#pickBtn, QPushButton#batchBtn {{
     background-color: {p["accent"]};
     color: {p["on_accent"]};
     font-weight: bold;
-    min-height: 28px;
-    padding: 6px 6px;
+    font-size: {action_px}px;
+    min-height: {action_h}px;
+    max-height: {action_h}px;
+    min-width: {action_min_w}px;
+    max-width: {action_max_w}px;
+    padding: {action_pad};
 }}
 QPushButton#executeBtn:hover, QPushButton#pickBtn:hover, QPushButton#batchBtn:hover {{
     background-color: {p["accent_hover"]};
@@ -504,10 +541,10 @@ QPushButton#cycleBtn {{
     color: {p["text"]};
     border: 1px solid {p["cycle_off_border"]};
     padding: 0px;
-    min-width: 34px;
-    max-width: 34px;
-    min-height: 34px;
-    max-height: 34px;
+    min-width: {icon_edge}px;
+    max-width: {icon_edge}px;
+    min-height: {icon_edge}px;
+    max-height: {icon_edge}px;
 }}
 QPushButton#cycleBtn:hover {{
     background-color: {p["cycle_off_hover"]};
@@ -531,8 +568,12 @@ QPushButton#stopBtn {{
     color: {p["danger_text"]};
     border: 1px solid {p["danger_text"]};
     font-weight: bold;
-    font-size: 11px;
-    padding: 4px 4px;
+    font-size: {stop_px}px;
+    min-height: {stop_h}px;
+    max-height: {stop_h}px;
+    min-width: {stop_min_w}px;
+    max-width: {stop_max_w}px;
+    padding: {stop_pad};
 }}
 QPushButton#stopBtn:hover {{
     background-color: {p["danger_hover"]};
@@ -541,14 +582,15 @@ QPushButton#stopBtn:hover {{
 QPushButton#settingsBtn, QPushButton#powerBtn, QPushButton#toolsBtn {{
     border-color: {p["strong_border"]};
     padding: 0px;
-    min-width: 34px;
-    max-width: 34px;
-    min-height: 34px;
-    max-height: 34px;
+    font-size: {settings_px}px;
+    min-width: {icon_edge}px;
+    max-width: {icon_edge}px;
+    min-height: {icon_edge}px;
+    max-height: {icon_edge}px;
 }}
 QLabel#slowRazorLabel {{
     color: {p["warning"]};
-    font-size: 12px;
+    font-size: {stop_px}px;
     font-weight: bold;
 }}
 """

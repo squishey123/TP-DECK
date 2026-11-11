@@ -438,6 +438,32 @@ class SettingsDialog(QDialog):
         self.theme_combo.currentIndexChanged.connect(self._on_theme_index_changed)
         appearance_layout.addWidget(theme_box)
 
+        self.mobile_mode_check = QCheckBox("Mobile Mode (laptop)")
+        appearance_layout.addWidget(_with_info(
+            self.mobile_mode_check,
+            "One display and it is small, so the panel gets narrow and horizontal: "
+            "the buttons become small squares with a symbol for what they do and "
+            "the lamp, title, version line, and status readout shrink. The actions "
+            "are the same, they are just drawn instead of spelled out, and the "
+            "pointer shows each one what it does. The panel is sized at launch, "
+            "so switch this on or off and open TP DECK again.",
+        ))
+
+        self.fade_out_check = QCheckBox("Fade Out main UI")
+        appearance_layout.addWidget(_with_info(
+            self.fade_out_check,
+            "Five seconds after you stop touching the panel it starts easing "
+            "transparent, and finishes five seconds later, so you can see what "
+            "is behind it. Moving the pointer into the panel brings it back to "
+            "solid right away, and clicking anything keeps it solid. It never "
+            "goes fully see-through and the status lamp stays lit, so the panel "
+            "is always findable. Auto-cycle running or armed does not hold the "
+            "panel solid: it fades while it works on its own, and comes back "
+            "when you reach for it. Safe Shutdown countdown and an update "
+            "warning keep it solid because both ask you to act within five "
+            "seconds. Works with either panel size.",
+        ))
+
         preview_box = QGroupBox("Palette preview")
         preview_form = QFormLayout(preview_box)
         self.preview_title = QLabel("Scrape eBay Orders")
@@ -562,6 +588,8 @@ class SettingsDialog(QDialog):
             _clamp_int(settings.get("uline_lookup_timeout_ms", 20000), 1000, 120000)
         )
         self.uline_export_edit.setText(str(settings.get("uline_export_dir", "")))
+        self.mobile_mode_check.setChecked(bool(settings.get("mobile_mode", False)))
+        self.fade_out_check.setChecked(bool(settings.get("fade_out_main_ui", False)))
         theme_key = normalize_theme(settings.get("theme", "neutral"))
         index = self.theme_combo.findData(theme_key)
         if index < 0:
@@ -662,6 +690,8 @@ class SettingsDialog(QDialog):
             uline_url_pattern=self.uline_pattern_edit.text().strip() or "uline.com",
             uline_lookup_timeout_ms=self.uline_timeout_spin.value(),
             uline_export_dir=self.uline_export_edit.text().strip(),
+            mobile_mode=self.mobile_mode_check.isChecked(),
+            fade_out_main_ui=self.fade_out_check.isChecked(),
         )
         runtime_state.slow_razor_enabled = self.slow_razor_check.isChecked()
         theme_key = str(self.theme_combo.currentData() or "neutral")
@@ -672,6 +702,11 @@ class SettingsDialog(QDialog):
                 parent.set_slow_razor(runtime_state.slow_razor_enabled)
             if hasattr(parent, "apply_palette"):
                 parent.apply_palette(palette)
+            if hasattr(parent, "set_idle_fade_enabled"):
+                # The fade takes effect the moment Save is clicked; only the
+                # panel shape waits for the next launch, because that is what
+                # sets the window's fixed size.
+                parent.set_idle_fade_enabled(self.fade_out_check.isChecked())
         logger.info(
             "Settings saved: mode=%s ebay_port=%s erp_port=%s slow_razor=%s theme=%s",
             mode,

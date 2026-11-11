@@ -49,6 +49,8 @@ DEFAULTS: dict[str, Any] = {
     "uline_lookup_timeout_ms": 20000,
     "uline_export_dir": "",
     "theme": "neutral",
+    "mobile_mode": False,
+    "fade_out_main_ui": False,
 }
 
 

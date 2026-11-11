@@ -8,9 +8,10 @@ import random
 import time
 from typing import Callable, Optional
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QGuiApplication,
@@ -39,6 +40,7 @@ from tp_deck import app_version
 from tp_deck.settings_manager import load_settings, update_settings
 from tp_deck.theme import (
     NEUTRAL,
+    _MOBILE_ICON_EDGE,
     action_qss,
     cycle_qss,
     dashboard_qss,
@@ -56,6 +58,33 @@ logger = logging.getLogger("tpdeck")
 
 _DASHBOARD_HEIGHT = 372
 _DASHBOARD_HEIGHT_SLOW = 404
+# Laptop panel: one short row of square icon buttons, so the window is a wide,
+# low strip instead of a 300 by 372 column. The QSS boxes come from
+# theme.dashboard_qss(compact=True), which sizes them from the _MOBILE_ICON_EDGE
+# this module imports from tp_deck.theme, so the panel, the QSS, and the drawn
+# glyphs all agree on one button edge.
+_MOBILE_WIDTH = 8 * _MOBILE_ICON_EDGE + 7 * 6 + 12 + 12
+_MOBILE_HEIGHT = 112
+_MOBILE_HEIGHT_SLOW = 128
+# Idle transparency countdown. Interaction based only: auto-cycle, a running job,
+# and the results windows do not hold the panel solid. The floor keeps the panel
+# findable, and the lamp ring is drawn at full strength so it reads through the
+# glass. Kept fully separate from the shutdown grey ease and from input_blocked(),
+# which gates job starts and the auto-cycle loop.
+_IDLE_ARM_SECONDS = 5.0
+_IDLE_RAMP_SECONDS = 5.0
+_IDLE_FLOOR = 0.35
+# The laptop panel spells nothing out: each action is a square button carrying
+# one symbol, and the words stay in the tooltip so the pointer still says what
+# the square does. Symbols only replace the labels, never the object names, so
+# the fade, pulse, and cycle rules keep matching every button.
+_MOBILE_SYMBOLS = {
+    "execute": "\U0001f50d",  # magnifier: scrape the eBay order list
+    "pick": "\U0001f4cb",  # clipboard: generate the pick list
+    "batch": "\U0001f523",  # barcodes: batch serial from a sales order
+    "stop": "\U0001f6d1",  # stop sign: emergency stop
+    "settings": "\u2699",  # gear
+}
 _RAINBOW = (
     "#EF4444",
     "#F97316",
@@ -490,7 +519,9 @@ class ChassisLight(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setFixedSize(12, 12)
+        self._edge = 12
+        self._boost = 0.0
+        self.setFixedSize(self._edge, self._edge)
         self._state = "idle"
         self._phase = 0.0
         self._fade = 0.0
@@ -524,6 +555,23 @@ class ChassisLight(QWidget):
         self._phase = (self._phase + 0.05) % (math.tau)
         self.update()
 
+    def set_edge(self, edge: int) -> None:
+        """Lamp size for this panel shape. The drawing follows the box."""
+        self._edge = max(8, int(edge))
+        self.setFixedSize(self._edge, self._edge)
+        self.update()
+
+    def set_idle_boost(self, amount: float) -> None:
+        """Contrast while the panel is transparent.
+
+        Window opacity dims the whole panel at once, so the lamp cannot stay
+        fully solid. A ring in the theme's text color is the strongest mark
+        available, which keeps the lamp readable through the glass and shows
+        an error state's red rather than hiding it.
+        """
+        self._boost = max(0.0, min(1.0, amount))
+        self.update()
+
     def set_fade(self, amount: float) -> None:
         self._fade = max(0.0, min(1.0, amount))
         self.update()
@@ -550,9 +598,16 @@ class ChassisLight(QWidget):
                 QColor("#94A3B8"),
                 self._fade,
             )
+        margin = 1 if self._edge >= 12 else max(0.5, self._edge * 0.08)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
-        painter.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
+        painter.drawEllipse(self.rect().adjusted(margin, margin, -margin, -margin))
+        if self._boost > 0:
+            ring = QPen(QColor(self._palette["text"]))
+            ring.setWidthF(max(1.0, self._edge * 0.09))
+            painter.setPen(ring)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(self.rect().adjusted(margin, margin, -margin, -margin))
         painter.end()
 
 
@@ -625,7 +680,8 @@ class PowerButton(QPushButton):
         super().__init__(parent)
         self._fade = 0.0
         self._palette = NEUTRAL
-        self.setFixedSize(36, 36)
+        self._edge = 36
+        self.setFixedSize(self._edge, self._edge)
 
     def set_palette(self, p: dict[str, str]) -> None:
         self._palette = p
@@ -635,23 +691,32 @@ class PowerButton(QPushButton):
         self._fade = max(0.0, min(1.0, amount))
         self.update()
 
+    def set_edge(self, edge: int) -> None:
+        """Resize the button. The glyph is drawn from the box, so it follows."""
+        self._edge = max(20, int(edge))
+        self.setFixedSize(self._edge, self._edge)
+        self.update()
+
     def paintEvent(self, event) -> None:  # noqa: N802 — Qt override
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         color = _palette_mix(self._palette, "text", self._fade)
         pen = QPen(color)
-        pen.setWidthF(1.8)
+        pen.setWidthF(1.8 * self._edge / 36.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        side = 14.0
+        side = 14.0 * self._edge / 36.0
         left = (self.width() - side) / 2
-        top = (self.height() - side) / 2 + 1
+        top = (self.height() - side) / 2 + self._edge / 36.0
         rect = QRectF(left, top, side, side)
         painter.drawArc(rect, int(125 * 16), int(290 * 16))
         center = rect.center()
-        painter.drawLine(QPointF(center.x(), center.y() - 1), QPointF(center.x(), rect.top() - 2))
+        painter.drawLine(
+            QPointF(center.x(), center.y() - 1.0 * self._edge / 36.0),
+            QPointF(center.x(), rect.top() - 2.0 * self._edge / 36.0),
+        )
         painter.end()
 
 
@@ -662,7 +727,8 @@ class ToolboxButton(QPushButton):
         super().__init__(parent)
         self._fade = 0.0
         self._palette = NEUTRAL
-        self.setFixedSize(36, 36)
+        self._edge = 36
+        self.setFixedSize(self._edge, self._edge)
 
     def set_palette(self, p: dict[str, str]) -> None:
         self._palette = p
@@ -672,21 +738,30 @@ class ToolboxButton(QPushButton):
         self._fade = max(0.0, min(1.0, amount))
         self.update()
 
+    def set_edge(self, edge: int) -> None:
+        """Resize the button. The art is drawn at 36 and scaled, so a smaller
+        box cannot overflow its coordinates.
+        """
+        self._edge = max(20, int(edge))
+        self.setFixedSize(self._edge, self._edge)
+        self.update()
+
     def paintEvent(self, event) -> None:  # noqa: N802 — Qt override
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = self._edge / 36.0
         color = _palette_mix(self._palette, "text", self._fade)
         pen = QPen(color)
-        pen.setWidthF(1.6)
+        pen.setWidthF(1.6 * s)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(QRectF(9, 15, 18, 12), 2, 2)
-        painter.drawLine(QPointF(9, 20), QPointF(27, 20))
-        painter.drawRoundedRect(QRectF(14, 10, 8, 5), 1.5, 1.5)
-        painter.drawRoundedRect(QRectF(16, 18, 4, 4), 1, 1)
+        painter.drawRoundedRect(QRectF(9 * s, 15 * s, 18 * s, 12 * s), 2 * s, 2 * s)
+        painter.drawLine(QPointF(9 * s, 20 * s), QPointF(27 * s, 20 * s))
+        painter.drawRoundedRect(QRectF(14 * s, 10 * s, 8 * s, 5 * s), 1.5 * s, 1.5 * s)
+        painter.drawRoundedRect(QRectF(16 * s, 18 * s, 4 * s, 4 * s), 1 * s, 1 * s)
         painter.end()
 
 
@@ -711,6 +786,15 @@ class StatusWell(QWidget):
 
     def set_palette(self, p: dict[str, str]) -> None:
         self._palette = p
+        self.update()
+
+    def set_compact(self, compact: bool) -> None:
+        """Shrink the readout for the laptop panel. The drawing follows the box.
+
+        The track only draws inside the box, so a shorter well cannot clip it.
+        """
+        self.setMinimumHeight(30 if compact else 68)
+        self.setFont(QFont("Consolas", 7 if compact else 9))
         self.update()
 
     def set_fade(self, amount: float) -> None:
@@ -874,6 +958,15 @@ class Dashboard(QMainWindow):
         self._update_restore_enabled: Optional[list[bool]] = None
         self._quitting = False
         self._palette = _startup_palette()
+        # The panel shape is chosen at launch: Settings says so, because the
+        # window is fixed-sized and a mid-session resize would move it around
+        # on the operator's screens. The idle fade is read here too, but
+        # set_idle_fade_enabled turns it on or off for a session already open.
+        launch_settings = load_settings()
+        self._compact = bool(launch_settings.get("mobile_mode", False))
+        self._idle_fade_enabled = False
+        self._idle_touched = time.monotonic()
+        self._idle_opacity = 1.0
 
         self.setWindowTitle("TP DECK")
         self.setWindowFlags(
@@ -886,12 +979,18 @@ class Dashboard(QMainWindow):
         self._update_timer.timeout.connect(self._tick_update_warning)
         self._rainbow_timer = QTimer(self)
         self._rainbow_timer.timeout.connect(self._tick_rainbow)
-        self.setFixedSize(300, _DASHBOARD_HEIGHT)
-        self.setStyleSheet(dashboard_qss(self._palette))
+        self._idle_timer = QTimer(self)
+        self._idle_timer.timeout.connect(self._tick_idle_fade)
+        self.setFixedSize(
+            _MOBILE_WIDTH if self._compact else 300,
+            _MOBILE_HEIGHT if self._compact else _DASHBOARD_HEIGHT,
+        )
+        self.setStyleSheet(dashboard_qss(self._palette, compact=self._compact))
 
         self._build_ui()
         self._restore_position()
         self._persist_enabled = True
+        self.set_idle_fade_enabled(bool(launch_settings.get("fade_out_main_ui", False)))
         self.set_status("Idle")
 
     def _build_ui(self) -> None:
@@ -900,14 +999,22 @@ class Dashboard(QMainWindow):
         self.setCentralWidget(root)
 
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        if self._compact:
+            # A short strip: less vertical chrome, so the row of squares and
+            # the shrunk title block are what the operator actually reads.
+            layout.setContentsMargins(12, 8, 12, 8)
+            layout.setSpacing(4)
+        else:
+            layout.setContentsMargins(12, 10, 12, 10)
+            layout.setSpacing(8)
 
         title_row = QHBoxLayout()
         title_row.setSpacing(6)
         title_row.addStretch()
         self._light = ChassisLight()
         self._light.set_click_handler(self._handle_urgent)
+        if self._compact:
+            self._light.set_edge(9)
         title_row.addWidget(self._light)
         title_col = QVBoxLayout()
         title_col.setSpacing(0)
@@ -919,9 +1026,11 @@ class Dashboard(QMainWindow):
         self._version = QLabel(f"// {app_version()} //")
         self._version.setObjectName("versionLabel")
         self._version.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        version_font = QFont("Consolas", 8)
+        version_font = QFont("Consolas", 7 if self._compact else 8)
         version_font.setBold(True)
-        version_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.2)
+        version_font.setLetterSpacing(
+            QFont.SpacingType.AbsoluteSpacing, 1.0 if self._compact else 2.2
+        )
         self._version.setFont(version_font)
         self._version.setToolTip(f"TP DECK {app_version()}")
         title_col.addWidget(self._version)
@@ -940,7 +1049,13 @@ class Dashboard(QMainWindow):
         layout.addWidget(self._slow_label)
 
         self._well = StatusWell()
+        if self._compact:
+            self._well.set_compact(True)
         layout.addWidget(self._well)
+
+        if self._compact:
+            self._build_compact_buttons(layout)
+            return
 
         scrape_row = QHBoxLayout()
         scrape_row.setSpacing(8)
@@ -1002,6 +1117,52 @@ class Dashboard(QMainWindow):
 
         layout.addLayout(row)
 
+    def _build_compact_buttons(self, layout: QVBoxLayout) -> None:
+        """One row of square symbol buttons: the laptop panel's whole body.
+
+        Eight squares, six pixels apart, inside the twelve-pixel margins, is
+        exactly _MOBILE_WIDTH, so the row cannot be squeezed and the QSS boxes
+        (all sized from _MOBILE_ICON_EDGE) agree with the window. The words
+        only exist in the tooltips, which is what the pointer reads.
+        """
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        edge = _MOBILE_ICON_EDGE
+        specs = (
+            ("execute_btn", QPushButton(_MOBILE_SYMBOLS["execute"]), "executeBtn",
+             "Scrape eBay Orders", self._handle_execute),
+            ("pick_btn", QPushButton(_MOBILE_SYMBOLS["pick"]), "pickBtn",
+             "Generate Pick List", self._handle_pick_list),
+            ("batch_btn", QPushButton(_MOBILE_SYMBOLS["batch"]), "batchBtn",
+             "Batch Serial", self._handle_batch_serial),
+            ("cycle_btn", CycleButton(), "cycleBtn",
+             "Auto-cycle eBay scrape", self._handle_cycle),
+            ("stop_btn", QPushButton(_MOBILE_SYMBOLS["stop"]), "stopBtn",
+             "Emergency Stop", self._handle_stop),
+            ("power_btn", PowerButton(), "powerBtn",
+             "Safe Shutdown", self._handle_power),
+            ("tools_btn", ToolboxButton(), "toolsBtn",
+             "Tools", self._handle_tools),
+            ("settings_btn", QPushButton(_MOBILE_SYMBOLS["settings"]), "settingsBtn",
+             "Settings", self._handle_settings),
+        )
+        for name, widget, object_name, tip, handler in specs:
+            widget.setObjectName(object_name)
+            widget.setToolTip(tip)
+            widget.clicked.connect(handler)
+            # PowerButton and ToolboxButton draw their glyph from the box, so
+            # they resize themselves; the rest are plain squares.
+            if hasattr(widget, "set_edge"):
+                widget.set_edge(edge)
+            else:
+                widget.setFixedSize(edge, edge)
+            setattr(self, name, widget)
+            row.addWidget(widget)
+        self.cycle_btn.setIcon(_cycle_icon(QColor(self._palette["text"])))
+        self.cycle_btn.setIconSize(QSize(edge - 10, edge - 10))
+        layout.addLayout(row)
+
     def palette(self) -> dict[str, str]:
         """The palette this panel is themed with."""
         return self._palette
@@ -1009,7 +1170,7 @@ class Dashboard(QMainWindow):
     def apply_palette(self, p: dict[str, str]) -> None:
         """Re-theme the panel, its painted widgets, and any report windows."""
         self._palette = p
-        self.setStyleSheet(dashboard_qss(p))
+        self.setStyleSheet(dashboard_qss(p, compact=self._compact))
         self._light.set_palette(p)
         self._well.set_palette(p)
         self.cycle_btn.set_palette(p)
@@ -1062,10 +1223,29 @@ class Dashboard(QMainWindow):
         self._active = bool(active)
         self._apply_lamp()
 
+    def _action_labels(self) -> tuple[str, str, str]:
+        """Labels the three action buttons carry now.
+
+        The laptop panel keeps its symbols instead of words: a 28-pixel square
+        cannot hold "Generate Pick List", and the tooltip already says it.
+        """
+        if self._compact:
+            return (
+                _MOBILE_SYMBOLS["execute"],
+                _MOBILE_SYMBOLS["pick"],
+                _MOBILE_SYMBOLS["batch"],
+            )
+        return "Scrape eBay Orders", "Generate Pick List", "Batch Serial"
+
     def set_serial_queued(self, queued: bool) -> None:
         self._serial_queued = bool(queued)
         if not (self._active and self._job == "serials"):
-            self.batch_btn.setText("Queued" if self._serial_queued else "Batch Serial")
+            if self._compact:
+                # The lamp already reads "running" for a queued order, and the
+                # symbol cannot say Queued, so the words are dropped here.
+                self.batch_btn.setText(_MOBILE_SYMBOLS["batch"])
+            else:
+                self.batch_btn.setText("Queued" if self._serial_queued else "Batch Serial")
         self._apply_lamp()
 
     def input_blocked(self) -> bool:
@@ -1087,6 +1267,7 @@ class Dashboard(QMainWindow):
 
     def _handle_urgent(self) -> None:
         """Hidden lamp click. Ignored while a job or an update warning is up."""
+        self.mark_touched()
         if self._active or self.input_blocked():
             return
         if self._on_urgent_sync:
@@ -1094,6 +1275,7 @@ class Dashboard(QMainWindow):
 
     def begin_urgent_sync(self) -> None:
         """Purple lamp and a rainbow pulse on the three action buttons."""
+        self.mark_touched()
         self._urgent = True
         self._paint_rainbow()
         if not self._rainbow_timer.isActive():
@@ -1140,6 +1322,7 @@ class Dashboard(QMainWindow):
         """Ease the panel to grey over 5 seconds, then start Safe Shutdown."""
         if self._armed or self._shutting_down:
             return
+        self.mark_touched()
         self._armed = True
         self._arm_started = time.monotonic()
         self._apply_fade(0.0)
@@ -1148,6 +1331,7 @@ class Dashboard(QMainWindow):
 
     def cancel_shutdown_arm(self) -> None:
         """Restore the normal colors and leave the app open."""
+        self.mark_touched()
         self._armed = False
         self._shutting_down = False
         self._arm_timer.stop()
@@ -1160,6 +1344,7 @@ class Dashboard(QMainWindow):
         Both alternate yellow and green.
         """
         self._update_kind = kind if kind in {"app", "chrome", "both"} else "app"
+        self.mark_touched()
         buttons = (self.execute_btn, self.pick_btn, self.batch_btn)
         self._update_restore_enabled = [button.isEnabled() for button in buttons]
         self._update_cancelled = False
@@ -1173,6 +1358,7 @@ class Dashboard(QMainWindow):
 
     def cancel_update_warning(self) -> bool:
         """Stop the pulse. True only when a warning was still running."""
+        self.mark_touched()
         if not self._update_warning:
             return False
         self._update_cancelled = True
@@ -1226,10 +1412,71 @@ class Dashboard(QMainWindow):
         for button in (self.execute_btn, self.pick_btn, self.batch_btn):
             button.setStyleSheet(qss)
 
+    def set_idle_fade_enabled(self, enabled: bool) -> None:
+        """Turn the idle transparency on or off for a session already open."""
+        self._idle_fade_enabled = bool(enabled)
+        if self._idle_fade_enabled:
+            if not self._idle_timer.isActive():
+                self._idle_timer.start(250)
+            return
+        if self._idle_opacity < 1.0:
+            self._apply_idle_fade(0.0)
+
+    def mark_touched(self) -> None:
+        """The operator reached for the panel: it goes back solid."""
+        self._idle_touched = time.monotonic()
+        if self._idle_opacity < 1.0:
+            self._apply_idle_fade(0.0)
+
+    def _hovering(self) -> bool:
+        """True while the pointer is inside the panel's box."""
+        frame = self.frameGeometry()
+        point = QCursor.pos()
+        return frame.contains(point.x(), point.y())
+
+    def _apply_idle_fade(self, amount: float) -> None:
+        """Ease the whole window toward transparent, never fully clear.
+
+        The whole panel dims at once, which is why ChassisLight draws a bright
+        ring through set_idle_boost: the lamp is the mark that has to stay
+        findable behind the glass. _IDLE_FLOOR is the floor, so the panel can
+        always be seen and clicked. This is separate from the shutdown grey
+        ease in _apply_fade, which changes colors, not window alpha.
+        """
+        t = max(0.0, min(1.0, amount))
+        opacity = 1.0 - t * (1.0 - _IDLE_FLOOR)
+        self._idle_opacity = opacity
+        self.setWindowOpacity(opacity)
+        self._light.set_idle_boost(t)
+
+    def _tick_idle_fade(self) -> None:
+        if not self._idle_fade_enabled:
+            return
+        if self.input_blocked():
+            # Safe Shutdown and an update warning both ask for a click inside
+            # five seconds, so they hold the panel solid while they run.
+            if self._idle_opacity < 1.0:
+                self._apply_idle_fade(0.0)
+            return
+        if self._hovering():
+            self._idle_touched = time.monotonic()
+            if self._idle_opacity < 1.0:
+                self._apply_idle_fade(0.0)
+            return
+        elapsed = time.monotonic() - self._idle_touched
+        ramp = (elapsed - _IDLE_ARM_SECONDS) / _IDLE_RAMP_SECONDS
+        if ramp <= 0:
+            return
+        self._apply_idle_fade(min(1.0, ramp))
+
     def mark_shutting_down(self) -> None:
         self._armed = False
         self._shutting_down = True
         self._arm_timer.stop()
+        # The grey ease is the last thing the operator sees, so the glass stays
+        # solid while it plays.
+        if self._idle_opacity < 1.0:
+            self._apply_idle_fade(0.0)
         self._apply_fade(1.0)
 
     def _tick_shutdown_arm(self) -> None:
@@ -1319,6 +1566,11 @@ class Dashboard(QMainWindow):
     def set_slow_razor(self, enabled: bool) -> None:
         """Show the session flag. The window grows only while it is on."""
         self._slow_label.setVisible(bool(enabled))
+        if self._compact:
+            self.setFixedHeight(
+                _MOBILE_HEIGHT_SLOW if enabled else _MOBILE_HEIGHT
+            )
+            return
         self.setFixedHeight(
             _DASHBOARD_HEIGHT_SLOW if enabled else _DASHBOARD_HEIGHT
         )
@@ -1400,14 +1652,18 @@ class Dashboard(QMainWindow):
                 self.execute_btn.setEnabled(False)
                 self.pick_btn.setEnabled(False)
                 self.batch_btn.setEnabled(job in {"cycle", "serials"})
-            if job == "picklist":
-                self.pick_btn.setText("⏳ Processing...")
-            elif job == "serials":
-                self.batch_btn.setText("⏳ Processing...")
-            else:
-                self.execute_btn.setText("⏳ Processing...")
-            if job == "cycle" and self._serial_queued:
-                self.batch_btn.setText("Queued")
+            if not self._compact:
+                # A 28-pixel square cannot hold "⏳ Processing...", so there the
+                # greyed-out button, the lamp, and the well's "Processing" say
+                # it instead. The button is still disabled above either way.
+                if job == "picklist":
+                    self.pick_btn.setText("⏳ Processing...")
+                elif job == "serials":
+                    self.batch_btn.setText("⏳ Processing...")
+                else:
+                    self.execute_btn.setText("⏳ Processing...")
+                if job == "cycle" and self._serial_queued:
+                    self.batch_btn.setText("Queued")
             self.set_status("Processing")
         else:
             self.clear_progress()
@@ -1416,40 +1672,47 @@ class Dashboard(QMainWindow):
                 self.pick_btn.setEnabled(True)
                 self.batch_btn.setEnabled(True)
                 self.cycle_btn.setEnabled(True)
-            self.execute_btn.setText("Scrape eBay Orders")
-            self.pick_btn.setText("Generate Pick List")
-            self.batch_btn.setText("Queued" if self._serial_queued else "Batch Serial")
+            execute, pick, batch = self._action_labels()
+            self.execute_btn.setText(execute)
+            self.pick_btn.setText(pick)
+            self.batch_btn.setText(batch)
             self._apply_lamp()
 
     def _handle_execute(self) -> None:
+        self.mark_touched()
         if self.input_blocked():
             return
         if self._on_execute:
             self._on_execute()
 
     def _handle_pick_list(self) -> None:
+        self.mark_touched()
         if self.input_blocked():
             return
         if self._on_pick_list:
             self._on_pick_list()
 
     def _handle_batch_serial(self) -> None:
+        self.mark_touched()
         if self.input_blocked():
             return
         if self._on_batch_serial:
             self._on_batch_serial()
 
     def _handle_cycle(self) -> None:
+        self.mark_touched()
         if self.input_blocked():
             return
         if self._on_cycle:
             self._on_cycle()
 
     def _handle_stop(self) -> None:
+        self.mark_touched()
         if self._on_stop:
             self._on_stop()
 
     def _handle_power(self) -> None:
+        self.mark_touched()
         if self._armed or self._shutting_down or self._update_warning:
             return
         if self._on_arm_shutdown:
@@ -1458,12 +1721,14 @@ class Dashboard(QMainWindow):
         self.begin_shutdown_arm()
 
     def _handle_tools(self) -> None:
+        self.mark_touched()
         if self.input_blocked():
             return
         if self._on_open_tools:
             self._on_open_tools()
 
     def _handle_settings(self) -> None:
+        self.mark_touched()
         if self.input_blocked():
             return
         if self._on_open_settings:
