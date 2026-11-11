@@ -82,6 +82,25 @@ class NormalizeItem(unittest.TestCase):
         self.assertEqual(parse_price("$0.80"), 0.8)
         self.assertIsNone(parse_price("ADD"))
 
+    def test_suffixed_item_number_is_not_shortened(self):
+        # H-64B used to resolve to H-64, which is a different real Uline item,
+        # so the builder opened and ordered the wrong product.
+        self.assertEqual(normalize_item("H-64B"), "H-64B")
+        self.assertEqual(normalize_item("h-64 b"), "H-64B")
+        self.assertEqual(normalize_item("H-64B-2"), "H-64B-2")
+        self.assertEqual(normalize_item("H-1150A"), "H-1150A")
+        self.assertTrue(is_item_shape("H-64B"))
+        self.assertTrue(looks_like_item("H-64B"))
+
+    def test_a_number_too_long_is_left_alone(self):
+        # Never cut a long number down to a shorter one that could name a real
+        # item; leave it alone so the caller reports it instead.
+        self.assertEqual(normalize_item("H-1234567X"), "H-1234567X")
+        self.assertEqual(normalize_item("H-64-"), "H-64-")
+        self.assertEqual(normalize_item("H-64--B"), "H-64--B")
+        self.assertFalse(is_item_shape("H-64-"))
+        self.assertFalse(is_item_shape("H-64--B"))
+
 
 class TierRule(unittest.TestCase):
     def test_highest_qualifying_tier_wins(self):
@@ -821,6 +840,30 @@ class DialogLogic(unittest.TestCase):
         self.assertIn("foam", dialog._error.text())
         self.assertIn("S-4307", dialog._error.text())
 
+    def test_an_item_number_with_a_tail_orders_the_whole_number(self):
+        """Typing H-64B must not be cut to H-64, which is another product.
+
+        The old normalize_item dropped the letter that follows the number, so
+        the order tab looked up and ordered H-64 while the operator meant H-64B.
+        The tail has to survive the whole way: from the typed text, through the
+        lookup key, onto the line, and into the draft on disk."""
+        dialog = self.dialog()
+        dialog._key_edit.setText("h-64 b")  # typed lower case with a space
+        dialog._alias_edit.setText("grab bar")
+        dialog._qty_spin.setValue(2)
+        dialog._add()
+        found = UlineItem(item="H-64B", name="Galvanized grab bar", price=3.0,
+                          units_per_set=12, unit="Pack", min_sets=1,
+                          base_unit="Pack", tiers=((1, 3.0),), aliases=(),
+                          url="", in_stock=True, note="chart", added="",
+                          checked="")
+        self.calls[0](True, found, "")
+        self.assertEqual(dialog._lines[0].item, "H-64B")
+        self.assertEqual(uline_order.load_draft()[0].item, "H-64B")
+        # the cache is filed under the whole number, so the next add hits it
+        self.assertIn("H-64B", dialog._cache)
+        self.assertIn("H-64B", uline_cache.load_cache())
+
     def test_cache_disk_failure_stays_on_the_error_after_add(self):
         from tp_deck import uline_dialog as dmod
 
@@ -1032,6 +1075,25 @@ class LazyMode(unittest.TestCase):
         self.assertEqual(line.needed_units, 4)
         self.assertIn("lazy", dialog._status.text())
         self.assertEqual(uline_order.load_draft()[0].lazy_pending, True)
+
+    def test_lazy_entry_keeps_the_item_number_tail(self):
+        """Lazy mode files the number as it was meant: H-64B stays whole.
+
+        The tail used to be dropped before the entry was stored, so a lazy
+        line meant H-64 and the later pass filled in a different product. The
+        line, its pending key and the draft on disk all have to carry the
+        whole number."""
+        dialog = self.dialog()
+        dialog._lazy_btn.setChecked(True)
+        dialog._key_edit.setText("h-64 b")
+        dialog._alias_edit.setText("grab bar")
+        dialog._add()
+        self.assertEqual(len(self.calls), 0)  # no Uline tab opened
+        line = dialog._lines[0]
+        self.assertEqual(line.item, "H-64B")
+        self.assertEqual(line.lazy_key, "H-64B")
+        self.assertTrue(line.lazy_pending)
+        self.assertEqual(uline_order.load_draft()[0].item, "H-64B")
 
     def test_lazy_off_opens_every_lazy_entry_in_parallel(self):
         dialog = self.dialog()

@@ -15,7 +15,11 @@ logger = logging.getLogger("tpdeck")
 
 CACHE_PATH = Path(__file__).resolve().parent / "uline_cache.json"
 _WSPACE = re.compile(r"\s+")
-_ITEM_SHAPE = re.compile(r"^[A-Z]{1,3}-\d{1,6}(-[A-Z0-9]+)?$")
+# An item number is a one to three letter prefix, a dash, one to six digits, and
+# an optional tail. The tail may be glued to the digits (H-64B, H-1150A) or dash
+# separated (H-992-ROLLER), and either form may carry further dash groups.
+_ITEM_SHAPE = re.compile(r"^[A-Z]{1,3}-\d{1,6}[A-Z0-9]*(?:-[A-Z0-9]+)?$")
+_ITEM_PREFIX = re.compile(r"^([A-Z]{1,3})-?(\d{1,6})([A-Z0-9]*(?:-[A-Z0-9]+)?)?")
 
 
 def normalize_item(text: str) -> str:
@@ -25,6 +29,12 @@ def normalize_item(text: str) -> str:
     labels (11,633), so commas are stripped before the shape check. Without
     that, "s-11,633" matched only the first digits and returned "S-11", which
     is a real Uline page for a different item.
+
+    The fallback keeps the whole tail, not just the digits. Dropping it turned
+    "H-64B" into "H-64", and H-64 is a real Uline item, so the builder opened
+    and ordered a different product than the one typed. A tail that cannot be
+    represented is left exactly as typed so the caller can report it, never
+    shortened behind the user's back.
     """
     raw = unicodedata.normalize("NFKC", str(text or ""))
     raw = raw.replace(",", "").strip()
@@ -32,9 +42,15 @@ def normalize_item(text: str) -> str:
     raw = re.sub(r"/", "-", raw)
     if _ITEM_SHAPE.match(raw):
         return raw
-    match = re.match(r"^([A-Z]{1,3})-?(\d{1,6})", raw)
+    match = _ITEM_PREFIX.match(raw)
     if match:
-        return f"{match.group(1)}-{match.group(2)}"
+        tail = match.group(3) or ""
+        rebuilt = f"{match.group(1)}-{match.group(2)}{tail}"
+        if match.end() == len(raw):
+            return rebuilt
+        # Characters left over are not a tail we can represent, so the text
+        # stays as typed and is reported instead of being cut down.
+        return raw
     return raw
 
 
