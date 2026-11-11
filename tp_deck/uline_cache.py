@@ -16,10 +16,14 @@ logger = logging.getLogger("tpdeck")
 CACHE_PATH = Path(__file__).resolve().parent / "uline_cache.json"
 _WSPACE = re.compile(r"\s+")
 # An item number is a one to three letter prefix, a dash, one to six digits, and
-# an optional tail. The tail may be glued to the digits (H-64B, H-1150A) or dash
-# separated (H-992-ROLLER), and either form may carry further dash groups.
-_ITEM_SHAPE = re.compile(r"^[A-Z]{1,3}-\d{1,6}[A-Z0-9]*(?:-[A-Z0-9]+)?$")
-_ITEM_PREFIX = re.compile(r"^([A-Z]{1,3})-?(\d{1,6})([A-Z0-9]*(?:-[A-Z0-9]+)?)?")
+# an optional tail. A tail glued to the digits is letters only (H-64B, H-1150A);
+# digits only count as the tail once a dash starts it (S-4307-2, H-992-ROLLER).
+# That split is what keeps a too-long digit run out: "H-1234567" is not an item
+# number at all, so it fails this shape and the caller reports it or searches it,
+# instead of opening the product page for a shortened number that names a real
+# product someone could order by mistake.
+_ITEM_SHAPE = re.compile(r"^[A-Z]{1,3}-\d{1,6}(?:[A-Z]+)?(?:-[A-Z0-9]+)*$")
+_ITEM_PREFIX = re.compile(r"^([A-Z]{1,3})-?(\d{1,6})((?:[A-Z]+)?(?:-[A-Z0-9]+)*)")
 
 
 def normalize_item(text: str) -> str:

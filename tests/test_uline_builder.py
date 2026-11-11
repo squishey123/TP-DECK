@@ -92,7 +92,7 @@ class NormalizeItem(unittest.TestCase):
         self.assertTrue(is_item_shape("H-64B"))
         self.assertTrue(looks_like_item("H-64B"))
 
-    def test_a_number_too_long_is_left_alone(self):
+    def test_a_number_too_long_is_left_alone_and_never_an_item(self):
         # Never cut a long number down to a shorter one that could name a real
         # item; leave it alone so the caller reports it instead.
         self.assertEqual(normalize_item("H-1234567X"), "H-1234567X")
@@ -100,6 +100,19 @@ class NormalizeItem(unittest.TestCase):
         self.assertEqual(normalize_item("H-64--B"), "H-64--B")
         self.assertFalse(is_item_shape("H-64-"))
         self.assertFalse(is_item_shape("H-64--B"))
+        # Seven digits is too many for an item number, and a tail glued to the
+        # number is letters only, so the extra digits do not count as a tail:
+        # this text is not an item at all. Left as one, it would send the
+        # builder to /Product/Detail/H-1234567, a page it makes up itself, and
+        # an order could be filed against a number nobody typed. It has to go
+        # to keyword search instead, which is what looks_like_item decides.
+        self.assertFalse(is_item_shape("H-1234567"))
+        self.assertFalse(looks_like_item("H-1234567"))
+        self.assertFalse(is_item_shape("H-1234567X"))
+        self.assertFalse(looks_like_item("H-1234567X"))
+        self.assertFalse(looks_like_item("S-12345678"))
+        self.assertFalse(is_item_shape("H-64B2"))
+        self.assertFalse(looks_like_item("H-64B2"))
 
 
 class TierRule(unittest.TestCase):
