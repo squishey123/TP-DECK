@@ -154,6 +154,19 @@ class MobilePanel(unittest.TestCase):
             self.assertEqual(dashboard.execute_btn.text(), "Scrape eBay Orders")
             self.assertEqual(dashboard.pick_btn.text(), "Generate Pick List")
             self.assertEqual(dashboard.batch_btn.text(), "Batch Serial")
+            self.assertIn("Emergency Stop", dashboard.stop_btn.text())
+            # the compact square button must not leak onto the normal panel:
+            # boxed to the glyph size there, Emergency Stop came up as a 10 px
+            # sliver with its words cut, which a test that never shows a
+            # window cannot see. The sheet is what draws it, so the sheet is
+            # what is checked: the normal panel leaves the height open (the
+            # sheet's own no-limit value) and carries no glyph-size box.
+            _, _, after = dashboard.styleSheet().partition("QPushButton#stopBtn {")
+            stop_rule = after.partition("}")[0]
+            self.assertTrue(stop_rule.strip())
+            self.assertIn("max-height: 16777215px", stop_rule)
+            self.assertNotIn(f"max-height: {_MOBILE_ICON_EDGE}px", stop_rule)
+            self.assertNotIn(f"min-height: {_MOBILE_ICON_EDGE}px", stop_rule)
             dashboard.set_slow_razor(True)
             self.assertEqual(dashboard.height(), _DASHBOARD_HEIGHT_SLOW)
 
@@ -162,16 +175,22 @@ class IdleFade(unittest.TestCase):
     def test_nothing_fades_until_the_setting_is_on(self):
         with _launch(fade_out_main_ui=False):
             dashboard = Dashboard()
+            # off at launch means no watch ticking: the timer only runs while
+            # the setting is on, so an idle panel costs nothing
+            self.assertFalse(dashboard._idle_timer.isActive())
             _left_alone_for(dashboard, _IDLE_ARM_SECONDS + _IDLE_RAMP_SECONDS)
             dashboard._tick_idle_fade()
             self.assertAlmostEqual(dashboard.windowOpacity(), 1.0, places=_OPACITY_PLACES)
             # turning it on mid-session starts the countdown and fades
             dashboard.set_idle_fade_enabled(True)
+            self.assertTrue(dashboard._idle_timer.isActive())
             _left_alone_for(dashboard, _IDLE_ARM_SECONDS + _IDLE_RAMP_SECONDS)
             dashboard._tick_idle_fade()
             self.assertAlmostEqual(dashboard.windowOpacity(), _IDLE_FLOOR, places=_OPACITY_PLACES)
             dashboard.set_idle_fade_enabled(False)
             self.assertAlmostEqual(dashboard.windowOpacity(), 1.0, places=_OPACITY_PLACES)
+            # turning it off drops the watch too, not just the glass
+            self.assertFalse(dashboard._idle_timer.isActive())
 
     def test_five_idle_seconds_start_a_five_second_ramp_to_the_floor(self):
         with _launch(fade_out_main_ui=True):
@@ -327,8 +346,11 @@ class SettingsWiring(unittest.TestCase):
                 dialog._save()
                 self.assertIs(written["mobile_mode"], True)
                 self.assertIs(written["fade_out_main_ui"], False)
-                # Save reaches the open panel: the glass goes back solid
+                # Save reaches the open panel: the glass goes back solid, and
+                # the watch that was ticking every 250 ms is switched off with
+                # it, so the rest of the session costs nothing
                 self.assertFalse(dashboard._idle_fade_enabled)
+                self.assertFalse(dashboard._idle_timer.isActive())
                 self.assertAlmostEqual(dashboard.windowOpacity(), 1.0,
                                        places=_OPACITY_PLACES)
                 # the strip keeps the shape it had at launch, so the shape is

@@ -1419,6 +1419,10 @@ class Dashboard(QMainWindow):
             if not self._idle_timer.isActive():
                 self._idle_timer.start(250)
             return
+        # Off also drops the watch: a timer that keeps ticking every 250 ms
+        # would burn the rest of the session for nothing.
+        if self._idle_timer.isActive():
+            self._idle_timer.stop()
         if self._idle_opacity < 1.0:
             self._apply_idle_fade(0.0)
 
