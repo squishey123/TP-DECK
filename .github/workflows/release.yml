@@ -47,3 +47,84 @@ jobs:
             Embeddable Python zip. Unzip and run `TP-DECK.bat`.
 
             Opening TP DECK starts Chromium minimized (first run needs network once to download it). Log into eBay Seller Hub and the ERP in that window once.
+
+      # Notes are written AFTER the release exists, because the create step above
+      # overwrites any body written earlier (GitHubReleases rule 8). The commit subjects
+      # since the previous v* release are what get summarized here, so no conversation
+      # needs local GitHub auth to ship notes: secrets.GITHUB_TOKEN comes from the
+      # contents: write permission already declared for this job. A failure in this step
+      # is caught on purpose, so a notes glitch can never un-publish a built zip.
+      - name: Write release notes from the commits in this tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env.TAG
+          $repo = $env.REPO
+          $sha = $env.SHA
+          try {
+            $releases = gh api "repos/$repo/releases?per_page=100" --jq ".[].tag_name"
+            $prev = ""
+            foreach ($candidate in $releases) {
+              if ("$candidate" -ne "$tag") { $prev = "$candidate"; break }
+            }
+            if (-not $prev) {
+              Write-Host "No earlier release to compare against, so the placeholder body stays."
+              exit 0
+            }
+            $subjects = gh api "repos/$repo/compare/$prev...$sha" --jq '.commits[].commit_message | split("\n")[0]'
+            $headings = @("New", "Fixed", "Docs", "Tests", "Other")
+            $kindToHeading = @{ feat = "New"; fix = "Fixed"; docs = "Docs"; test = "Tests" }
+            $buckets = [ordered]@{}
+            foreach ($heading in $headings) { $buckets[$heading] = @() }
+            foreach ($subject in $subjects) {
+              $text = "$subject"
+              $colon = $text.IndexOf(":")
+              if ($colon -gt 0) {
+                $kind = $text.Substring(0, $colon).Trim().TrimEnd("!").Split("(")[0].ToLower()
+                $text = $text.Substring($colon + 1).Trim()
+              } else {
+                $kind = ""
+              }
+              if ($kindToHeading.ContainsKey($kind)) {
+                $heading = $kindToHeading[$kind]
+              } else {
+                $heading = "Other"
+              }
+              if ($text.Length -gt 1) {
+                $text = $text.Substring(0, 1).ToUpper() + $text.Substring(1)
+              }
+              $buckets[$heading] += "- $text"
+            }
+            $lines = @()
+            foreach ($heading in $headings) {
+              if ($buckets[$heading].Count -eq 0) { continue }
+              $lines += "### $heading"
+              $lines += $buckets[$heading]
+              $lines += ""
+            }
+            $body = @(
+              "TP DECK $tag",
+              "",
+              'Embeddable Python zip. Unzip and run `TP-DECK.bat`.',
+              '',
+              'Opening TP DECK starts Chromium minimized (first run needs network once to download it). Log into eBay Seller Hub and the ERP in that window once.',
+              ''
+            ) + $lines + @("**Full Changelog**: https://github.com/$repo/compare/$prev...$tag")
+            $notesFile = "dist/release-notes-$tag.md"
+            Set-Content -Path $notesFile -Value ($body -join "`r`n") -Encoding utf8NoBOM
+            gh release edit "$tag" --repo "$repo" --notes-file "$notesFile"
+            $check = gh api "repos/$repo/releases/tags/$tag" --jq ".body | length"
+            if ([int]"$check" -lt 100) {
+              throw "Release notes for $tag came back only $check characters long"
+            }
+            Write-Host "Notes published for $tag ($check characters), summarized from $prev...$tag"
+          } catch {
+            # A built zip must never be un-published because notes could not be composed.
+            Write-Warning "Release notes step failed: $_"
+            Write-Host "The release and its zip are still live; run gh release edit <tag> --notes-file ... to write the notes by hand."
+          }
