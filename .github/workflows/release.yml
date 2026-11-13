@@ -49,7 +49,7 @@ jobs:
             Opening TP DECK starts Chromium minimized (first run needs network once to download it). Log into eBay Seller Hub and the ERP in that window once.
 
       # Notes are written AFTER the release exists, because the create step above
-      # overwrites any body written earlier (GitHubReleases rule 8). The commit subjects
+      # writes a placeholder and overwrites any body set earlier. The commit subjects
       # since the previous v* release are what get summarized here, so no conversation
       # needs local GitHub auth to ship notes: secrets.GITHUB_TOKEN comes from the
       # contents: write permission already declared for this job. A failure in this step

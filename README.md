@@ -52,7 +52,7 @@ Build the coworker zip:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 ```
 
-Publish by pushing a tag such as `v0.4.0`. GitHub Actions reads that tag, stamps it into the zip, and attaches the zip to the release. Wait until that workflow finishes before editing the release notes; the create-release step overwrites the body when the zip is attached. The window shows the latest `v*` tag in a git checkout, and the stamped version in an installed copy. Installed copies pick up the new zip the next time they open. A commit on `main` updates this README without a new tag.
+Publish by pushing a tag such as `v0.4.0`. GitHub Actions reads that tag, stamps it into the zip, and attaches the zip to the release. The same run then writes the release notes from the commit subjects since the previous tag. Leave the release body alone while that run is still going: the create step writes a placeholder, and the notes step replaces it after the zip is attached. If the notes step warns that it failed, the zip is still published and the notes can be written with `gh release edit`. The window shows the latest `v*` tag in a git checkout, and the stamped version in an installed copy. Installed copies pick up the new zip the next time they open. A commit on `main` updates this README without a new tag.
 
 ```
 TP-DECK/

@@ -1,84 +1,13 @@
-<ProjectContext>
-# TP DECK (Techyparts Data Entry Control Keeper)
-**Goal:** Automate repetitive inventory data entry between eBay, ShipStation, and RazorERP without creating a new browser for each run.
-**Target Environment:** Native Windows multimonitor desktop utility.
-**Theme Identity:** Techyparts enterprise hardware dark theme.
-- Background: Deep Server Charcoal (`#0F172A` or `#1E293B`)
-- Primary Accent: Enterprise Electric Blue (`#0EA5E9`)
-- Text: Crisp White (`#F8FAFC`)
-- Cancel/Stop: Alert Red (`#7F1D1D` background, `#FCA5A5` text)
-- Update warning: pulse the action buttons between yellow (`#FBBF24`) and grey (`#64748B`)
-</ProjectContext>
+# TP DECK agent constraints
 
-<TechStack>
-- **Language:** Python 3.11+
-- **GUI Framework:** PySide6 (Native Windows integrations, Qt.WindowStaysOnTopHint)
-- **Browser Automation:** Playwright (async API) via Chrome DevTools Protocol (CDP)
-- **Global Hotkey:** `keyboard` library (Strictly limited to the `Pause` key)
-- **Concurrency:** `asyncio` for managing cancelable background automation tasks, bridged to Qt with `qasync`
-</TechStack>
+Rules that the README and the release skill do not state.
 
-<ArchitectureRules>
-# 1. Packaging (STRICT)
-- DO NOT use PyInstaller `--onefile` or broadly hook the Windows keyboard API.
-- Global hotkey usage is strictly limited to registering the `Pause` (Pause/Break) key for the emergency abort function.
-- Releases are an embeddable CPython zip plus source, launched by `TP-DECK.bat`. Write code assuming a standard `python main.py` execution environment.
-- Do not hand-edit `__version__`. The version is the latest `v*` git tag. See GitHub releases below.
-
-# 2. Window & UI Constraints
-- **Floating Tool Window:** The main UI is a compact, floating dashboard. Use `Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool`.
-- **Position Persistence:** Override `closeEvent` and `moveEvent` to save the exact `(X, Y)` screen coordinates to `settings.json`. On initialization, load these coordinates so the app remembers its placement on auxiliary monitors.
-- **Debouncing:** When automation starts, disable the running action button and change its text to "⏳ Processing...". Re-enable inside a `finally` block.
-
-# 3. Automation Engine & CDP Connection
-- **NO NEW BROWSERS PER RUN:** DO NOT use `playwright.chromium.launch()`. Attach with `playwright.chromium.connect_over_cdp()` to the Chromium instance TP DECK already started.
-- **Operating Modes:** Support "Single" (Port 9222) and "Dual" browser connections (eBay Port 9222, ERP Port 9223) determined by `settings.json`.
-- **Tab Disambiguation:** Match the configured URL pattern across CDP contexts. Use `document.hasFocus()` only when more than one tab matches, so a unique URL does not have to be the focused tab.
-
-# 4. Emergency Kill-Switch
-- All Playwright operations must run inside an `asyncio.Task`.
-- Provide a red UI button `[🛑 Emergency Stop]` AND listen for the `Pause` key globally. Both triggers must call `task.cancel()` on the running asyncio task immediately.
-
-# 5. Configuration & State Management
-- Ports, mode, timeouts, hotkey, and window geometry live in `tp_deck/settings.json`. Do not hardcode them.
-- DOM CSS selectors and Razor page addresses live in `tp_deck/locators.json`, not in Settings.
-- Maintain a rolling log at `tp_deck/tpdeck.log`.
-</ArchitectureRules>
-
-<ProjectStructure>
-/tp_deck/
-  ├── main.py                 # Qt + asyncio bridge, hotkey, jobs, update check
-  ├── dashboard.py            # Floating UI, theme, position persistence
-  ├── settings_dialog.py      # Ports, mode, timeouts
-  ├── settings.json           # Runtime config (not selectors)
-  ├── locators.json           # CSS selectors and Razor URLs
-  ├── automation_engine.py    # CDP connect, eBay scrape, ERP location lookup
-  ├── shipstation.py          # Store-order scrape
-  ├── sales_order.py          # Open a Razor sales order for batch serial
-  ├── chrome_launcher.py      # Start the portable Chromium debug browser
-  ├── updater.py              # GitHub release check and in-place upgrade
-  └── tpdeck.log              # Rolling log
-</ProjectStructure>
-
-<GitHubReleases>
-# Commit & Push means release
-When the user asks to **Commit & Push** (or any clear Commit & Push phrasing), treat that as a full release, not a code-only push. Do all of the following in order, without asking again for the tag or version unless they named a specific version:
-
-1. Read the latest `v*` tag (`git describe --tags --abbrev=0 --match "v*"` or `git tag --sort=-v:refname`).
-2. Increment the patch number by default (`v0.3.1` → `v0.3.2`). Use a minor or major bump only when the user asks for one, or when they give an exact tag.
-3. Commit the current changes on the working branch. Do not edit `tp_deck/__init__.py`; the tag is the version.
-4. Push the branch to `origin` (`squishey123/TP-DECK`).
-5. Create the new tag on that commit and push the tag:
-
-```
-git tag v0.3.2
-git push origin v0.3.2
-```
-
-6. `.github/workflows/release.yml` runs on the tag. `scripts/build_release.ps1` reads the tag, builds `dist/TP-DECK-<version>-windows-x64.zip`, and stamps that version into the packaged `tp_deck/__init__.py`.
-7. The workflow publishes a GitHub Release named `TP DECK <version>` and attaches that zip. The asset name must stay `TP-DECK-<version>-windows-x64.zip`; the updater only accepts that pattern.
-8. **Release notes come last.** Wait until the Release workflow succeeds and the zip is on the release. Do not edit the release body while Actions is still running. The create-release step overwrites the body when it finishes, so notes written earlier are lost. After the workflow is green, update the notes with `gh release edit <tag> --notes "..."` (or the Notes editor). Summarize what changed in this version.
-9. A release install checks `update_repo` (`squishey123/TP-DECK`) against the latest GitHub release the next time it opens. A newer tag downloads and replaces the app. `settings.json`, `sku_overrides.json`, `sku_location_cache.json`, `uline_cache.json`, `uline_draft.json`, and the browser profile are kept. `Uline Exports/` sits outside the package, so an update leaves it in place.
-
-A request that says only **commit** (no push) stays a local commit. A request that says push without Commit & Push wording is a normal branch push and does not create a release tag.
-</GitHubReleases>
+- The GUI is PySide6. Bridge asyncio to Qt with `qasync`. Playwright uses its async API.
+- The main panel is a floating tool window: `Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool`.
+- Persist the panel's screen position. On `closeEvent` and `moveEvent`, save `(X, Y)` to `settings.json` and restore it on startup, so the panel returns to the same monitor.
+- When a run starts, disable that action. On the full panel, set its text to "⏳ Processing...". Leave the compact-strip button label alone. Re-enable the button in a `finally` block.
+- Browser connections come from `settings.json`. Single uses port 9222. Dual uses eBay port 9222 and ERP port 9223. Do not hardcode them.
+- Match a tab by the configured URL pattern. Call `document.hasFocus()` only when more than one tab matches.
+- Run Playwright work inside an `asyncio.Task`. Emergency Stop and the Pause key must both call `task.cancel()` on that task immediately.
+- Register Pause through the `keyboard` library. Do not hook the Windows keyboard API more broadly.
+- Keep a rolling log at `tp_deck/tpdeck.log`.
