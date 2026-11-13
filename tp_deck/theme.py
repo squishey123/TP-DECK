@@ -458,7 +458,7 @@ def dashboard_qss(p: dict[str, str], compact: bool = False) -> str:
         action_min_w, action_max_w = icon_edge, 16777215
         settings_px = 13
         stop_px, stop_pad = 13, "0px"
-        stop_weight = "bold"
+        slow_px = 10
         stop_min_h, stop_max_h = icon_edge, icon_edge
         stop_min_w, stop_max_w = icon_edge, icon_edge
     else:
@@ -470,7 +470,7 @@ def dashboard_qss(p: dict[str, str], compact: bool = False) -> str:
         action_min_w, action_max_w = 0, 16777215
         settings_px = 12
         stop_px, stop_pad = 11, "4px 4px"
-        stop_weight = "normal"
+        slow_px = 12
         stop_min_h, stop_max_h = 0, 16777215
         stop_min_w, stop_max_w = 0, 16777215
     return f"""
@@ -569,7 +569,7 @@ QPushButton#stopBtn {{
     background-color: {p["danger_bg"]};
     color: {p["danger_text"]};
     border: 1px solid {p["danger_text"]};
-    font-weight: {stop_weight};
+    font-weight: bold;
     font-size: {stop_px}px;
     min-height: {stop_min_h}px;
     max-height: {stop_max_h}px;
@@ -592,7 +592,7 @@ QPushButton#settingsBtn, QPushButton#powerBtn, QPushButton#toolsBtn {{
 }}
 QLabel#slowRazorLabel {{
     color: {p["warning"]};
-    font-size: {stop_px}px;
+    font-size: {slow_px}px;
     font-weight: bold;
 }}
 """
